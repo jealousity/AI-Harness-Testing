@@ -373,11 +373,22 @@ export function effectiveAcl(stageId: StageId, cfg: PipelineConfig): ToolFilter 
 
 ## 11. 验证点（实现时需对照 harness 实际 API）
 
-1. `ResolvedSubagentStartRequest` 的精确形状（toolFilter/background/outputSchema 字段名）。
-2. execute 阶段后台可续跑 spawn 的确切方式（continuation manager API）。
-3. `ToolRestriction` 语义：allow 与 deny 的合并规则（白名单 vs 黑名单优先级）。
-4. `structured_output` 在审核 agent 场景的接入方式（或直接读 review.json 文件）。
-5. goal pause/resume 与"人工门等待"的对接（mainAgent 等待期间是否释放会话）。
+**已解决（2026-08-21 核实，checkout rc.5）**：
+
+1. ✅ `SubagentStartRequest` 精确形状（packages/subagent/subagent/src/types.ts:100）：
+   `{ label?, prompt: ContentBlock[], parent: Agent, signal: AbortSignal, agentOptions?, outputSchema?, maxDepth?, toolFilter?: ToolRestriction, persona? }`；
+   宿主服务入口 `ctx.subagents.start(name, request): Promise<SubagentRun>`（index.ts:414）。
+2. ✅ `ToolRestriction`（packages/core/tools/src/index.ts:680）：`{ allow?: string[], deny?: string[] }`，
+   **allow 存在即白名单**（其余全局工具移除），deny 移除指定工具；限制取交集。
+   与 platform-pipeline 的 `ToolFilter` 结构一致，可直接映射。
+3. ✅ toolFilter 需 provider capability `toolFilter`（in-process 后端 `tools.restrict()`：被禁工具从子 agent prompt 消失 + 执行被拒，unknown-name 响亮失败）。
+
+**待解决（集成时定）**：
+
+4. ⏳ **版本对齐**：checkout 为 `0.1.0-rc.5`，npm `@deepseek-ai/dsh-subagent` next 为 `0.1.0-rc.8`——独立包 devDependencies 应 pin 到哪个版本（建议：按宿主部署的 harness 版本，`@next` 或对齐 checkout），并在 CI 加"harness 类型兼容"检查。
+5. ⏳ execute 阶段后台可续跑 spawn 的确切方式（continuation manager API：`prepareContinuable` / 续跑驱动）。
+6. ⏳ `structured_output` 在审核 agent 场景的接入方式（或直接读 review.json 文件）。
+7. ⏳ goal pause/resume 与"人工门等待"的对接——D-20 后 mainAgent 为纯代码，此项已降级为"human-gate.ts 用 ui-user-questions 阻塞等待"，无 goal 依赖。
 
 ---
 
