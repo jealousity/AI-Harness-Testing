@@ -153,3 +153,23 @@ export interface Checkpoint {
   readonly stageStates: Readonly<Record<StageId, StageState>>
   readonly reentries: readonly ReentryRecord[]
 }
+
+// ── 产物（docs/02 第 4 节 / docs/01 G-08 摘要锁）────────────────────────────
+
+/** 产物声明的上游 digest（G-08 摘要锁）。 */
+export interface InputLocks {
+  readonly [upstreamStage: string]: string
+}
+
+/** 阶段产物统一包装：内容 + 摘要锁 + 版本信息（docs/09 第 1 节）。 */
+export interface StageArtifact<Content = unknown> {
+  readonly pipelineId: string
+  readonly stageId: StageId
+  /** 重入/回环覆盖时递增。 */
+  readonly version: number
+  readonly inputs: InputLocks
+  readonly content: Content
+  /** 内容 + inputs 的哈希（G-04 幂等校验）。 */
+  readonly digest: string
+  readonly path: string
+}

@@ -80,3 +80,20 @@ export {
   type SpawnedRun,
   type StageSpawner,
 } from './stage-spawner.ts'
+
+export {
+  MachineGateEngine,
+  computeArtifactDigest,
+  platformGenericRules,
+  type GateRule,
+  type JudgeResult,
+  type RuleContext,
+} from './gates/machine.ts'
+
+export {
+  deepEqual,
+  validateSubset,
+  type SubsetSchema,
+} from './gates/schema.ts'
+
+export type { InputLocks, StageArtifact } from './types.ts'
