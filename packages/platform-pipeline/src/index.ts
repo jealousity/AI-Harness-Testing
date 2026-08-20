@@ -97,3 +97,10 @@ export {
 } from './gates/schema.ts'
 
 export type { InputLocks, StageArtifact } from './types.ts'
+
+export {
+  HarnessStageSpawner,
+  toContentBlocks,
+  toToolRestriction,
+  type HarnessSpawnerDeps,
+} from './harness/index.ts'
