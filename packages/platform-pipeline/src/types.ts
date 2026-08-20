@@ -7,6 +7,16 @@
 export const STAGE_ORDER = ['receive', 'analyze', 'design', 'execute', 'report', 'archive'] as const
 export type StageId = (typeof STAGE_ORDER)[number]
 
+/** 各阶段的上游产物（docs/02 产物契约总表第 4 节）：驱动编排与 G-08 摘要锁声明用。 */
+export const STAGE_UPSTREAMS: Readonly<Record<StageId, readonly StageId[]>> = {
+  receive: [],
+  analyze: ['receive'],
+  design: ['analyze'],
+  execute: ['design'],
+  report: ['execute'],
+  archive: ['receive', 'analyze', 'design', 'execute', 'report'],
+}
+
 export type ProjectType = 'api-service' | 'web-ui' | 'desktop-client' | 'mixed'
 export type ScaleTier = 'S' | 'M' | 'L'
 export type ExecutionLevel = 'auto' | 'hybrid' | 'manual'
@@ -130,7 +140,7 @@ export interface StageState {
     readonly machine: MachineGateState
     readonly human: HumanGateState
   }
-  readonly failures: readonly { readonly kind: string; readonly rule?: string; readonly at: number }[]
+  readonly failures: readonly { readonly kind: string; readonly rule?: string; readonly detail?: string; readonly at: number }[]
 }
 
 export interface ReentryRecord {

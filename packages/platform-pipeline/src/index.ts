@@ -104,3 +104,15 @@ export {
   toToolRestriction,
   type HarnessSpawnerDeps,
 } from './harness/index.ts'
+
+export {
+  PipelineDriver,
+  type ArtifactStore,
+  type CheckpointPort,
+  type DriverOptions,
+  type HumanDecision,
+  type HumanGatePort,
+  type ReviewOutcome,
+  type ReviewRunner,
+  type RunOutcome,
+} from './driver.ts'

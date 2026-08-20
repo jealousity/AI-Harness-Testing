@@ -49,6 +49,14 @@ export function stageRunContext(stageId: StageId, cp: Checkpoint): { kind: 'firs
   const stage = cp.stageStates[stageId]
   switch (stage.status) {
     case 'needs-fix': {
+      // 交叉检查失败的重跑优先于门禁违规（findings 回喂，docs/03 第 7.4 节）
+      const reviewFail = [...stage.failures].reverse().find(f => f.kind === 'review-fail')
+      if (reviewFail !== undefined) {
+        return {
+          kind: 'needs-fix',
+          extra: `交叉检查未通过，需修复以下问题：\n${reviewFail.detail ?? '（无细节）'}`,
+        }
+      }
       const violations = stage.gate.machine.violations
       return {
         kind: 'needs-fix',
