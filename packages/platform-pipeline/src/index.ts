@@ -116,3 +116,27 @@ export {
   type ReviewRunner,
   type RunOutcome,
 } from './driver.ts'
+
+export {
+  makeRecord,
+  hashRecord,
+  verifyChain,
+  reconcile,
+  verifyEvidence,
+} from './executor/executor.ts'
+export type {
+  ChainViolation,
+  EvidenceEntry,
+  EvidenceViolation,
+  ExecutionRecord,
+  ExecutionSession,
+  ExecutionStatus,
+  Executor,
+  ExecutorContext,
+  ReconcileResult,
+} from './executor/executor.ts'
+
+export {
+  FsArtifactStore,
+  FsCheckpointPort,
+} from './stores/fs.ts'
