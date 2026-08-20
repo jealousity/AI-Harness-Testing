@@ -1,0 +1,21 @@
+{
+  "name": "platform-pipeline",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "测试辅助平台六阶段流水线插件包（设计文档 docs/09 实现骨架第 1 步：配置解析 / 检查点 / ACL）",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "yaml": "^2.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
