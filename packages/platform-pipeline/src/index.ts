@@ -140,3 +140,11 @@ export {
   FsArtifactStore,
   FsCheckpointPort,
 } from './stores/fs.ts'
+
+export {
+  HttpExecutor,
+  type HttpCase,
+  type HttpRequestFn,
+  type HttpResponse,
+  type HttpStep,
+} from './executor/http.ts'
