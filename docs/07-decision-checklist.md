@@ -189,3 +189,4 @@
 | I-1 | 插件包结构：独立 cordis 插件包 `platform-pipeline` | 2026-08-20 | 可插拔、可单测、不污染现有 host 组合 |
 | I-2 | manual 会话 UI：复用 ui-user-questions 弹窗流 | 2026-08-20 | 开始/逐条回填/结束问答序列；专用界面后续可换 |
 | I-3 | 用户命令入口：挂现有 CLI 子命令（`dsh pipeline run`） | 2026-08-20 | 与 `dsh web` 等现有子命令一致 |
+| I-4 | **部署模型：独立 npm 包**（任何人任何平台可部署） | 2026-08-21 | harness 核心包已发布 npm（`@deepseek-ai/cordis` 4.0.1 等）；插件包零/少 harness 运行时依赖，harness 相关模块声明 peerDependencies 由宿主提供；executor/env_diag 平台相关部分做可插拔适配器。风险：harness 处于 rc（API 未冻结），需版本对齐（docs/09 验证点 4） |
