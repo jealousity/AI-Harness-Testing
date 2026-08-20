@@ -59,3 +59,24 @@ export {
   loadCheckpoint,
   saveCheckpoint,
 } from './checkpoint.ts'
+
+export {
+  assemblePrompt,
+  capExtraContext,
+  MAX_EXTRA_CONTEXT_CHARS,
+  TRUNCATED_MARK,
+  type PromptInput,
+} from './prompt/assemble.ts'
+
+export {
+  STAGE_SPECS,
+  type StagePromptSpec,
+} from './prompt/specs.ts'
+
+export {
+  resolveStageAcl,
+  stageRunContext,
+  type SpawnRequest,
+  type SpawnedRun,
+  type StageSpawner,
+} from './stage-spawner.ts'
