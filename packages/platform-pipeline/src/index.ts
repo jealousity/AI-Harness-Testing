@@ -148,3 +148,15 @@ export {
   type HttpResponse,
   type HttpStep,
 } from './executor/http.ts'
+
+export {
+  diagCredential,
+  diagDisk,
+  diagNetwork,
+  diagService,
+  runDiag,
+  type DiagKind,
+  type DiagProbe,
+  type DiagSpec,
+  type EnvDiagOptions,
+} from './executor/env-diag.ts'
