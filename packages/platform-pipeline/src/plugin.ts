@@ -13,7 +13,7 @@ import { FsArtifactStore, FsCheckpointPort } from './stores/fs.ts'
 import { MachineGateEngine, platformGenericRules } from './gates/machine.ts'
 import { stageRules } from './gates/stage-rules.ts'
 import { pipelineContractSchemas } from './contracts/schemas.ts'
-import { PipelineDriver, type HumanGatePort, type ReviewRunner, type RunOutcome } from './driver.ts'
+import { PipelineDriver, type ExecutionLoader, type HumanGatePort, type ReviewRunner, type RunOutcome } from './driver.ts'
 import type { StageSpawner } from './stage-spawner.ts'
 import type { PipelineConfig, StageId, SubsetSchema } from './types.ts'
 import { join } from 'node:path'
@@ -34,6 +34,8 @@ export interface PipelinePluginConfig {
   readonly human: HumanGatePort
   /** 交叉检查（宿主注入：独立审核 agent）。 */
   readonly review?: ReviewRunner
+  /** executor 执行数据（宿主注入：从 executor 写入的记录/证据读取；R4-08/09/10 用）。 */
+  readonly execution?: ExecutionLoader
 }
 
 /** `ctx.pipeline` 服务面。 */
@@ -67,6 +69,7 @@ export async function apply(ctx: Context, config: PipelinePluginConfig): Promise
     artifacts,
     checkpoint,
     ...(config.review === undefined ? {} : { review: config.review }),
+    ...(config.execution === undefined ? {} : { execution: config.execution }),
   })
 
   const service: PipelineService = {

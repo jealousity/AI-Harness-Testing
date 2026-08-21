@@ -7,14 +7,17 @@
 
 import { createHash } from 'node:crypto'
 import { validateSubset, type SubsetSchema } from './schema.ts'
+import type { ExecutionSession } from '../executor/executor.ts'
 import type { StageArtifact, StageId, Violation } from '../types.ts'
 
-/** 规则判定上下文：产物 + 上游产物（按 inputs 摘要锁声明解析）。 */
+/** 规则判定上下文：产物 + 上游产物 + （execute 阶段）executor 执行数据。 */
 export interface RuleContext {
   readonly stageId: StageId
   readonly artifact: StageArtifact
-  /** 上游产物（stageId → 产物）；由 driver 按 artifact.inputs 组装。 */
+  /** 上游产物（传递性：当前阶段之前全部产物，由 driver 组装）。 */
   readonly upstreams: Readonly<Record<string, StageArtifact>>
+  /** executor 自产执行数据（R4-08/09/10 用；execute 阶段必须提供）。 */
+  readonly execution?: ExecutionSession
 }
 
 export interface GateRule {
@@ -244,11 +247,17 @@ export class MachineGateEngine {
   }
 
   /** 全量重判（不增量）；留痕由 driver 写入检查点。 */
-  judge(stageId: StageId, artifact: StageArtifact, upstreams: Readonly<Record<string, StageArtifact>>, attempts: number): JudgeResult {
+  judge(
+    stageId: StageId,
+    artifact: StageArtifact,
+    upstreams: Readonly<Record<string, StageArtifact>>,
+    attempts: number,
+    execution?: ExecutionSession,
+  ): JudgeResult {
     const violations: Violation[] = []
     for (const rule of this.rules) {
       if (rule.stages !== 'all' && !rule.stages.includes(stageId)) continue
-      violations.push(...rule.judge({ stageId, artifact, upstreams }))
+      violations.push(...rule.judge({ stageId, artifact, upstreams, ...(execution === undefined ? {} : { execution }) }))
     }
     const status = violations.some(v => v.level === 'BLOCKING') ? 'failed' : 'passed'
     return { status, violations }

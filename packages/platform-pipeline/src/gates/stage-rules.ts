@@ -7,6 +7,8 @@
  */
 
 import type { GateRule, RuleContext } from './machine.ts'
+import { reconcile, verifyEvidence } from '../executor/verify.ts'
+import { verifyChain } from '../executor/records.ts'
 import type { Violation } from '../types.ts'
 
 export interface StageRulesOptions {
@@ -209,6 +211,51 @@ export function stageRules(options: StageRulesOptions = {}): readonly GateRule[]
           }
         }
         return violations
+      },
+    },
+
+    // R4-08 execute：执行-产物对账（防空跑/漏跑/伪造，docs/08 防线 1）
+    {
+      id: 'R4-08', level: 'BLOCKING', stages: ['execute'],
+      judge: ({ artifact, upstreams, execution }) => {
+        if (execution === undefined) {
+          return [v('R4-08', 'executor execution data not provided — executor 必须真实执行并自产记录')]
+        }
+        const content = artifact.content as Content
+        const upstreamDesign = upstreams.design
+        if (upstreamDesign === undefined) return []
+        const planned = [
+          ...asArray((upstreamDesign.content as Content).testCases).map(raw => String(asObj(raw).id ?? '')),
+          ...asArray((upstreamDesign.content as Content).reusedCases).map(raw => String(asObj(raw).id ?? '')),
+        ]
+        const results = asArray(content.results).map(raw => {
+          const result = asObj(raw)
+          return { caseId: String(result.caseId ?? ''), recordRef: String(result.recordRef ?? '') }
+        })
+        const reconciled = reconcile(execution.records, planned, results)
+        const violations: Violation[] = []
+        for (const id of reconciled.missingRecords) violations.push(v('R4-08', `planned case "${id}" has no executor record (漏跑)`))
+        for (const ref of reconciled.phantomResults) violations.push(v('R4-08', `result "${ref}" references no executor record (伪造结果)`))
+        for (const seq of reconciled.unclaimedRecords) violations.push(v('R4-08', `executor record seq ${seq} is unreferenced (多余执行)`))
+        return violations
+      },
+    },
+
+    // R4-09 execute：时序链校验（防删改记录，docs/08 防线 2）
+    {
+      id: 'R4-09', level: 'BLOCKING', stages: ['execute'],
+      judge: ({ execution }) => {
+        if (execution === undefined) return [v('R4-09', 'executor execution data not provided')]
+        return verifyChain(execution.records).map(chain => v('R4-09', chain.detail))
+      },
+    },
+
+    // R4-10 execute：证据指纹与来源锚定（防虚假产物，docs/08 防线 3）
+    {
+      id: 'R4-10', level: 'BLOCKING', stages: ['execute'],
+      judge: ({ execution }) => {
+        if (execution === undefined) return [v('R4-10', 'executor execution data not provided')]
+        return verifyEvidence(execution.evidence, execution.records).map(entry => v('R4-10', entry.detail))
       },
     },
 

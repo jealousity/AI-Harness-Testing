@@ -10,6 +10,7 @@
 import { initialCheckpoint } from './checkpoint.ts'
 import { stageRunContext, type StageSpawner } from './stage-spawner.ts'
 import { MachineGateEngine, type JudgeResult } from './gates/machine.ts'
+import type { ExecutionSession } from './executor/executor.ts'
 import {
   STAGE_ORDER,
   STAGE_UPSTREAMS,
@@ -49,6 +50,11 @@ export interface CheckpointPort {
   save(root: string, checkpoint: Checkpoint): Promise<void>
 }
 
+/** executor 执行数据加载（R4-08/09/10 用；宿主从 executor 写入的记录/证据文件读取）。 */
+export interface ExecutionLoader {
+  load(stageId: StageId, pipelineId: string): Promise<ExecutionSession | undefined>
+}
+
 export interface DriverOptions {
   readonly cfg: PipelineConfig
   readonly pipelineId: string
@@ -60,6 +66,8 @@ export interface DriverOptions {
   readonly artifacts: ArtifactStore
   readonly checkpoint: CheckpointPort
   readonly review?: ReviewRunner
+  /** execute 阶段门禁需要 executor 执行数据（R4-08/09/10）。 */
+  readonly execution?: ExecutionLoader
   /** 门禁语义重试次数（docs/01 ET-01：默认 2）。 */
   readonly maxGateRetries?: number
 }
@@ -111,8 +119,9 @@ export class PipelineDriver {
       }
       const upstreams = await this.loadUpstreams(stageId, cp)
 
-      // 1. 机器门禁（全量重判；G-08 摘要锁在此拦截级联失效）
-      const gate = this.options.gates.judge(stageId, artifact, upstreams, state.gate.machine.attempts + 1)
+      // 1. 机器门禁（全量重判；G-08 摘要锁在此拦截级联失效；R4-08/09/10 需 executor 执行数据）
+      const execution = await this.options.execution?.load(stageId, this.options.pipelineId)
+      const gate = this.options.gates.judge(stageId, artifact, upstreams, state.gate.machine.attempts + 1, execution)
       if (gate.status === 'failed') {
         if (state.gate.machine.attempts < this.maxGateRetries) {
           cp = await this.update(cp, stageId, {

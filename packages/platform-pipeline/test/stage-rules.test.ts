@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { stageRules } from '../src/gates/stage-rules.ts'
 import type { StageArtifact, StageId } from '../src/types.ts'
-import { stageContent, type Content } from './fixtures.ts'
+import { stageContent, executionSessionFor, type Content } from './fixtures.ts'
 import { STAGE_ORDER } from '../src/types.ts'
 
 const rules = stageRules({ maxManualClaimedRatio: 0.3 })
@@ -39,7 +39,10 @@ function contentFor(stageId: StageId, upstreams: Record<string, StageArtifact>):
 
 function judgeFor(stageId: StageId, content: Content, upstreams: Record<string, StageArtifact> = upstreamsUpTo(stageId)): boolean {
   const applicable = rules.filter(r => r.stages === 'all' || (Array.isArray(r.stages) && (r.stages as readonly StageId[]).includes(stageId)))
-  return applicable.every(r => r.judge({ stageId, artifact: artifact(stageId, content), upstreams }).length === 0)
+  const execution = stageId === 'execute'
+    ? executionSessionFor(upstreams.design?.content as unknown as { testCases: readonly { id: string }[] })
+    : undefined
+  return applicable.every(r => r.judge({ stageId, artifact: artifact(stageId, content), upstreams, ...(execution === undefined ? {} : { execution }) }).length === 0)
 }
 
 test('valid fixtures pass all applicable R rules for every stage', () => {
@@ -154,4 +157,45 @@ test('R6-02: unarchived designed case is BLOCKING', () => {
   const bad = { ...content, caseArchive: [] }
   const rule = rules.find(r => r.id === 'R6-02')!
   assert.ok(rule.judge({ stageId: 'archive', artifact: artifact('archive', bad), upstreams }).length > 0)
+})
+
+
+test('R4-08: missing executor record is BLOCKING (漏跑)', () => {
+  const upstreams = upstreamsUpTo('execute')
+  const content = contentFor('execute', upstreams)
+  // 结果引用了不存在的记录 seq 99（伪造结果）
+  const results = content.results as Record<string, unknown>[]
+  const bad = { ...content, results: [{ ...results[0]!, recordRef: '99' }] }
+  const rule = rules.find(r => r.id === 'R4-08')!
+  const execution = executionSessionFor(upstreams.design!.content as unknown as { testCases: readonly { id: string }[] })
+  const violations = rule.judge({ stageId: 'execute', artifact: artifact('execute', bad), upstreams, execution })
+  assert.ok(violations.some(v => v.rule === 'R4-08' && v.detail.includes('no executor record')))
+})
+
+test('R4-09: tampered record chain is BLOCKING', () => {
+  const upstreams = upstreamsUpTo('execute')
+  const content = contentFor('execute', upstreams)
+  const execution = executionSessionFor(upstreams.design!.content as unknown as { testCases: readonly { id: string }[] })
+  const tampered = { ...execution.records[0]!, durationMs: 9999 }
+  const rule = rules.find(r => r.id === 'R4-09')!
+  const violations = rule.judge({ stageId: 'execute', artifact: artifact('execute', content), upstreams, execution: { ...execution, records: [tampered, ...execution.records.slice(1)] } })
+  assert.ok(violations.some(v => v.rule === 'R4-09'))
+})
+
+test('R4-10: agent-written evidence is BLOCKING', () => {
+  const upstreams = upstreamsUpTo('execute')
+  const content = contentFor('execute', upstreams)
+  const execution = executionSessionFor(upstreams.design!.content as unknown as { testCases: readonly { id: string }[] })
+  const bad = { ...execution, evidence: [{ ...execution.evidence[0]!, capturedBy: 'agent-zhang' }] }
+  const rule = rules.find(r => r.id === 'R4-10')!
+  const violations = rule.judge({ stageId: 'execute', artifact: artifact('execute', content), upstreams, execution: bad })
+  assert.ok(violations.some(v => v.rule === 'R4-10' && v.detail.includes('not an executor identity')))
+})
+
+test('R4-08: missing execution data is BLOCKING', () => {
+  const upstreams = upstreamsUpTo('execute')
+  const content = contentFor('execute', upstreams)
+  const rule = rules.find(r => r.id === 'R4-08')!
+  const violations = rule.judge({ stageId: 'execute', artifact: artifact('execute', content), upstreams })
+  assert.ok(violations.some(v => v.rule === 'R4-08' && v.detail.includes('not provided')))
 })

@@ -4,6 +4,8 @@
  */
 
 import type { StageId } from '../src/types.ts'
+import { makeRecord, type ExecutionRecord } from '../src/executor/records.ts'
+import type { EvidenceEntry } from '../src/executor/verify.ts'
 
 export type Content = Record<string, unknown>
 
@@ -100,4 +102,28 @@ export function stageContent(stageId: StageId, upstreams: Readonly<Record<string
     case 'report': return reportContent()
     case 'archive': return archiveContent(upstreams.design as unknown as { testCases: readonly { id: string }[] })
   }
+}
+
+/** 与 executeContent 匹配的合法 executor 执行会话（记录链 + 锚定证据，R4-08/09/10 全通过）。 */
+export function executionSessionFor(design: { testCases: readonly { id: string }[] }): {
+  records: ExecutionRecord[]
+  evidence: EvidenceEntry[]
+} {
+  const records: ExecutionRecord[] = []
+  const evidence: EvidenceEntry[] = []
+  let prevHash = ''
+  design.testCases.forEach((t, index) => {
+    const capturedAt = 1000 + index * 100
+    const record = makeRecord({
+      seq: index + 1, caseId: t.id, capturedAt, durationMs: 50, status: 'pass',
+      evidenceRefs: [`ev-${index + 1}`], prevHash, segment: 1,
+    })
+    records.push(record)
+    prevHash = record.ownHash
+    evidence.push({
+      id: `ev-${index + 1}`, recordId: index + 1, file: `evidence/${index + 1}.log`, digest: 'd',
+      capturedBy: 'executor:inv-1', capturedAt: capturedAt + 10,
+    })
+  })
+  return { records, evidence }
 }

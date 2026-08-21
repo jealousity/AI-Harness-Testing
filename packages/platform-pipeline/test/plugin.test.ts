@@ -10,7 +10,7 @@ import { computeArtifactDigest } from '../src/gates/machine.ts'
 import type { SpawnRequest, SpawnedRun, StageSpawner } from '../src/stage-spawner.ts'
 import type { HumanGatePort } from '../src/driver.ts'
 import type { PipelineConfig, StageArtifact } from '../src/types.ts'
-import { stageContent, type Content } from './fixtures.ts'
+import { stageContent, executionSessionFor, type Content } from './fixtures.ts'
 
 const FIXTURE_YAML = `
 projectId: acme-pay-2026
@@ -86,12 +86,22 @@ async function boot(): Promise<{ ctx: Context; fiber: { dispose(): Promise<void>
   const checkpointRoot = join(dir, 'checkpoints')
   const spawn = new ScriptedSpawn(artifactsRoot)
   const human = new ApprovingHuman()
+  const artifacts = new FsArtifactStore(artifactsRoot)
   const pluginConfig: PipelinePluginConfig = {
     configPath,
     artifactsRoot,
     checkpointRoot,
     spawner: spawn,
     human,
+    // R4-08/09/10：从磁盘 design 产物生成合法执行会话
+    execution: {
+      load: async (stageId, _pipelineId) => {
+        if (stageId !== 'execute') return undefined
+        const design = await artifacts.read('artifacts/pipe-1/design.json')
+        if (design === null) return undefined
+        return executionSessionFor(design.content as unknown as { testCases: readonly { id: string }[] })
+      },
+    },
   }
   const ctx = new Context()
   const fiber = await ctx.plugin(pipelinePlugin, pluginConfig) as unknown as { dispose(): Promise<void> }
