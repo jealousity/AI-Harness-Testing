@@ -25,7 +25,11 @@ import { stageRules } from '../gates/stage-rules.ts'
 import { pipelineContractSchemas } from '../contracts/schemas.ts'
 import { PipelineDriver, type HumanGatePort } from '../driver.ts'
 import { HarnessStageSpawner } from '../harness/stage-spawner-harness.ts'
+import { applyToolTimeoutPolicy } from '../harness/tool-timeout.ts'
 import { HttpExecutor, type HttpCase, type HttpStep } from '../executor/http.ts'
+
+/** 工具调用超时上限：3 分钟（用户硬性要求：超时自动退出并汇报）。 */
+const TOOL_TIMEOUT_MS = 180_000
 
 /** 从桌面端凭据库读取 DEEPSEEK_API_KEY（不打印值）。 */
 async function ensureApiKey(): Promise<void> {
@@ -58,6 +62,7 @@ function registerTools(ctx: Context, baseDir: string, baseUrl: string): void {
       schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } } },
       render: (_args, value) => textResult(value.text ?? ''),
     },
+    timeoutMs: TOOL_TIMEOUT_MS,
     async execute(args) {
       const text = await readFile(resolve(args.path!), 'utf8')
       return { text }
@@ -75,6 +80,7 @@ function registerTools(ctx: Context, baseDir: string, baseUrl: string): void {
       schema: { type: 'object', additionalProperties: false, properties: { path: { type: 'string' } } },
       render: (_args, value) => [{ type: 'text', text: `written ${value.path}` }],
     },
+    timeoutMs: TOOL_TIMEOUT_MS,
     async execute(args) {
       const target = resolve(args.path)
       await mkdir(target.slice(0, target.lastIndexOf('/')), { recursive: true })
@@ -91,6 +97,7 @@ function registerTools(ctx: Context, baseDir: string, baseUrl: string): void {
       schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } } },
       render: (_args, value) => textResult(value.text ?? ''),
     },
+    timeoutMs: TOOL_TIMEOUT_MS,
     async execute(args) {
       return { text: await readFile(resolve(args.path!), 'utf8') }
     },
@@ -104,6 +111,7 @@ function registerTools(ctx: Context, baseDir: string, baseUrl: string): void {
       schema: { type: 'object', additionalProperties: false, properties: { entries: { type: 'array', items: { type: 'json' } } } },
       render: () => textResult('[]'),
     },
+    timeoutMs: TOOL_TIMEOUT_MS,
     async execute() {
       return { entries: [] }
     },
@@ -117,6 +125,7 @@ function registerTools(ctx: Context, baseDir: string, baseUrl: string): void {
       schema: { type: 'object', additionalProperties: false, properties: { cases: { type: 'array', items: { type: 'json' } } } },
       render: () => textResult('[]'),
     },
+    timeoutMs: TOOL_TIMEOUT_MS,
     async execute() {
       return { cases: [] }
     },
@@ -138,6 +147,7 @@ function registerTools(ctx: Context, baseDir: string, baseUrl: string): void {
       },
       render: (_args, value) => textResult(JSON.stringify(value.records ?? value.error ?? [])),
     },
+    timeoutMs: TOOL_TIMEOUT_MS,
     async execute(args) {
       try {
         const design = JSON.parse(await readFile(join(baseDir, 'artifacts', 'e2e-2026', 'design.json'), 'utf8')) as {
@@ -188,6 +198,7 @@ function registerTools(ctx: Context, baseDir: string, baseUrl: string): void {
         schema: { type: 'object', additionalProperties: false, properties: { error: { type: 'string' } } },
         render: (_args, value) => textResult(value.error ?? ''),
       },
+      timeoutMs: TOOL_TIMEOUT_MS,
       async execute() {
         return { error: `${name} not available in minimal host` }
       },
@@ -202,6 +213,7 @@ function registerTools(ctx: Context, baseDir: string, baseUrl: string): void {
       schema: { type: 'object', additionalProperties: false, properties: { probes: { type: 'array', items: { type: 'json' } } } },
       render: () => textResult('[]'),
     },
+    timeoutMs: TOOL_TIMEOUT_MS,
     async execute() {
       return { probes: [] }
     },
@@ -290,6 +302,7 @@ async function main(): Promise<void> {
   })
   await ctx.plugin(AgentLoop, { agents: [] })
   registerTools(ctx, workdir, baseUrl)
+  applyToolTimeoutPolicy(ctx) // 工具调用 >3 分钟自动中止并汇报（用户硬性要求）
   await ctx.plugin(LlmDeepSeek, { apiKeyEnv: 'DEEPSEEK_API_KEY', baseURL: 'https://api.deepseek.com' })
   await ctx.plugin(SubagentRuntime)
   await ctx.plugin(Spawn, { providerName: 'spawn' })
