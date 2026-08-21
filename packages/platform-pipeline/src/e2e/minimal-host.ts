@@ -6,6 +6,7 @@
  */
 
 import { readFile, writeFile, mkdir, rm } from 'node:fs/promises'
+import { createServer, type Server } from 'node:http'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -24,6 +25,7 @@ import { stageRules } from '../gates/stage-rules.ts'
 import { pipelineContractSchemas } from '../contracts/schemas.ts'
 import { PipelineDriver, type HumanGatePort } from '../driver.ts'
 import { HarnessStageSpawner } from '../harness/stage-spawner-harness.ts'
+import { HttpExecutor, type HttpCase, type HttpStep } from '../executor/http.ts'
 
 /** 从桌面端凭据库读取 DEEPSEEK_API_KEY（不打印值）。 */
 async function ensureApiKey(): Promise<void> {
@@ -45,7 +47,7 @@ function textResult(text: string): ContentBlock[] {
 }
 
 /** 注册最小工具集（ACL allow 名单全覆盖；fs 相对路径按 baseDir 解析）。 */
-function registerTools(ctx: Context, baseDir: string): void {
+function registerTools(ctx: Context, baseDir: string, baseUrl: string): void {
   const resolve = (path: string): string => (path.startsWith('/') ? path : join(baseDir, path))
 
   ctx.tools.register(defineTool({
@@ -120,18 +122,61 @@ function registerTools(ctx: Context, baseDir: string): void {
     },
   }))
 
+  // executor_run：真实 HttpExecutor（本地假登录 API；记录+证据落盘，供执行可信门禁验证）
+  const executorState: { session?: import('../executor/executor.ts').ExecutionSession } = {}
   ctx.tools.register(defineTool({
     name: 'executor_run',
-    description: 'Run test cases via the executor. Not wired in minimal host.',
-    parameters: { caseIds: { type: 'array', items: { type: 'string' }, description: 'case ids' } },
+    description: 'Execute the given case ids against the login API and return their real records. Call this with the case ids from design.json.',
+    parameters: { caseIds: { type: 'array', items: { type: 'string' }, description: 'case ids to run' } },
     output: {
-      schema: { type: 'object', additionalProperties: false, properties: { error: { type: 'string' } } },
-      render: (_args, value) => textResult(value.error ?? ''),
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          records: { type: 'array', items: { type: 'json' } },
+          error: { type: 'string' },
+        },
+      },
+      render: (_args, value) => textResult(JSON.stringify(value.records ?? value.error ?? [])),
     },
-    async execute() {
-      return { error: 'executor not wired in minimal host' }
+    async execute(args) {
+      try {
+        const design = JSON.parse(await readFile(join(baseDir, 'artifacts', 'e2e-2026', 'design.json'), 'utf8')) as {
+          testCases: Array<{ id: string; steps: Array<{ action?: string; expected?: string[] }> }>
+        }
+        const cases: HttpCase[] = design.testCases.map((tc) => {
+          const first = tc.steps[0] ?? {}
+          const match = /^(GET|POST|PUT|DELETE)\s+(\/\S+)/.exec(first.action ?? '')
+          const expected = first.expected?.find((e) => /^\d{3}$/.test(e))
+          const step: HttpStep = {
+            kind: 'http-request', name: tc.id, method: match?.[1] ?? 'GET',
+            url: baseUrl + (match?.[2] ?? '/api/login/sms'),
+            ...(expected === undefined ? {} : { expectedStatus: Number(expected) }),
+          }
+          return { id: tc.id, steps: [step] }
+        })
+        const executor = new HttpExecutor({
+          resolveCase: async (id) => cases.find((c) => c.id === id),
+          writeEvidence: async (path, content) => {
+            const dirPath = join(baseDir, 'executor', 'evidence')
+            await mkdir(dirPath, { recursive: true })
+            await writeFile(join(dirPath, path.split('/').pop() ?? 'x'), content)
+          },
+        })
+        const session = await executor.run(args.caseIds ?? cases.map((c) => c.id), {
+          designArtifactPath: join(baseDir, 'artifacts', 'e2e-2026', 'design.json'),
+          evidenceDir: join(baseDir, 'executor', 'evidence'),
+          invocationId: `inv-${Date.now()}`,
+        })
+        executorState.session = session
+        await writeFile(join(baseDir, 'executor', 'session.json'), JSON.stringify(session))
+        // 只给 agent 记录摘要（caseId/status/evidenceRefs），不暴露实现细节
+        return { records: session.records.map((r) => ({ seq: r.seq, caseId: r.caseId, status: r.status, evidenceRefs: r.evidenceRefs })) } as never
+      } catch (error) {
+        return { error: error instanceof Error ? error.message : String(error) }
+      }
     },
   }))
+  void executorState
 
   // DENY 名单中的工具也需存在（restrict() 校验所有 filter 名）：无操作 stub
   for (const name of ['kb_write', 'case_archive', 'subagent']) {
@@ -193,8 +238,46 @@ const INPUT_TEXT = `需求：登录功能改造
 优先级：P0
 来源：jira:PAY-100`
 
+/** 本地假登录 API：/api/login/sms（成功 200；验证码错 400）、/api/login（密码登录 200）。 */
+function startFakeApi(): Promise<{ server: Server; baseUrl: string }> {
+  return new Promise((resolve) => {
+    const server = createServer((req, res) => {
+      const url = req.url ?? ''
+      if (url.startsWith('/api/login/sms')) {
+        const raw: string[] = []
+        req.on('data', (chunk) => raw.push(String(chunk)))
+        req.on('end', () => {
+          let code = 'wrong'
+          try { code = String(JSON.parse(raw.join('') || '{}').code ?? 'wrong') } catch { /* ignore */ }
+          if (code === '123456') {
+            res.writeHead(200, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ token: 'sms-token-1', ok: true }))
+          } else {
+            res.writeHead(400, { 'content-type': 'application/json' })
+            res.end(JSON.stringify({ error: 'invalid code' }))
+          }
+        })
+        return
+      }
+      if (url.startsWith('/api/login')) {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ token: 'pwd-token-1', ok: true }))
+        return
+      }
+      res.writeHead(404)
+      res.end('not found')
+    })
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      if (address === null || typeof address === 'string') throw new Error('no port')
+      resolve({ server, baseUrl: `http://127.0.0.1:${address.port}` })
+    })
+  })
+}
+
 async function main(): Promise<void> {
   await ensureApiKey()
+  const { baseUrl } = await startFakeApi()
   const workdir = join(process.cwd(), '.e2e-workdir')
   await rm(workdir, { recursive: true, force: true })
   await mkdir(join(workdir, 'inputs'), { recursive: true })
@@ -206,7 +289,7 @@ async function main(): Promise<void> {
     systemPrompt: { persona: 'You are a careful testing engineer agent. Follow your instructions precisely.' },
   })
   await ctx.plugin(AgentLoop, { agents: [] })
-  registerTools(ctx, workdir)
+  registerTools(ctx, workdir, baseUrl)
   await ctx.plugin(LlmDeepSeek, { apiKeyEnv: 'DEEPSEEK_API_KEY', baseURL: 'https://api.deepseek.com' })
   await ctx.plugin(SubagentRuntime)
   await ctx.plugin(Spawn, { providerName: 'spawn' })
@@ -268,6 +351,18 @@ async function main(): Promise<void> {
     artifacts: new FsArtifactStore(workdir), // 基址 = agent CWD，artifactPath 相对路径直接解析
     checkpoint: new FsCheckpointPort(),
     receiveInput: join(workdir, 'inputs', 'requirements.txt'),
+    // execute 门禁 R4-08/09/10：读取 executor 真实执行会话
+    execution: {
+      load: async (stageId) => {
+        if (stageId !== 'execute') return undefined
+        try {
+          const raw = await readFile(join(workdir, 'executor', 'session.json'), 'utf8')
+          return JSON.parse(raw) as { records: never[]; evidence: never[] }
+        } catch {
+          return undefined
+        }
+      },
+    },
   })
 
   console.log('[minimal-host] driver run start...')

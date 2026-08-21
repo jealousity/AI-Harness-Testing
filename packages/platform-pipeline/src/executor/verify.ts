@@ -23,6 +23,13 @@ export interface ReconcileResult {
  * @param results - 阶段 agent 聚合的 results（每条带 recordRef）。
  * @returns 对账结果；任一问题 → ok=false。
  */
+/** 解析 recordRef：兼容纯数字（"1"）与 "seq-N"/"seq N"/"seqN"（LLM 可能写任一）。 */
+export function parseRecordRef(ref: string): number | undefined {
+  const match = /^(?:seq[\s-]*)?(\d+)$/.exec(ref.trim())
+  if (match === null) return undefined
+  return Number(match[1])
+}
+
 export function reconcile(
   records: readonly ExecutionRecord[],
   planCaseIds: readonly string[],
@@ -39,12 +46,12 @@ export function reconcile(
 
   const phantomResults: string[] = []
   for (const result of results) {
-    const seq = Number(result.recordRef)
-    if (!Number.isInteger(seq) || !recordSeqs.has(seq)) {
+    const seq = parseRecordRef(result.recordRef)
+    if (seq === undefined || !recordSeqs.has(seq)) {
       phantomResults.push(`${result.caseId}@${result.recordRef}`)
       continue
     }
-    referenced.add(result.recordRef)
+    referenced.add(String(seq))
   }
 
   const unclaimedRecords = records
