@@ -200,6 +200,16 @@ export {
 } from './prompt/review.ts'
 
 export {
+  pipelineContractSchemas,
+  STAGE_SCHEMAS,
+} from './contracts/schemas.ts'
+
+export {
+  stageRules,
+  type StageRulesOptions,
+} from './gates/stage-rules.ts'
+
+export {
   apply as pipelinePlugin,
   type PipelinePluginConfig,
   type PipelineService,

@@ -11,6 +11,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import { loadPipelineConfig } from './config.ts'
 import { FsArtifactStore, FsCheckpointPort } from './stores/fs.ts'
 import { MachineGateEngine, platformGenericRules } from './gates/machine.ts'
+import { stageRules } from './gates/stage-rules.ts'
+import { pipelineContractSchemas } from './contracts/schemas.ts'
 import { PipelineDriver, type HumanGatePort, type ReviewRunner, type RunOutcome } from './driver.ts'
 import type { StageSpawner } from './stage-spawner.ts'
 import type { PipelineConfig, StageId, SubsetSchema } from './types.ts'
@@ -48,8 +50,9 @@ export async function apply(ctx: Context, config: PipelinePluginConfig): Promise
   const cfg = await loadPipelineConfig(config.configPath)
   const artifacts = new FsArtifactStore(config.artifactsRoot)
   const checkpoint = new FsCheckpointPort()
+  const schemas = config.schemaByStage ?? pipelineContractSchemas()
   const gates = new MachineGateEngine(
-    platformGenericRules(config.schemaByStage ?? {}),
+    [...platformGenericRules(schemas), ...stageRules({ maxManualClaimedRatio: cfg.releasePolicy.maxManualClaimedRatio })],
     config.rulesetVersion ?? cfg.templateVersion,
   )
 

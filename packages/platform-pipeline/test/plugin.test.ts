@@ -10,6 +10,7 @@ import { computeArtifactDigest } from '../src/gates/machine.ts'
 import type { SpawnRequest, SpawnedRun, StageSpawner } from '../src/stage-spawner.ts'
 import type { HumanGatePort } from '../src/driver.ts'
 import type { PipelineConfig, StageArtifact } from '../src/types.ts'
+import { stageContent, type Content } from './fixtures.ts'
 
 const FIXTURE_YAML = `
 projectId: acme-pay-2026
@@ -34,7 +35,7 @@ test.afterEach(async () => {
   await rm(dir, { recursive: true, force: true })
 })
 
-/** 脚本替身 spawner：从上游产物计算 digest 写入 inputs（G-08 一致），写磁盘产物。 */
+/** 脚本替身 spawner：从上游产物生成符合契约的产物内容（G/R 规则全通过）。 */
 class ScriptedSpawn implements StageSpawner {
   readonly calls: string[] = []
   private readonly artifacts: FsArtifactStore
@@ -43,6 +44,13 @@ class ScriptedSpawn implements StageSpawner {
   }
   async runStage(request: SpawnRequest, _cfg: PipelineConfig): Promise<SpawnedRun> {
     this.calls.push(request.stageId)
+    // 读取传递性上游内容
+    const upstreamContents: Record<string, Content> = {}
+    for (const path of new Set(Object.values(request.inputPaths))) {
+      const upstream = await this.artifacts.read(path)
+      if (upstream !== null) upstreamContents[upstream.stageId] = upstream.content as Content
+    }
+    const content = stageContent(request.stageId, upstreamContents)
     const inputs: Record<string, string> = {}
     for (const [upstream, path] of Object.entries(request.inputPaths)) {
       const upstreamArtifact = await this.artifacts.read(path)
@@ -53,7 +61,7 @@ class ScriptedSpawn implements StageSpawner {
       stageId: request.stageId,
       version: 1,
       inputs,
-      content: { ok: true },
+      content,
       digest: '',
       path: request.artifactPath,
     }

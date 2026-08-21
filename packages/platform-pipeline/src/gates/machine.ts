@@ -45,22 +45,30 @@ export function computeArtifactDigest(artifact: Pick<StageArtifact, 'content' | 
 const PLACEHOLDER_RE = /TODO|待补充|同上|TBD|\.\.\./i
 const EVIDENCE_KEY_RE = /evidence|diagnosis/i
 
-/** 遍历产物，收集 id 集合与引用（G-07 内部一致性）。 */
-function collectIdsAndRefs(value: unknown, key: string | undefined, ids: Set<string>, refs: Array<{ ref: string; path: string }>, path: string): void {
+/** 内部引用键白名单（G-07 只查产物内部可解析的引用；sourceRef/recordRef 是外部引用不查）。 */
+const INTERNAL_REF_KEYS = new Set(['caseId', 'requirementId', 'related', 'coverageRef'])
+
+/** 遍历产物，收集 id 集合与内部引用（collectRefs=false 时只收 id，用于上游产物）。 */
+function collectIdsAndRefs(
+  value: unknown,
+  key: string | undefined,
+  ids: Set<string>,
+  refs: Array<{ ref: string; path: string }>,
+  path: string,
+  collectRefs = true,
+): void {
   if (typeof value === 'string') {
     if (key === 'id' || key === 'sourceCaseId') ids.add(value)
-    else if (key === 'caseId' || key === 'requirementId' || key === 'related' || (key !== undefined && key.endsWith('Ref'))) {
-      refs.push({ ref: value, path })
-    }
+    else if (collectRefs && key !== undefined && INTERNAL_REF_KEYS.has(key)) refs.push({ ref: value, path })
     return
   }
   if (Array.isArray(value)) {
-    value.forEach((item, index) => collectIdsAndRefs(item, key, ids, refs, `${path}[${index}]`))
+    value.forEach((item, index) => collectIdsAndRefs(item, key, ids, refs, `${path}[${index}]`, collectRefs))
     return
   }
   if (value !== null && typeof value === 'object') {
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      collectIdsAndRefs(v, k, ids, refs, `${path}.${k}`)
+      collectIdsAndRefs(v, k, ids, refs, `${path}.${k}`, collectRefs)
     }
   }
 }
@@ -185,14 +193,18 @@ export function platformGenericRules(schemaByStage: Readonly<Partial<Record<Stag
       id: 'G-07',
       level: 'BLOCKING',
       stages: 'all',
-      judge: ({ artifact }) => {
+      judge: ({ artifact, upstreams }) => {
         const ids = new Set<string>()
         const refs: Array<{ ref: string; path: string }> = []
         collectIdsAndRefs(artifact.content, undefined, ids, refs, '$')
+        // 上游产物的 id 也纳入解析（如 design 的 coverageRef 引用上游 receive 的需求 id）
+        for (const upstream of Object.values(upstreams)) {
+          collectIdsAndRefs(upstream.content, undefined, ids, refs, `upstream:${upstream.stageId}`, false)
+        }
         if (ids.size === 0) return []
         const violations: Violation[] = []
         for (const { ref, path } of refs) {
-          if (!ids.has(ref)) violations.push({ rule: 'G-07', level: 'BLOCKING', detail: `${path}: ref "${ref}" does not resolve within the artifact`, at: Date.now() })
+          if (!ids.has(ref)) violations.push({ rule: 'G-07', level: 'BLOCKING', detail: `${path}: ref "${ref}" does not resolve within the artifact or its upstreams`, at: Date.now() })
         }
         return violations
       },

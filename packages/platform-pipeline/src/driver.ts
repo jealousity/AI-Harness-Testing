@@ -109,7 +109,7 @@ export class PipelineDriver {
       if (artifact === null) {
         throw new Error(`stage "${stageId}" produced no artifact at ${spawned.artifactPath}`)
       }
-      const upstreams = await this.loadUpstreams(artifact.inputs, cp)
+      const upstreams = await this.loadUpstreams(stageId, cp)
 
       // 1. 机器门禁（全量重判；G-08 摘要锁在此拦截级联失效）
       const gate = this.options.gates.judge(stageId, artifact, upstreams, state.gate.machine.attempts + 1)
@@ -222,10 +222,13 @@ export class PipelineDriver {
     return out
   }
 
-  private async loadUpstreams(locks: Readonly<Record<string, string>>, cp: Checkpoint): Promise<Readonly<Record<string, StageArtifact>>> {
+  /** 加载当前阶段之前的全部产物（传递性上游，供 R3-01 等规则读取 receive 需求清单）。 */
+  private async loadUpstreams(stageId: StageId, cp: Checkpoint): Promise<Readonly<Record<string, StageArtifact>>> {
     const out: Record<string, StageArtifact> = {}
-    for (const upstream of Object.keys(locks)) {
-      const artifact = await this.options.artifacts.read(cp.stageStates[upstream as StageId]!.artifact)
+    const currentIndex = STAGE_ORDER.indexOf(stageId)
+    for (let i = 0; i < currentIndex; i++) {
+      const upstream = STAGE_ORDER[i]!
+      const artifact = await this.options.artifacts.read(cp.stageStates[upstream]!.artifact)
       if (artifact !== null) out[upstream] = artifact
     }
     return out
