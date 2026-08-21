@@ -16,6 +16,7 @@ function initialState(stageId: StageId, pipelineId: string): StageState {
     status: 'idle',
     artifact: `artifacts/${pipelineId}/${stageId}.json`,
     digest: '',
+    inputs: {},
     history: [],
     reviewDegraded: false,
     gate: {

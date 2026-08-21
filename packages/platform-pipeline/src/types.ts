@@ -133,6 +133,8 @@ export interface StageState {
   readonly status: CheckpointStatus
   readonly artifact: string
   readonly digest: string
+  /** 产物声明的上游 digest（G-08 摘要锁；由 driver 落盘时填充并持久化）。 */
+  readonly inputs: InputLocks
   /** 产物历史（重入/回环替换掉的旧版，docs/03 第 8.4 节）。 */
   readonly history: readonly { readonly digest: string; readonly capturedAt: number; readonly supersededBy?: number }[]
   readonly reviewDegraded: boolean

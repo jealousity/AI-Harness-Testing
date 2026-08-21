@@ -4,7 +4,8 @@
  * @module platform-pipeline/contracts/schemas
  */
 
-import type { StageId, SubsetSchema } from '../types.ts'
+import type { StageId } from '../types.ts'
+import type { SubsetSchema } from '../gates/schema.ts'
 
 const STRING = { type: 'string' } as const
 const STRING_ARRAY = { type: 'array', items: STRING } as const

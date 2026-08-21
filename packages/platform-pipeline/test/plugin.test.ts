@@ -126,7 +126,8 @@ test('run drives all six stages, writing artifacts and checkpoint to disk', asyn
   // 磁盘产物（6 个）与检查点
   for (const stage of ['receive', 'analyze', 'design', 'execute', 'report', 'archive']) {
     const artifact = await readFile(join(dir, 'artifacts', 'artifacts', 'pipe-1', `${stage}.json`), 'utf8')
-    assert.ok(JSON.parse(artifact).stageId === stage)
+    // 磁盘只存 content（裸产物，无 wrapper 字段）
+    assert.ok(JSON.parse(artifact).stageId === undefined)
   }
   const checkpoint = JSON.parse(await readFile(join(dir, 'checkpoints', 'pipe-1', 'checkpoint.json'), 'utf8'))
   assert.equal(checkpoint.cursor, 6)

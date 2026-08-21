@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { FsArtifactStore, FsCheckpointPort } from '../src/stores/fs.ts'
@@ -31,13 +31,19 @@ function artifact(): StageArtifact {
   return { ...base, digest: computeArtifactDigest(base) }
 }
 
-test('FsArtifactStore write → read round-trips', async () => {
+test('FsArtifactStore persists content and read wraps it (disk = bare content)', async () => {
   const store = new FsArtifactStore(join(dir, 'artifacts'))
   const art = artifact()
   await store.write(art)
+  // 磁盘只存 content（无 wrapper 字段）
+  const raw = await readFile(join(dir, 'artifacts', 'receive.json'), 'utf8')
+  assert.deepEqual(JSON.parse(raw), art.content)
+  // read 返回包装后的 wrapper（stageId 从路径派生；digest 由 content 重算）
   const loaded = await store.read('receive.json')
   assert.ok(loaded !== null)
-  assert.deepEqual(loaded, art)
+  assert.equal(loaded.stageId, 'receive')
+  assert.deepEqual(loaded.content, art.content)
+  assert.ok(loaded.digest.length === 64)
 })
 
 test('FsArtifactStore read missing returns null', async () => {

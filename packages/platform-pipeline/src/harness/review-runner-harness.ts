@@ -14,7 +14,8 @@ import type { ReviewOutcome, ReviewRunner } from '../driver.ts'
 import type { JudgeResult } from '../gates/machine.ts'
 import { assembleReviewPrompt } from '../prompt/review.ts'
 import { toContentBlocks } from './stage-spawner-harness.ts'
-import type { StageArtifact, StageId, SubsetSchema } from '../types.ts'
+import type { StageArtifact, StageId } from '../types.ts'
+import type { SubsetSchema } from '../gates/schema.ts'
 
 export interface HarnessReviewDeps {
   /** `ctx.subagents` 的 start 面。 */

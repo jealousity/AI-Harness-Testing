@@ -15,7 +15,8 @@ import { stageRules } from './gates/stage-rules.ts'
 import { pipelineContractSchemas } from './contracts/schemas.ts'
 import { PipelineDriver, type ExecutionLoader, type HumanGatePort, type ReviewRunner, type RunOutcome } from './driver.ts'
 import type { StageSpawner } from './stage-spawner.ts'
-import type { PipelineConfig, StageId, SubsetSchema } from './types.ts'
+import type { PipelineConfig, StageId } from './types.ts'
+import type { SubsetSchema } from './gates/schema.ts'
 import { join } from 'node:path'
 
 export interface PipelinePluginConfig {

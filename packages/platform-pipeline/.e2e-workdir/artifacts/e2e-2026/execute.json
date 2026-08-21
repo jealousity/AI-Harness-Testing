@@ -1,0 +1,84 @@
+{
+  "plan": {
+    "env": [
+      "minimal-host：env_diag 返回 []（无执行器接线、无诊断信息返回）",
+      "executor 未接线：executor_run(['TC-0001','TC-0002','TC-0003']) 返回 'executor not wired in minimal host'（本次运行真实调用），全部 auto 用例无法在本宿主真实执行"
+    ],
+    "executors": [
+      {
+        "level": "auto",
+        "impl": "executor_run(caseIds) —— 本次已调用 executor_run(['TC-0001','TC-0002','TC-0003'])，minimal host 未接线，无执行记录返回；按 R4-08/09/10 只聚合 executor 自产记录，不编造记录"
+      }
+    ],
+    "order": ["TC-0001", "TC-0002", "TC-0003"]
+  },
+  "results": [
+    {
+      "caseId": "TC-0001",
+      "recordRef": "none:executor-not-wired-in-minimal-host（executor_run(['TC-0001','TC-0002','TC-0003']) 本次返回 'executor not wired in minimal host'，未产生 executor 记录；按 R4-08/09/10 只聚合不改写，不编造记录 id）",
+      "status": "pending",
+      "evidence": [],
+      "durationMs": 0,
+      "attempts": 1,
+      "envIssueId": "env-001",
+      "note": "未执行（pending）：auto 用例因阻塞级环境问题 env-001（executor 未接线）无法真实执行，不计为用例失败（环境故障不记为用例失败）。evidence 为空原因：executor 未运行，无 evidence-manifest 条目可引用（本次运行已核实 artifacts/e2e-2026/evidence/evidence-manifest.json、evidence/evidence-manifest.json 均 ENOENT）；编造 manifest 条目 id 违反禁止编造纪律。门禁 G-03（evidence 非空）与 R4-08/09/10（executor 真实执行自产数据）须在已接线 executor 的宿主续跑、由 executor 自产记录与证据后方可满足。"
+    },
+    {
+      "caseId": "TC-0002",
+      "recordRef": "none:executor-not-wired-in-minimal-host（executor_run(['TC-0001','TC-0002','TC-0003']) 本次返回 'executor not wired in minimal host'，未产生 executor 记录；按 R4-08/09/10 只聚合不改写，不编造记录 id）",
+      "status": "pending",
+      "evidence": [],
+      "durationMs": 0,
+      "attempts": 1,
+      "envIssueId": "env-001",
+      "note": "未执行（pending）：auto 用例（错误验证码登录返回 400）因阻塞级环境问题 env-001（executor 未接线）无法真实执行，不计为用例失败；是否满足期望（HTTP 400 + 无凭据）需真实执行后判定，本宿主无执行器，不臆断 pass/fail。evidence 为空原因同 TC-0001：无 evidence-manifest 条目可引用，不编造。"
+    },
+    {
+      "caseId": "TC-0003",
+      "recordRef": "none:executor-not-wired-in-minimal-host（executor_run(['TC-0001','TC-0002','TC-0003']) 本次返回 'executor not wired in minimal host'，未产生 executor 记录；按 R4-08/09/10 只聚合不改写，不编造记录 id）",
+      "status": "pending",
+      "evidence": [],
+      "durationMs": 0,
+      "attempts": 1,
+      "envIssueId": "env-001",
+      "note": "未执行（pending）：auto 回归用例（密码登录不受影响）因阻塞级环境问题 env-001（executor 未接线）无法真实执行，不计为用例失败；是否满足期望（密码登录 HTTP 200 + 凭据）需真实执行后判定，本宿主无执行器，不臆断 pass/fail。evidence 为空原因同 TC-0001：无 evidence-manifest 条目可引用，不编造。"
+    }
+  ],
+  "envIssues": [
+    {
+      "id": "env-001",
+      "category": "server",
+      "severity": "blocking",
+      "issue": "测试执行器不可用（minimal host 未接线）：executor_run(['TC-0001','TC-0002','TC-0003']) 返回 'executor not wired in minimal host'（本次运行真实调用），全部 3 个 auto 用例无法真实执行；因此无法提供 executor 自产记录与 evidence-manifest，门禁 G-03（evidence 为空）与 R4-08/09/10（无 executor 执行数据）在本宿主内不可满足",
+      "diagnosis": [
+        "executor_run(['TC-0001','TC-0002','TC-0003']) -> 'executor not wired in minimal host'（本次运行调用，工具返回原文）",
+        "env_diag -> []（minimal host 无诊断信息返回）",
+        "fs_read('artifacts/e2e-2026/evidence/evidence-manifest.json') -> ENOENT；fs_read('evidence/evidence-manifest.json') -> ENOENT（本次运行核实：executor 从未运行，无证据清单可聚合）",
+        "上游 artifacts/e2e-2026/design.json 可读，3 个用例 execution_level 均为 auto（TC-0001/TC-0002/TC-0003），无 manual 用例"
+      ],
+      "impact": ["TC-0001", "TC-0002", "TC-0003"],
+      "resolution": "由编排器将 execute 阶段调度到已接入 executor 的宿主续跑：executor 真实执行 auto 用例并自产记录、写入 evidence/ 与 evidence-manifest 后，本阶段聚合其记录 id 与 manifest 条目 id 填充 recordRef/evidence/status（届时 resumed: true；已 pass 保留不重跑）",
+      "recommendation": "blocking：在具备 executor 能力的宿主上恢复执行；环境故障不得记为用例失败（本产物已按 pending + envIssueId 关联处理，未计入失败）。门禁 G-03（evidence 非空）与 R4-08/09/10（executor 真实执行数据）在本 minimal host 内无法满足——唯一合规路径是换宿主续跑；禁止编造证据/记录（R4-08/09/10 与禁止编造纪律）"
+    },
+    {
+      "id": "env-002",
+      "category": "other",
+      "severity": "warning",
+      "issue": "execute schema 文件不可达：schemas/execute.schema.json 在相对与多个绝对候选路径均读取返回 ENOENT，产物结构按任务第 3 节内嵌契约生成（以文件为准的复核待编排器补齐文件后执行）",
+      "diagnosis": [
+        "fs_read('schemas/execute.schema.json') -> ENOENT（本次运行）",
+        "fs_read('/Users/zhangzhixiong/Downloads/harness/test-platform-design/schemas/execute.schema.json') -> ENOENT（本次运行）",
+        "fs_read('/Users/zhangzhixiong/Downloads/harness/test-platform-design/packages/platform-pipeline/schemas/execute.schema.json') -> ENOENT（本次运行）",
+        "fs_read('.e2e-workdir/schemas/execute.schema.json') -> ENOENT（本次运行）"
+      ],
+      "impact": ["all"],
+      "resolution": "由编排器补齐 schemas/execute.schema.json 后，以文件为准复核本产物结构与字段是否一致",
+      "recommendation": "warning：不影响执行编排与结果记录；schema 文件缺失期间产物结构以任务第 3 节契约为准（本产物已采用），文件补齐后需复核"
+    }
+  ],
+  "pendingManual": [],
+  "resumed": false,
+  "inputs": {
+    "design": "unverified:execute-env-lacks-hash-tool;orchestrator-must-recompute-design-digest-per-G-08;contentFingerprint=testCases:[TC-0001(auto),TC-0002(auto),TC-0003(auto)];coverageMatrix:{PAY-100:[TC-0001,TC-0002,TC-0003]};reusedCases:[];gaps:[];inputs.analyze=unverified"
+  }
+}

@@ -1,0 +1,11 @@
+
+projectId: e2e-2026
+projectType: api-service
+templateVersion: v1
+scaleTier: S
+releasePolicy: { maxManualClaimedRatio: 0.3 }
+stores:
+  knowledge: { impl: markdown-fs, path: kb }
+  cases: { impl: markdown-fs, path: cases }
+  requirements: { primary: { impl: paste } }
+stages: {}

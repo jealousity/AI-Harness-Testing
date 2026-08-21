@@ -1,0 +1,61 @@
+{
+  "boundaries": {
+    "in": [
+      "手机号+验证码登录（新增接口 POST /api/login/sms）：验证码正确登录成功（PAY-100 acceptance: 手机号+验证码可登录成功）",
+      "验证码错误场景：返回 400（PAY-100 acceptance: 验证码错误返回 400）",
+      "既有密码登录回归：确认密码登录不受本次改造影响（PAY-100 acceptance: 密码登录不受影响；changePoints: 原有密码登录保留）"
+    ],
+    "out": [
+      "验证码发送/获取通道（短信网关、验证码生成与下发）——未在 PAY-100 changePoints 中明确，范围待澄清（见 openQuestions）",
+      "非登录域功能（支付、订单、账户注册、密码找回等）——未出现在 receive.json 需求中",
+      "密码登录的改造/下线——需求明确保留原密码登录，不做改动"
+    ]
+  },
+  "scope": "针对 PAY-100（P0，登录功能改造，sourceRef jira:PAY-100）的测试范围：正向测试手机号+验证码登录成功（新增 POST /api/login/sms）；异常测试验证码错误返回 400；回归测试既有密码登录不受影响。测试对象限定在登录认证接口层及错误处理，不扩展到支付/订单等下游业务域。",
+  "versionImpact": [
+    {
+      "version": "none",
+      "impact": "none（receive.json 中 PAY-100 记录无版本档案/版本字段，kb_query 与 case_query 检索为空，无版本档案条目或知识库条目可关联）",
+      "evidence": "receive.json#/requirements/0"
+    }
+  ],
+  "reuseSuggestions": [],
+  "openQuestions": [
+    {
+      "question": "需求背景（background）缺失：本次登录功能改造的背景/动因是什么（现状问题、业务诉求、触发原因）？",
+      "needs": "receive.json clarifications 已记录该问题，需需求方补充背景，用于风险与测试优先级判断",
+      "related": "PAY-100"
+    },
+    {
+      "question": "验证码的发送/获取机制未定义：验证码由哪个接口/系统下发、有效期多长、是否支持重发、错误次数是否有限制？",
+      "needs": "确认验证码发送接口契约与有效期/重发策略，否则无法设计验证码获取的前置步骤与超时/重发异常用例",
+      "related": "PAY-100"
+    },
+    {
+      "question": "验证码错误返回 400 的响应体规范未定义：错误码、message、字段结构是什么？",
+      "needs": "API 错误契约文档或补充需求，用于断言设计",
+      "related": "PAY-100"
+    },
+    {
+      "question": "登录接口安全/非功能策略未提及：是否有限流、防刷、验证码失效时长、短信服务依赖降级等要求？",
+      "needs": "安全与非功能需求确认，用于确定是否纳入测试范围及风险标注",
+      "related": "PAY-100"
+    },
+    {
+      "question": "receive.json 的 digest 无法在本 analyze 环境计算（无哈希计算工具），G-08 输入摘要锁如何比对？",
+      "needs": "由编排器按 G-08 重算 receive.json 当前 digest 并与本产物 inputs.receive 比对，避免门禁 BLOCKING",
+      "related": "PAY-100"
+    }
+  ],
+  "riskNotes": [
+    "kb_query 与 case_query 均返回空（最小化宿主，无历史资料），因此 reuseSuggestions 为空；无版本档案条目或知识库条目可引用，故 versionImpact none 的 evidence 采用 receive.json 字段引用 receive.json#/requirements/0（该 PAY-100 记录不含 version/版本字段），以满足 R2-03 对引用式 evidence 的要求（未验证，检索结果为空而非超限）。",
+    "schemas/analyze.schema.json 不存在（ENOENT，已尝试 schemas/ 与 packages/platform-pipeline/schemas/ 两级路径），产物结构按任务第 3 节契约生成，未引用不存在的 schema 文件。",
+    "receive.json 的 digest 无法在本阶段计算（工具白名单内无哈希工具），inputs.receive 为未验证状态；G-08 门禁需编排器重算比对（同 receive 阶段既有处理方式）。",
+    "需求背景字段缺失已在 receive.json clarifications 中记录，相关澄清由人工门 B/C 处理。",
+    "retrievalTruncated=false：kb_query/case_query 返回空结果而非超限截断。"
+  ],
+  "retrievalTruncated": false,
+  "inputs": {
+    "receive": "unverified:analyze-env-lacks-hash-tool;orchestrator-must-recompute-receive-digest-per-G-08"
+  }
+}

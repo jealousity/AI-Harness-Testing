@@ -1,0 +1,24 @@
+{
+  "requirements": [
+    {
+      "id": "PAY-100",
+      "title": "登录功能改造",
+      "background": "",
+      "goals": ["支持手机号+验证码登录"],
+      "changePoints": ["新增验证码登录接口 POST /api/login/sms", "原有密码登录保留"],
+      "acceptance": ["手机号+验证码可登录成功", "验证码错误返回 400", "密码登录不受影响"],
+      "priority": "P0",
+      "sourceRef": "jira:PAY-100"
+    }
+  ],
+  "clarifications": [
+    {
+      "requirementId": "PAY-100",
+      "field": "background",
+      "question": "输入（来源 jira:PAY-100）未提供需求背景（background）字段。请补充：本次登录功能改造的背景/动因是什么（例如现状问题、业务诉求、触发原因）。"
+    }
+  ],
+  "inputs": {
+    "input": "未验证（当前环境无哈希计算工具，无法计算输入文件 requirements.txt 的 digest，需由编排器重算比对）"
+  }
+}

@@ -79,7 +79,7 @@ test('R2-03: versionImpact evidence must be a reference (no whitespace)', () => 
 
 test('R3-01: uncovered requirement is BLOCKING (防漏测核心)', () => {
   const upstreams = upstreamsUpTo('design')
-  const content = stageContent('design', upstreams)
+  const content = contentFor('design', upstreams)
   const bad = { ...content, coverageMatrix: { 'REQ-1': ['TC-001'] } } // REQ-2 未覆盖
   const rule = rules.find(r => r.id === 'R3-01')!
   const violations = rule.judge({ stageId: 'design', artifact: artifact('design', bad), upstreams })
@@ -88,7 +88,7 @@ test('R3-01: uncovered requirement is BLOCKING (防漏测核心)', () => {
 
 test('R3-01: matrix referencing unknown case is BLOCKING', () => {
   const upstreams = upstreamsUpTo('design')
-  const content = stageContent('design', upstreams)
+  const content = contentFor('design', upstreams)
   const bad = { ...content, coverageMatrix: { 'REQ-1': ['TC-999'], 'REQ-2': ['TC-002'] } }
   const rule = rules.find(r => r.id === 'R3-01')!
   assert.ok(rule.judge({ stageId: 'design', artifact: artifact('design', bad), upstreams }).some(v => v.detail.includes('TC-999')))
@@ -96,7 +96,7 @@ test('R3-01: matrix referencing unknown case is BLOCKING', () => {
 
 test('R3-02: duplicate case id is BLOCKING', () => {
   const upstreams = upstreamsUpTo('design')
-  const content = stageContent('design', upstreams)
+  const content = contentFor('design', upstreams)
   const testCases = content.testCases as Record<string, unknown>[]
   const bad = { ...content, testCases: [testCases[0]!, { ...testCases[1]!, id: testCases[0]!.id }] }
   const rule = rules.find(r => r.id === 'R3-02')!
@@ -105,7 +105,7 @@ test('R3-02: duplicate case id is BLOCKING', () => {
 
 test('R3-04: gap for a covered requirement is BLOCKING', () => {
   const upstreams = upstreamsUpTo('design')
-  const content = stageContent('design', upstreams)
+  const content = contentFor('design', upstreams)
   const bad = { ...content, gaps: [{ requirementId: 'REQ-1', reason: 'x' }] }
   const rule = rules.find(r => r.id === 'R3-04')!
   assert.ok(rule.judge({ stageId: 'design', artifact: artifact('design', bad), upstreams }).length > 0)

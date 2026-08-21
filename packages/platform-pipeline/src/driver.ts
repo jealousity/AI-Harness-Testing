@@ -9,7 +9,7 @@
 
 import { initialCheckpoint } from './checkpoint.ts'
 import { stageRunContext, type StageSpawner } from './stage-spawner.ts'
-import { MachineGateEngine, type JudgeResult } from './gates/machine.ts'
+import { MachineGateEngine, computeArtifactDigest, type JudgeResult } from './gates/machine.ts'
 import type { ExecutionSession } from './executor/executor.ts'
 import {
   STAGE_ORDER,
@@ -68,6 +68,8 @@ export interface DriverOptions {
   readonly review?: ReviewRunner
   /** execute 阶段门禁需要 executor 执行数据（R4-08/09/10）。 */
   readonly execution?: ExecutionLoader
+  /** receive 阶段的输入文件路径（降级链末级；传给 receive agent 读取）。 */
+  readonly receiveInput?: string
   /** 门禁语义重试次数（docs/01 ET-01：默认 2）。 */
   readonly maxGateRetries?: number
 }
@@ -118,10 +120,16 @@ export class PipelineDriver {
         throw new Error(`stage "${stageId}" produced no artifact at ${spawned.artifactPath}`)
       }
       const upstreams = await this.loadUpstreams(stageId, cp)
+      // 宿主填充输入摘要锁（G-08）：优先用检查点持久化的 inputs（冻结），首次运行从当前上游填充
+      const persisted = cp.stageStates[stageId]!.inputs
+      const hasPersisted = persisted !== undefined && Object.keys(persisted).length > 0
+      const filled = hasPersisted
+        ? { ...artifact, inputs: persisted, digest: cp.stageStates[stageId]!.digest || computeArtifactDigest({ ...artifact, inputs: persisted }) }
+        : this.fillInputLocks(artifact, upstreams)
 
       // 1. 机器门禁（全量重判；G-08 摘要锁在此拦截级联失效；R4-08/09/10 需 executor 执行数据）
       const execution = await this.options.execution?.load(stageId, this.options.pipelineId)
-      const gate = this.options.gates.judge(stageId, artifact, upstreams, state.gate.machine.attempts + 1, execution)
+      const gate = this.options.gates.judge(stageId, filled, upstreams, state.gate.machine.attempts + 1, execution)
       if (gate.status === 'failed') {
         if (state.gate.machine.attempts < this.maxGateRetries) {
           cp = await this.update(cp, stageId, {
@@ -175,9 +183,11 @@ export class PipelineDriver {
         continue
       }
 
-      // 4. 推进
+      // 4. 推进（持久化 digest+inputs 供 G-08 跨运行级联）
       cp = await this.update(cp, stageId, {
         status: 'done',
+        digest: filled.digest,
+        inputs: filled.inputs,
         reviewDegraded: state.reviewDegraded,
         gate: { ...state.gate, human: { state: 'approved', records: state.gate.human.records } },
       })
@@ -224,6 +234,9 @@ export class PipelineDriver {
   // ── 私有辅助 ────────────────────────────────────────────────────────────────
 
   private inputPathsOf(stageId: StageId, cp: Checkpoint): Readonly<Record<string, string>> {
+    if (stageId === 'receive' && this.options.receiveInput !== undefined) {
+      return { input: this.options.receiveInput }
+    }
     const out: Record<string, string> = {}
     for (const upstream of STAGE_UPSTREAMS[stageId]!) {
       out[upstream] = cp.stageStates[upstream]!.artifact
@@ -241,6 +254,22 @@ export class PipelineDriver {
       if (artifact !== null) out[upstream] = artifact
     }
     return out
+  }
+
+  /** 宿主填充输入摘要锁（G-08）：为缺失的上游 digest 补全并重算 digest（上游变更 → 下次判定自动 BLOCKING）。 */
+  private fillInputLocks(artifact: StageArtifact, upstreams: Readonly<Record<string, StageArtifact>>): StageArtifact {
+    let changed = false
+    const inputs = { ...artifact.inputs }
+    for (const upstream of STAGE_UPSTREAMS[artifact.stageId] ?? []) {
+      if (inputs[upstream] !== undefined) continue
+      const digest = upstreams[upstream]?.digest
+      if (digest === undefined) continue
+      inputs[upstream] = digest
+      changed = true
+    }
+    if (!changed) return artifact
+    const base = { ...artifact, inputs }
+    return { ...base, digest: computeArtifactDigest(base) }
   }
 
   private async update(cp: Checkpoint, stageId: StageId, patch: Partial<StageState>): Promise<Checkpoint> {
