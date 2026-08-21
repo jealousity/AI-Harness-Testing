@@ -160,3 +160,25 @@ export {
   type DiagSpec,
   type EnvDiagOptions,
 } from './executor/env-diag.ts'
+
+export {
+  renderReport,
+  type DefectAnalysisEntry,
+  type DefectClassification,
+  type DefectSeverity,
+  type EvidenceIndexEntry,
+  type PriorityBucket,
+  type ReportContent,
+  type ReportStats,
+  type RiskEntry,
+  type SourceBucket,
+} from './report/render.ts'
+
+export {
+  MarkdownCaseStore,
+  MarkdownKnowledgeStore,
+  type CaseMeta,
+  type KnowledgeEntry,
+  type KnowledgeQuery,
+  type VersionedCase,
+} from './stores/markdown.ts'
