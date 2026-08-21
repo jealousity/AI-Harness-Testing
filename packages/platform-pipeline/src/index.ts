@@ -194,6 +194,12 @@ export {
 } from './execute/manual-session.ts'
 
 export {
+  assembleReviewPrompt,
+  REVIEW_CHECKLISTS,
+  type ReviewPromptInput,
+} from './prompt/review.ts'
+
+export {
   apply as pipelinePlugin,
   type PipelinePluginConfig,
   type PipelineService,

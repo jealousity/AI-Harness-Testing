@@ -1,0 +1,65 @@
+# 示例：ACME 支付平台测试流水线（docs/02 第 2 节 schema 草案的完整示例）
+# 用法：node packages/platform-pipeline/src/cli.mjs run --config examples/pipeline.yaml --pipeline-id acme-pay-2026-01
+# 注："G-01..G-07" 范围记号在装载时展开（expandRuleList）。
+
+projectId: acme-pay-2026
+projectType: api-service            # api-service | web-ui | desktop-client | mixed
+templateVersion: v1
+displayName: ACME 支付平台测试流水线
+
+executionPolicy:
+  defaultLevel: auto                # auto | hybrid | manual
+  overrides:
+    - match: "client-*"
+      level: manual
+
+scaleTier: M                        # S | M | L
+
+releasePolicy:
+  maxManualClaimedRatio: 0.3        # R5-06：manual 占比超限不得 approve
+
+stores:
+  knowledge:
+    impl: markdown-fs
+    path: kb/acme-pay
+  cases:
+    impl: markdown-fs
+    path: cases/acme-pay
+  requirements:
+    primary: { impl: jira, projectKey: PAY, mode: readonly-api }
+    fallback:
+      - { impl: export-files, dir: inputs/requirements }
+      - { impl: paste }
+
+stages:
+  receive:
+    gate: { human: { id: A, block: true } }
+    budget: { maxSteps: 20, timeoutMs: 600000, maxRetries: 2 }
+    rules: [G-01..G-07, R1-01..R1-04]
+    review: { enabled: false }
+  analyze:
+    gate: { human: { id: B, block: true }, human2: { id: C, block: true } }
+    budget: { maxSteps: 30, timeoutMs: 900000, maxRetries: 2 }
+    rules: [G-01..G-07, R2-01..R2-05]
+    review: { enabled: true }
+    tools: { deny: [kb_query] }     # 示例：项目关掉知识库检索（收窄，delta）
+  design:
+    gate: { human: { id: D, block: true } }
+    budget: { maxSteps: 40, timeoutMs: 1200000, maxRetries: 2, maxTestCases: 200 }
+    rules: [G-01..G-07, R3-01..R3-07]
+    review: { enabled: true }
+  execute:
+    gate: { human: { id: E, block: true } }
+    budget: { maxSteps: 100, timeoutMs: 0, maxRetries: 2 }
+    rules: [G-01..G-07, R4-01..R4-11]
+    review: { enabled: true }
+  report:
+    gate: { human: { id: F, block: true } }
+    budget: { maxSteps: 20, timeoutMs: 600000, maxRetries: 2 }
+    rules: [G-01..G-07, R5-01..R5-06]
+    review: { enabled: true }
+  archive:
+    gate: { human: { id: G, block: true } }
+    budget: { maxSteps: 20, timeoutMs: 600000, maxRetries: 2 }
+    rules: [G-01..G-07, R6-01..R6-05]
+    review: { enabled: false }
