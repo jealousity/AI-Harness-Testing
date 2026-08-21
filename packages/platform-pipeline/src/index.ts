@@ -182,3 +182,19 @@ export {
   type KnowledgeQuery,
   type VersionedCase,
 } from './stores/markdown.ts'
+
+export {
+  openManualSession,
+  validateAttestation,
+  isExpired,
+  DEFAULT_MANUAL_WINDOW_MS,
+  type ManualAttestation,
+  type ManualSession,
+  type AttestResult,
+} from './execute/manual-session.ts'
+
+export {
+  apply as pipelinePlugin,
+  type PipelinePluginConfig,
+  type PipelineService,
+} from './plugin.ts'
