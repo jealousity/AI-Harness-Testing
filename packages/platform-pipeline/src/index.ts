@@ -99,9 +99,12 @@ export {
 export type { InputLocks, StageArtifact } from './types.ts'
 
 export {
+  HarnessReviewRunner,
   HarnessStageSpawner,
+  REVIEW_OUTPUT_SCHEMA,
   toContentBlocks,
   toToolRestriction,
+  type HarnessReviewDeps,
   type HarnessSpawnerDeps,
 } from './harness/index.ts'
 

@@ -9,3 +9,9 @@ export {
   toToolRestriction,
   type HarnessSpawnerDeps,
 } from './stage-spawner-harness.ts'
+
+export {
+  HarnessReviewRunner,
+  REVIEW_OUTPUT_SCHEMA,
+  type HarnessReviewDeps,
+} from './review-runner-harness.ts'
