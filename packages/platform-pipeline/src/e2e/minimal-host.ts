@@ -31,19 +31,87 @@ import { HttpExecutor, type HttpCase, type HttpStep } from '../executor/http.ts'
 /** 工具调用超时上限：3 分钟（用户硬性要求：超时自动退出并汇报）。 */
 const TOOL_TIMEOUT_MS = 180_000
 
-/** 从桌面端凭据库读取 DEEPSEEK_API_KEY（不打印值）。 */
-async function ensureApiKey(): Promise<void> {
-  if (process.env.DEEPSEEK_API_KEY !== undefined && process.env.DEEPSEEK_API_KEY !== '') return
+/** LLM 提供者配置（自动切换：DeepSeek 余额不足时回退到千问）。 */
+interface LlmTarget {
+  readonly label: string
+  readonly apiKeyEnv: string
+  readonly baseURL: string
+  readonly model: string
+}
+
+const DEEPSEEK_TARGET: LlmTarget = {
+  label: 'DeepSeek 官方',
+  apiKeyEnv: 'DEEPSEEK_API_KEY',
+  baseURL: 'https://api.deepseek.com',
+  model: 'deepseek-v4-flash',
+}
+
+const QWEN_TARGET: LlmTarget = {
+  label: '千问 token-plan（自动切换）',
+  apiKeyEnv: 'QWEN_TOKEN_PLAN_CN_API_KEY',
+  baseURL: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+  model: 'qwen3.8-max',
+}
+
+/** 从凭据库加载指定 key 到 env；返回是否成功。 */
+async function loadKey(envName: string): Promise<boolean> {
+  if (process.env[envName] !== undefined && process.env[envName] !== '') return true
   try {
     const raw = await readFile(join(homedir(), '.dsh', '.credentials.yaml'), 'utf8')
-    const match = /DEEPSEEK_API_KEY:\s*"?([^"\n]+)"?/.exec(raw)
+    const match = new RegExp(`${envName}:\\s*"?([^"\\n]+)"?`).exec(raw)
     if (match?.[1] !== undefined) {
-      process.env.DEEPSEEK_API_KEY = match[1].trim()
-      console.log('[minimal-host] DEEPSEEK_API_KEY loaded from ~/.dsh/.credentials.yaml')
+      process.env[envName] = match[1].trim()
+      console.log(`[minimal-host] ${envName} loaded from ~/.dsh/.credentials.yaml`)
+      return true
     }
+  } catch { /* ignore */ }
+  return false
+}
+
+/** 探测端点是否可用（发一个最小请求，30 s 超时）。 */
+async function probeEndpoint(baseURL: string, apiKey: string): Promise<boolean> {
+  try {
+    const resp = await fetch(`${baseURL}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
+      signal: AbortSignal.timeout(30_000),
+    })
+    if (resp.ok) return true
+    // 检查是否为余额不足 / 认证错误（这些情况明确不可用）
+    const text = await resp.text()
+    if (text.includes('Insufficient Balance') || text.includes('invalid_api_key') || text.includes('invalid_request_error')) return false
+    // 其他 HTTP 错误也视为不可用
+    return false
   } catch {
-    throw new Error('DEEPSEEK_API_KEY 未设置且无法从 ~/.dsh/.credentials.yaml 读取')
+    return false
   }
+}
+
+/** 选择 LLM 提供者：优先 DeepSeek，余额不足时自动切换到千问。 */
+async function selectLlmProvider(): Promise<LlmTarget> {
+  const deepseekOk = await loadKey(DEEPSEEK_TARGET.apiKeyEnv)
+  const qwenOk = await loadKey(QWEN_TARGET.apiKeyEnv)
+
+  if (!deepseekOk && !qwenOk) {
+    throw new Error('既无 DEEPSEEK_API_KEY 也无 QWEN_TOKEN_PLAN_CN_API_KEY')
+  }
+
+  if (deepseekOk) {
+    const usable = await probeEndpoint(DEEPSEEK_TARGET.baseURL, process.env[DEEPSEEK_TARGET.apiKeyEnv]!)
+    if (usable) {
+      console.log('[minimal-host] LLM: 使用 DeepSeek 官方（余额充足）')
+      return DEEPSEEK_TARGET
+    }
+    console.log('[minimal-host] LLM: DeepSeek 余额不足，自动切换到千问')
+  }
+
+  if (qwenOk) {
+    console.log(`[minimal-host] LLM: 使用${QWEN_TARGET.label}`)
+    return QWEN_TARGET
+  }
+
+  throw new Error('DeepSeek 不可用且未找到千问密钥')
 }
 
 function textResult(text: string): ContentBlock[] {
@@ -288,7 +356,7 @@ function startFakeApi(): Promise<{ server: Server; baseUrl: string }> {
 }
 
 async function main(): Promise<void> {
-  await ensureApiKey()
+  const target = await selectLlmProvider()
   const { baseUrl } = await startFakeApi()
   const workdir = join(process.cwd(), '.e2e-workdir')
   await rm(workdir, { recursive: true, force: true })
@@ -303,13 +371,19 @@ async function main(): Promise<void> {
   await ctx.plugin(AgentLoop, { agents: [] })
   registerTools(ctx, workdir, baseUrl)
   applyToolTimeoutPolicy(ctx) // 工具调用 >3 分钟自动中止并汇报（用户硬性要求）
-  await ctx.plugin(LlmDeepSeek, { apiKeyEnv: 'DEEPSEEK_API_KEY', baseURL: 'https://api.deepseek.com' })
+  // 千问需要禁用 thinking（避免发送 reasoning_effort），并覆盖模型目录
+  const pluginConfig: Record<string, unknown> = { apiKeyEnv: target.apiKeyEnv, baseURL: target.baseURL }
+  if (target === QWEN_TARGET) {
+    pluginConfig.thinking = 'disabled'
+    pluginConfig.models = [{ id: 'qwen3.8-max', name: 'Qwen3.8 Max', contextWindow: 1_000_000, maxTokens: 131_072 }]
+  }
+  await ctx.plugin(LlmDeepSeek, pluginConfig as never)
   await ctx.plugin(SubagentRuntime)
   await ctx.plugin(Spawn, { providerName: 'spawn' })
 
   const parent = ctx.agentLoop.create(SessionId('pipeline-parent'), {
     provider: 'deepseek-official',
-    model: 'deepseek-v4-flash',
+    model: target.model,
   })
   console.log('[minimal-host] parent agent created:', parent.id)
 
