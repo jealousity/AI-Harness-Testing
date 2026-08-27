@@ -25,6 +25,7 @@ import { stageRules } from '../gates/stage-rules.ts'
 import { pipelineContractSchemas } from '../contracts/schemas.ts'
 import { PipelineDriver, type HumanGatePort } from '../driver.ts'
 import { HarnessStageSpawner } from '../harness/stage-spawner-harness.ts'
+import { HarnessReviewRunner } from '../harness/review-runner-harness.ts'
 import { applyToolTimeoutPolicy } from '../harness/tool-timeout.ts'
 import { HttpExecutor, type HttpCase, type HttpStep } from '../executor/http.ts'
 
@@ -437,6 +438,13 @@ async function main(): Promise<void> {
     human: new ApprovingHuman(),
     artifacts: new FsArtifactStore(workdir), // 基址 = agent CWD，artifactPath 相对路径直接解析
     checkpoint: new FsCheckpointPort(),
+    // 交叉检查（docs/03 第 7 节）：独立审核 agent 盲审；cfg 开启的阶段（analyze/design/execute/report）生效
+    review: new HarnessReviewRunner({
+      subagents: ctx.subagents,
+      parent,
+      signal: new AbortController().signal,
+      toolFilter: { allow: ['fs_read'] }, // 盲审只读
+    }),
     receiveInput: join(workdir, 'inputs', 'requirements.txt'),
     // execute 门禁 R4-08/09/10：读取 executor 真实执行会话
     execution: {
@@ -455,6 +463,30 @@ async function main(): Promise<void> {
   console.log('[minimal-host] driver run start...')
   const outcome = await driver.run()
   console.log('[minimal-host] outcome:', JSON.stringify(outcome))
+
+  // 重入场景（E2E_REENTRY=1）：需求变更 → 重入 receive → 级联重跑全下游
+  if (process.env.E2E_REENTRY === '1' && outcome.outcome === 'completed') {
+    console.log('[minimal-host] === 重入场景：需求变更，重入 receive ===')
+    const inputPath = join(workdir, 'inputs', 'requirements.txt')
+    await writeFile(inputPath, `${INPUT_TEXT}
+补充变更点：验证码发送频率限制——同一手机号 60 秒内仅可发送 1 次，超限返回 429
+补充验收标准：4) 60 秒内重复发送验证码返回 429`)
+    const cpAfterReenter = await driver.reenter('receive', 'e2e-tester', '需求变更：新增验证码频率限制')
+    console.log('[minimal-host] reenter done; analyze.inputs 已解锁:', JSON.stringify(cpAfterReenter.stageStates.analyze.inputs))
+    const reentryOutcome = await driver.run()
+    console.log('[minimal-host] reentry outcome:', JSON.stringify(reentryOutcome))
+    if (reentryOutcome.outcome !== 'completed') {
+      throw new Error(`重入级联重跑未完成: ${JSON.stringify(reentryOutcome)}`)
+    }
+    // 验证：重入记录 + 全部下游重跑 + history 归档
+    const cpFinal = await new FsCheckpointPort().load(join(workdir, 'checkpoints'))
+    if (cpFinal === null) throw new Error('重入后检查点丢失')
+    console.log('[minimal-host] reentries:', JSON.stringify(cpFinal.reentries.map(r => ({ stageId: r.stageId, by: r.by, reason: r.reason }))))
+    for (const stage of ['receive', 'analyze', 'design', 'execute', 'report', 'archive'] as const) {
+      const st = cpFinal.stageStates[stage]
+      console.log(`[minimal-host] ${stage}: status=${st.status} history=${st.history.length} inputs=${JSON.stringify(st.inputs).slice(0, 80)}`)
+    }
+  }
 
   for (const stage of ['receive', 'analyze', 'design']) {
     try {

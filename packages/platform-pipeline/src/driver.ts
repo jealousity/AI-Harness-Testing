@@ -210,6 +210,19 @@ export class PipelineDriver {
       stageStates[id] = {
         ...s,
         status: 'needs-reentry',
+        // 重入 = 全新生命周期（docs/03 第 8.2 节 [6]"全新 spawn"）：
+        // - 输入摘要锁解锁：重跑时按当前上游重新锁定（G-08 复验）；否则下游
+        //   持久化的旧 digest 会把级联重跑永久 BLOCKING（锁只对未重跑阶段生效）；
+        // - 机器门禁归零：不把上一周期的违规清单回喂进重入 prompt；
+        // - 人工门重开（docs/03 第 8.6 节），批准记录保留作审计；
+        // - review 失败计数清零：重入后交叉检查重试预算重新开始。
+        inputs: {},
+        digest: '',
+        failures: [],
+        gate: {
+          machine: { status: 'passed', attempts: 0, violations: [] },
+          human: { state: 'open', records: s.gate.human.records },
+        },
         // 旧产物归档进 history（docs/03 第 8.4 节），保留审计
         history: s.digest === '' ? s.history : [...s.history, { digest: s.digest, capturedAt: Date.now() }],
       }

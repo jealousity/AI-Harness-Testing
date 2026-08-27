@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { PipelineDriver, type ArtifactStore, type CheckpointPort, type HumanGatePort, type ReviewOutcome, type ReviewRunner } from '../src/driver.ts'
-import { MachineGateEngine, computeArtifactDigest, type GateRule } from '../src/gates/machine.ts'
+import { MachineGateEngine, computeArtifactDigest, platformGenericRules, type GateRule } from '../src/gates/machine.ts'
 import { initialCheckpoint } from '../src/checkpoint.ts'
 import { normalizeConfig } from '../src/config.ts'
 import { resolveStageAcl, type SpawnRequest, type SpawnedRun, type StageSpawner } from '../src/stage-spawner.ts'
@@ -260,6 +260,60 @@ test('review degraded records flag and proceeds', async () => {
   })
   const outcome = await d.run()
   assert.deepEqual(outcome, { outcome: 'completed' })
+})
+
+test('reenter receive after upstream change: cascade re-locks inputs and completes (no G-08 deadlock)', async () => {
+  // receive 重跑时内容变化（模拟需求变更）→ digest 变化 → 下游必须重新锁定而非被旧锁永久 BLOCKING
+  const artifacts = new MemoryArtifacts()
+  const calls: StageId[] = []
+  let receiveRound = 0
+  const spawn: StageSpawner = {
+    async runStage(request: SpawnRequest): Promise<SpawnedRun> {
+      calls.push(request.stageId)
+      if (request.stageId === 'receive') receiveRound += 1
+      const content = request.stageId === 'receive' ? { ok: true, round: receiveRound } : { ok: true }
+      const artifact: StageArtifact = {
+        pipelineId: request.pipelineId, stageId: request.stageId, version: 1,
+        inputs: {}, content, digest: '', path: request.artifactPath,
+      }
+      artifacts.put({ ...artifact, digest: computeArtifactDigest(artifact) })
+      return { stageId: request.stageId, artifactPath: request.artifactPath }
+    },
+  }
+  const cp = new MemoryCheckpoint()
+  const gates = new MachineGateEngine(
+    platformGenericRules({}).filter(r => r.id === 'G-08'),
+    'rules-v1',
+  )
+  const driver = new PipelineDriver({
+    cfg: cfg(), pipelineId: 'pipe-1', root: 'artifacts/pipe-1', rulesetVersion: 'rules-v1',
+    spawn, gates, human: new ScriptedHuman(), artifacts, checkpoint: cp,
+    review: undefined,
+  })
+
+  assert.deepEqual(await driver.run(), { outcome: 'completed' })
+  const firstReceiveDigest = cp.value?.stageStates.receive.digest
+  assert.ok(firstReceiveDigest !== undefined && firstReceiveDigest !== '')
+
+  await driver.reenter('receive', 'tester', '需求变更')
+  // 重入解锁：下游输入锁清零、机器门禁归零（重跑时按当前上游重新锁定）
+  assert.deepEqual(cp.value?.stageStates.analyze.inputs, {})
+  assert.equal(cp.value?.stageStates.analyze.gate.machine.violations.length, 0)
+  assert.deepEqual(cp.value?.stageStates.receive.inputs, {})
+
+  assert.deepEqual(await driver.run(), { outcome: 'completed' })
+  // receive 重跑后 digest 变化（内容变了）
+  const newReceiveDigest = cp.value?.stageStates.receive.digest
+  assert.notEqual(newReceiveDigest, firstReceiveDigest)
+  // analyze 已重新锁定到 receive 的新 digest（G-08 通过 = 级联重跑完成）
+  assert.equal(cp.value?.stageStates.analyze.inputs.receive, newReceiveDigest)
+  // design 锁定到 analyze 的库内 digest（wrapContent 口径：inputs 待宿主填充）
+  const analyzeStored = artifacts.map.get(cp.value!.stageStates.analyze.artifact)
+  assert.equal(cp.value?.stageStates.design.inputs.analyze, analyzeStored?.digest)
+  // 全部六阶段重跑
+  assert.equal(calls.length, 12)
+  // 旧 digest 归档进 history（docs/03 第 8.4 节）
+  assert.ok((cp.value?.stageStates.analyze.history.length ?? 0) >= 1)
 })
 
 test('reenter rolls back cursor, marks downstream needs-reentry, and resumes', async () => {

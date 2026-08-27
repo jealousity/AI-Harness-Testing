@@ -10,6 +10,7 @@
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SubagentRuntime } from '@deepseek-ai/dsh-subagent'
+import type { ToolRestriction } from '@deepseek-ai/dsh-tools'
 import type { ReviewOutcome, ReviewRunner } from '../driver.ts'
 import type { JudgeResult } from '../gates/machine.ts'
 import { assembleReviewPrompt } from '../prompt/review.ts'
@@ -25,6 +26,8 @@ export interface HarnessReviewDeps {
   readonly signal: AbortSignal
   readonly providerName?: string
   readonly maxDepth?: number
+  /** 审核 agent 工具限制（盲审只需只读；默认由宿主决定）。 */
+  readonly toolFilter?: ToolRestriction
 }
 
 /** 审核报告结构化 schema（docs/03 第 7.4 节；outputSchema 用，断言子集兼容）。 */
@@ -82,14 +85,21 @@ export class HarnessReviewRunner implements ReviewRunner {
       upstreamPaths,
       violations: gate.violations.map(v => ({ rule: v.rule, level: v.level, detail: v.detail })),
     })
-    const run = await this.deps.subagents.start(this.deps.providerName ?? 'spawn', {
-      label: `review:${stageId}`,
-      prompt: toContentBlocks(prompt),
-      parent: this.deps.parent,
-      signal: this.deps.signal,
-      outputSchema: REVIEW_OUTPUT_SCHEMA as never, // <验证点> ObjectJsonSchema 断言子集
-      ...(this.deps.maxDepth === undefined ? {} : { maxDepth: this.deps.maxDepth }),
-    })
+    let run: Awaited<ReturnType<SubagentRuntime['start']>>
+    try {
+      run = await this.deps.subagents.start(this.deps.providerName ?? 'spawn', {
+        label: `review:${stageId}`,
+        prompt: toContentBlocks(prompt),
+        parent: this.deps.parent,
+        signal: this.deps.signal,
+        outputSchema: REVIEW_OUTPUT_SCHEMA as never, // <验证点> ObjectJsonSchema 断言子集
+        ...(this.deps.toolFilter === undefined ? {} : { toolFilter: this.deps.toolFilter }),
+        ...(this.deps.maxDepth === undefined ? {} : { maxDepth: this.deps.maxDepth }),
+      })
+    } catch (error) {
+      // 审核不可用 → 降级（docs/03 第 7.5 节），不阻塞流水线
+      return { verdict: 'degraded', findings: [`审核 agent 启动失败（${error instanceof Error ? error.message : String(error)}）`] }
+    }
     try {
       const result = await run.result
       if (result.stopReason !== 'completed' || result.structured === undefined) {
@@ -100,6 +110,8 @@ export class HarnessReviewRunner implements ReviewRunner {
         verdict: structured.verdict,
         findings: structured.findings.map(f => f.claim),
       }
+    } catch (error) {
+      return { verdict: 'degraded', findings: [`审核 agent 运行失败（${error instanceof Error ? error.message : String(error)}）`] }
     } finally {
       run.dispose()
     }
