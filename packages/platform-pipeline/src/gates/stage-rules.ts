@@ -79,7 +79,7 @@ export function stageRules(options: StageRulesOptions = {}): readonly GateRule[]
           const entry = asObj(raw)
           const evidence = String(entry.evidence ?? '')
           if (evidence.trim() === '' || /\s/.test(evidence) || evidence.length < 3) {
-            violations.push(v('R2-03', `versionImpact entry "${String(entry.version ?? '')}" evidence must be a reference (got "${evidence}")`))
+            violations.push(v('R2-03', `versionImpact entry "${String(entry.version ?? '')}" evidence must be a reference (got "${evidence}"). 修复：evidence 改为无空白引用串——JSON Pointer 风格（如 receive.json#/requirements/0/changePoints）或条目 id（如 kb-entry-123）；含空格的解释句请移到 impact 或 riskNotes。`))
           }
         }
         return violations
@@ -145,7 +145,7 @@ export function stageRules(options: StageRulesOptions = {}): readonly GateRule[]
           const requirementId = String(asObj(raw).requirementId ?? '')
           const covered = asArray(matrix[requirementId])
           if (covered.length > 0) {
-            violations.push(v('R3-04', `gaps lists "${requirementId}" but coverageMatrix covers it (${covered.join(', ')})`))
+            violations.push(v('R3-04', `gaps lists "${requirementId}" but coverageMatrix covers it (${covered.join(', ')}). 修复：从 gaps 中删除该条目——该需求点已有用例；其未覆盖方面（非功能性约束等）保留在上游 analyze.json 的 openQuestions，不要写入 gaps。`))
           }
         }
         return violations

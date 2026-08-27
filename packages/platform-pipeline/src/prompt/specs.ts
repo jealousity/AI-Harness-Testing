@@ -63,6 +63,14 @@ export const STAGE_SPECS: Readonly<Record<StageId, StagePromptSpec>> = {
 2. 输出修改边界 boundaries.in / boundaries.out、测试范围 scope；
 3. 输出版本影响 versionImpact：每条带依据（版本档案条目/需求变更点/知识库条目），
    无影响时显式写 "none"；
+   evidence 的格式（机器门禁 R2-03 强制，务必遵守）：
+   - 必须是"引用串"——无空白的定位字符串，能直接定位到依据所在位置；
+   - 合法形式：JSON Pointer 风格（如 receive.json#/requirements/0/changePoints）、
+     条目 id（如 kb-entry-123）、文件路径+锚点；
+   - 非法形式：任何含空格的描述性文字（如 "receive.json 的需求变更点"、
+     "基于现有输入无法确认" 这类解释句）——解释放 impact/riskNotes，evidence 只放引用；
+   - 检索为空/无版本档案时：version 写 "none"、impact 写 "none"，evidence 仍可写
+     一个合法引用串指向你实际检查过的位置（如 receive.json#/requirements/0）；
 4. 给出复用建议 reuseSuggestions（候选用例 + 理由 + 适配动作），但不下复用决策；
 5. 无法确认的问题写入 openQuestions（每条带 needs 与 related），只抛出，不自行回答；
 6. 检索结果超限 → 标记 retrievalTruncated: true 并在 riskNotes 说明。
@@ -70,7 +78,7 @@ export const STAGE_SPECS: Readonly<Record<StageId, StagePromptSpec>> = {
     schemaInline: `{
   "boundaries": { "in": ["string, 必填, ≥1"], "out": ["string, 必填"] },
   "scope": "string, 必填",
-  "versionImpact": [{ "version": "", "impact": "", "evidence": "必填" }],
+  "versionImpact": [{ "version": "", "impact": "", "evidence": "必填：无空白引用串，如 receive.json#/requirements/0/id" }],
   "reuseSuggestions": [{
     "caseId": "string, 必填（须能用例库查回）",
     "reason": "string, 必填",
@@ -82,8 +90,8 @@ export const STAGE_SPECS: Readonly<Record<StageId, StagePromptSpec>> = {
 }`,
     allowTools: ['kb_query', 'case_query', 'fs_read', 'fs_write'],
     denyTools: ['写知识库/用例库', '生成用例', '执行测试', '修改 receive.json 或任何上游产物'],
-    boundaries: '- 不修改需求内容（receive.json 的原文、优先级、范围一概不动）。',
-    artifactNotes: '- 每个结论字段尽量附 evidence（版本档案条目 id / 知识库条目 id / receive.json 字段引用）。',
+    boundaries: '- 不修改需求内容（receive.json 的原文、优先级、范围一概不动）。\n- evidence 一律为无空白引用串（R2-03）：JSON Pointer 风格或条目 id；含空格的解释句会直接 BLOCKING。',
+    artifactNotes: '- 每个结论字段尽量附 evidence（版本档案条目 id / 知识库条目 id / receive.json#/… 形式的 JSON Pointer）。',
   },
 
   design: {
@@ -93,22 +101,30 @@ export const STAGE_SPECS: Readonly<Record<StageId, StagePromptSpec>> = {
 2. 覆盖矩阵 coverageMatrix 与 testCases ∪ reusedCases 双向一致；
 3. 复用清单中的用例单独列出为 reusedCases（不并入 testCases），
    带 sourceCaseId + 适配动作（unchanged / modify-data / modify-expectation）+ 适配后完整内容；
-4. 无法覆盖的需求点写入 gaps（带原因），宁可 gaps 也不要假装覆盖；
+4. gaps 的语义（机器门禁 R3-04 强制，务必遵守）：
+   - gaps 只收录"一条用例都没有"的需求点（该 requirementId 不出现在 coverageMatrix 的键里）；
+   - 一个需求点只要已有 ≥1 条用例，就绝不能写进 gaps——即使它还有无法给出可执行断言的方面
+     （如缺失的非功能性约束、未明确的凭证格式）；这类"未覆盖方面"保留在上游 analyze.json 的
+     openQuestions 即可，不要在 design 产物里重复记录；
+   - 因此：写完产物后自检——对每个 gaps[i].requirementId，确认 coverageMatrix 里没有这个键；
+     两者同时出现同一个 requirementId 即 BLOCKING；
+   - 宁可少写用例也不要假装覆盖，但"少写用例"的正确做法是：该需求点零用例 + 写入 gaps，
+     而不是"有用例 + 又写 gaps"；
 5. 用例总数（testCases + reusedCases）不得超过预算上限；超出按 P0/P1/P2 分层取舍。
 定位：你是"设计执行者"，不是"决策者"——复用范围来自人工门 C 的确认清单。`,
     schemaInline: `{
   "testCases": [{ "id": "TC-", "title": "", "preconditions": ["≥1"],
     "execution_level": "auto|hybrid|manual", "priority": "P0|P1|P2",
     "coverageRef": ["REQ-id"], "steps": [{"action":"","data":{}}],
-    "expected": ["≥1"], "data": "可选", "cleanup": "可选" }],
+    "expected": ["≥1"], "data": "可选，必须是字符串（用例级数据文本；steps[].data 才是对象）", "cleanup": "可选" }],
   "reusedCases": [{ "id": "TC-", "sourceCaseId": "历史库 id", "title": "",
     "adaptation": "unchanged|modify-data|modify-expectation", "...": "同 testCases" }],
   "coverageMatrix": { "REQ-001": ["TC-0001"] },
-  "gaps": [{ "requirementId": "REQ-id", "reason": "" }]
+  "gaps": [{ "requirementId": "零用例的需求点 id（禁止与 coverageMatrix 的键重复）", "reason": "" }]
 }`,
     allowTools: ['fs_read', 'fs_write'],
     denyTools: ['执行测试', '写知识库/用例库', '自行决定复用清单之外的用例'],
-    boundaries: '- steps 与 expected 不能是空话；无法给出可执行断言的场景写入 gaps。\n- 覆盖矩阵与 gaps 必须自洽（R3-04）。',
+    boundaries: '- steps 与 expected 不能是空话。\n- gaps 与 coverageMatrix 互斥（R3-04）：同一需求点要么在矩阵里有 ≥1 条用例，要么在 gaps 里——二者只能选一。\n- 已覆盖需求点的"未覆盖方面"（非功能性约束缺失等）不写 gaps，留在上游 openQuestions。',
     artifactNotes: '- 每条用例的 coverageRef 必须指向 analyze.json 中真实存在的需求点 id。',
   },
 
@@ -135,7 +151,7 @@ export const STAGE_SPECS: Readonly<Record<StageId, StagePromptSpec>> = {
     schemaInline: `{
   "plan": { "env": ["≥1"], "executors": [{"level":"auto|hybrid|manual","impl":""}],
     "order": ["覆盖全部用例 id"] },
-  "results": [{ "caseId": "", "recordRef": "executor 记录 id（必填）",
+  "results": [{ "caseId": "", "recordRef": "executor_run 返回的记录 seq 号（必填，原样填写，如 \"1\"）",
     "status": "pass|fail|pending", "evidence": ["manifest 条目 id"],
     "durationMs": 0, "attempts": 1, "envIssueId": "可选",
     "manualClaimed": "可选", "attestedBy": "可选", "sessionId": "可选",
