@@ -298,7 +298,7 @@ function registerTools(ctx: Context, baseDir: string, baseUrl: string): void {
 
 /** e2e 用的自动人工门 provider（复用 ctx.userQuestions 服务）：默认每门批准；
  * 可通过环境变量 E2E_HUMAN_GATES="execute=需修改,report=批准" 注入脚本化裁决。 */
-function makeHumanGate(ctx: Context, parentSessionId: string): HumanGatePort {
+function makeHumanGate(ctx: Context, parentSessionId: string, parent: { id: string }): HumanGatePort {
   const answers: Record<string, string> = {}
   const raw = process.env.E2E_HUMAN_GATES
   if (raw) {
@@ -323,6 +323,7 @@ function makeHumanGate(ctx: Context, parentSessionId: string): HumanGatePort {
   return Object.assign(
     new UiUserQuestionsHumanGate({
       userQuestions: ctx.userQuestions,
+      agent: parent,
       by: parentSessionId,
       onDecision: (record) => {
         onDecisions.push({ stageId: record.stageId, action: record.action, note: record.note })
@@ -500,7 +501,7 @@ async function main(): Promise<void> {
       [...platformGenericRules(pipelineContractSchemas()), ...stageRules({ maxManualClaimedRatio: 0.3 })],
       'e2e-v1',
     ),
-    human: makeHumanGate(ctx, parent.id),
+    human: makeHumanGate(ctx, parent.id, parent),
     artifacts: new FsArtifactStore(workdir), // 基址 = agent CWD，artifactPath 相对路径直接解析
     checkpoint: new FsCheckpointPort(),
     // 交叉检查（docs/03 第 7 节）：独立审核 agent 盲审；cfg 开启的阶段（analyze/design/execute/report）生效。

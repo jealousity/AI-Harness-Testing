@@ -43,7 +43,7 @@ interface AskAnswer {
 }
 
 export interface UserQuestions {
-  ask(request: { readonly questions: readonly AskItem[]; readonly signal?: AbortSignal }): Promise<AskAnswer>
+  ask(request: { readonly questions: readonly AskItem[]; readonly signal?: AbortSignal; readonly agent?: { readonly id: string } }): Promise<AskAnswer>
 }
 
 // ── 裁决审计记录（HumanGateRecord 子集）──
@@ -62,11 +62,13 @@ export interface HumanGateDeps {
   /** 裁决记录回调（可选；落审计/检查点用）。 */
   readonly onDecision?: (record: HumanGateAuditRecord) => void
   /** 人工门 id（如 'A'~'G'）与阶段的映射；缺省按阶段顺序推导 A/B/C/D/E/F。 */
-  readonly gateLetterByStage?: Readonly<Record<StageId, string>>
+  readonly gateLetterByStage?: Partial<Readonly<Record<StageId, string>>>
   /** 取消信号（流水线整体取消时不再阻塞等人工）。 */
   readonly signal?: AbortSignal
   /** 裁决人标识（记录用）。 */
   readonly by?: string
+  /** 发起问答主体的会话 agent（真 provider/web 交互必须传真实 live root Agent；缺省为无 session 交互）。 */
+  readonly agent?: { readonly id: string }
 }
 
 export const APPROVE = '批准' as const
@@ -152,7 +154,11 @@ export class UiUserQuestionsHumanGate implements HumanGatePort {
 
     let answer: AskAnswer
     try {
-      answer = await this.deps.userQuestions.ask({ questions: [q], signal: this.deps.signal })
+      answer = await this.deps.userQuestions.ask({
+        questions: [q],
+        signal: this.deps.signal,
+        ...(this.deps.agent === undefined ? {} : { agent: this.deps.agent }),
+      })
     } catch (error) {
       const code = error instanceof Error && 'code' in error ? (error as { code?: string }).code : undefined
       // 取消（ABORTED）不打回——视为需修改重新进入门禁；其它错误抛出
