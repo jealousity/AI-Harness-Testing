@@ -153,7 +153,7 @@ export const STAGE_SPECS: Readonly<Record<StageId, StagePromptSpec>> = {
     "order": ["覆盖全部用例 id"] },
   "results": [{ "caseId": "", "recordRef": "executor_run 返回的记录 seq 号（必填，原样填写，如 \"1\"）",
     "status": "pass|fail|pending", "evidence": ["manifest 条目 id"],
-    "durationMs": 0, "attempts": 1, "envIssueId": "可选",
+    "durationMs": "executor_run 返回的真实耗时（原样填写，禁止写 0 占位）", "attempts": 1, "envIssueId": "可选",
     "manualClaimed": "可选", "attestedBy": "可选", "sessionId": "可选",
     "note": "失败原因；manual 失败必填" }],
   "envIssues": [{ "id": "env-", "category": "network|disk|server|credentials|other",

@@ -27,6 +27,29 @@ export interface ExecutionSession {
   /** 按 seq 升序的记录（可能多段，续跑新段）。 */
   readonly records: readonly ExecutionRecord[]
   readonly evidence: readonly EvidenceEntry[]
+  /** manual 会话（R4-11a 时间窗校验用；宿主从 manual 会话存储提供，可选）。 */
+  readonly manualSessions?: readonly ManualSessionRecord[]
+  /** manual 回填见证（R4-11a/b 校验用；宿主提供，可选）。 */
+  readonly manualAttestations?: readonly ManualAttestationRecord[]
+}
+
+/** manual 会话记录（门禁侧视图，与 execute/manual-session 的 ManualSession 对齐）。 */
+export interface ManualSessionRecord {
+  readonly id: string
+  readonly attestedBy: string
+  readonly startedAt: number
+  readonly expiresAt: number
+  readonly status: 'open' | 'closed'
+}
+
+/** manual 回填见证记录（门禁侧视图）。 */
+export interface ManualAttestationRecord {
+  readonly caseId: string
+  readonly sessionId: string
+  readonly attestedBy: string
+  readonly at: number
+  readonly status: 'pass' | 'fail' | 'skipped'
+  readonly note?: string
 }
 
 /** 执行器实现契约（http runner 等）。 */

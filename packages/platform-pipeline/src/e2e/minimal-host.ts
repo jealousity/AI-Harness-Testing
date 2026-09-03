@@ -248,8 +248,8 @@ function registerTools(ctx: Context, baseDir: string, baseUrl: string): void {
         })
         executorState.session = session
         await writeFile(join(baseDir, 'executor', 'session.json'), JSON.stringify(session))
-        // 只给 agent 记录摘要（caseId/status/evidenceRefs），不暴露实现细节
-        return { records: session.records.map((r) => ({ seq: r.seq, caseId: r.caseId, status: r.status, evidenceRefs: r.evidenceRefs })) } as never
+        // 只给 agent 记录摘要（caseId/status/evidenceRefs/真实时长），不暴露实现细节
+        return { records: session.records.map((r) => ({ seq: r.seq, caseId: r.caseId, status: r.status, evidenceRefs: r.evidenceRefs, durationMs: r.durationMs })) } as never
       } catch (error) {
         return { error: error instanceof Error ? error.message : String(error) }
       }
@@ -356,6 +356,36 @@ function startFakeApi(): Promise<{ server: Server; baseUrl: string }> {
   })
 }
 
+/** 交叉检查故障注入：E2E_FAULT_REVIEW_FAIL=<stage>[:次数]（默认 1 次）。前 N 次判 fail 模拟审核发现问题。 */
+function makeReviewWithFaultInjection(ctx: Context, parent: import('@deepseek-ai/dsh-agent').Agent): import('../driver.ts').ReviewRunner {
+  const real = new HarnessReviewRunner({
+    subagents: ctx.subagents,
+    parent,
+    signal: new AbortController().signal,
+    toolFilter: { allow: ['fs_read'] }, // 盲审只读
+    // execute 审核需要看见 executor 自产数据（记录+证据清单），否则"结果↔记录↔证据一致性"必查面无法复核
+    extraPaths: (stageId): Record<string, string> => (stageId === 'execute'
+      ? { 'executor 执行会话（records+evidence 清单）': 'executor/session.json' }
+      : {}),
+  })
+  const spec = process.env.E2E_FAULT_REVIEW_FAIL ?? ''
+  if (spec === '') return real
+  const [faultStage, countRaw] = spec.split(':')
+  const faultCount = countRaw === undefined ? 1 : Number(countRaw)
+  let injected = 0
+  return {
+    async run(stageId, artifact, gate) {
+      if (stageId === faultStage && injected < faultCount) {
+        injected += 1
+        const finding = `【注入故障 ${injected}/${faultCount}】覆盖完整性存疑：请逐条核对上游 analyze.json 的验收标准与变更点，确认每条都有 ≥1 条用例覆盖；未覆盖的必须写入 gaps 并说明原因。同时复核用例 steps/expected 是否可执行（非空话）。`
+        console.log(`[minimal-host] 故障注入：审核 ${stageId} 判 fail（${injected}/${faultCount}）`)
+        return { verdict: 'fail' as const, findings: [finding] }
+      }
+      return real.run(stageId, artifact, gate)
+    },
+  }
+}
+
 async function main(): Promise<void> {
   const target = await selectLlmProvider()
   const { baseUrl } = await startFakeApi()
@@ -438,13 +468,10 @@ async function main(): Promise<void> {
     human: new ApprovingHuman(),
     artifacts: new FsArtifactStore(workdir), // 基址 = agent CWD，artifactPath 相对路径直接解析
     checkpoint: new FsCheckpointPort(),
-    // 交叉检查（docs/03 第 7 节）：独立审核 agent 盲审；cfg 开启的阶段（analyze/design/execute/report）生效
-    review: new HarnessReviewRunner({
-      subagents: ctx.subagents,
-      parent,
-      signal: new AbortController().signal,
-      toolFilter: { allow: ['fs_read'] }, // 盲审只读
-    }),
+    // 交叉检查（docs/03 第 7 节）：独立审核 agent 盲审；cfg 开启的阶段（analyze/design/execute/report）生效。
+    // 故障注入（里程碑 7 验收）：E2E_FAULT_REVIEW_FAIL=<stage>[:次数] —— 前 N 次该阶段审核判 fail
+    // （模拟审核发现问题），之后交给真实审核器，验证 findings 回喂重跑闭环。
+    review: makeReviewWithFaultInjection(ctx, parent),
     receiveInput: join(workdir, 'inputs', 'requirements.txt'),
     // execute 门禁 R4-08/09/10：读取 executor 真实执行会话
     execution: {

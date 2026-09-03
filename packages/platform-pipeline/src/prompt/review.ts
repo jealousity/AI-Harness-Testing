@@ -17,7 +17,7 @@ export const REVIEW_CHECKLISTS: Readonly<Record<StageId, readonly string[]>> = {
     'openQuestions 可答（每条带 needs）',
   ],
   design: [
-    '覆盖矩阵完备（每个需求点 ≥1 条用例）',
+    '覆盖矩阵完备（每个需求点 ≥1 条用例；每条验收标准/变更点应有用例覆盖，未覆盖的须在 gaps 或上游 openQuestions 有交代）',
     'gaps 自洽（列出的需求点确实是零用例）',
     '用例可执行性（steps/expected 非空话）',
     '复用用例适配正确性（adaptation 与内容一致）',

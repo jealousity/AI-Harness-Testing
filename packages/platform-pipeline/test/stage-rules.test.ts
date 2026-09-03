@@ -199,3 +199,67 @@ test('R4-08: missing execution data is BLOCKING', () => {
   const violations = rule.judge({ stageId: 'execute', artifact: artifact('execute', content), upstreams })
   assert.ok(violations.some(v => v.rule === 'R4-08' && v.detail.includes('not provided')))
 })
+
+test('R4-11a: manual result without sessionId/attestedBy is BLOCKING', () => {
+  const upstreams = upstreamsUpTo('execute')
+  const content = contentFor('execute', upstreams)
+  const results = content.results as Record<string, unknown>[]
+  const manual: Record<string, unknown> = { ...results[0]!, status: 'pass', manualClaimed: true }
+  const bad = { ...content, results: [manual, ...results.slice(1)] }
+  const rule = rules.find(r => r.id === 'R4-11')!
+  const execution = executionSessionFor(upstreams.design!.content as unknown as { testCases: readonly { id: string }[] })
+  const violations = rule.judge({ stageId: 'execute', artifact: artifact('execute', bad), upstreams, execution })
+  assert.ok(violations.some(v => v.rule === 'R4-11' && v.detail.includes('missing sessionId')))
+  assert.ok(violations.some(v => v.rule === 'R4-11' && v.detail.includes('missing attestedBy')))
+})
+
+test('R4-11a: manual result with in-window attestation passes', () => {
+  const upstreams = upstreamsUpTo('execute')
+  const content = contentFor('execute', upstreams)
+  const results = content.results as Record<string, unknown>[]
+  const caseId = String(results[0]!.caseId)
+  const manual = { ...results[0]!, status: 'pass', manualClaimed: true, sessionId: 'm-1', attestedBy: 'tester-a' }
+  const manualContent = { ...content, results: [manual, ...results.slice(1)] }
+  const rule = rules.find(r => r.id === 'R4-11')!
+  const execution = {
+    ...executionSessionFor(upstreams.design!.content as unknown as { testCases: readonly { id: string }[] }),
+    manualSessions: [{ id: 'm-1', attestedBy: 'tester-a', startedAt: 1000, expiresAt: 1000 + 4 * 3600_000, status: 'open' as const }],
+    manualAttestations: [{ caseId, sessionId: 'm-1', attestedBy: 'tester-a', at: 2000, status: 'pass' as const }],
+  }
+  const violations = rule.judge({ stageId: 'execute', artifact: artifact('execute', manualContent), upstreams, execution })
+  assert.equal(violations.length, 0)
+})
+
+test('R4-11a: attestation outside session window is BLOCKING', () => {
+  const upstreams = upstreamsUpTo('execute')
+  const content = contentFor('execute', upstreams)
+  const results = content.results as Record<string, unknown>[]
+  const caseId = String(results[0]!.caseId)
+  const manual = { ...results[0]!, status: 'pass', manualClaimed: true, sessionId: 'm-1', attestedBy: 'tester-a' }
+  const manualContent = { ...content, results: [manual, ...results.slice(1)] }
+  const rule = rules.find(r => r.id === 'R4-11')!
+  const execution = {
+    ...executionSessionFor(upstreams.design!.content as unknown as { testCases: readonly { id: string }[] }),
+    manualSessions: [{ id: 'm-1', attestedBy: 'tester-a', startedAt: 1000, expiresAt: 2000, status: 'closed' as const }],
+    manualAttestations: [{ caseId, sessionId: 'm-1', attestedBy: 'tester-a', at: 9999, status: 'pass' as const }],
+  }
+  const violations = rule.judge({ stageId: 'execute', artifact: artifact('execute', manualContent), upstreams, execution })
+  assert.ok(violations.some(v => v.rule === 'R4-11' && v.detail.includes('outside session')))
+})
+
+test('R4-11b: manual fail without note is BLOCKING', () => {
+  const upstreams = upstreamsUpTo('execute')
+  const content = contentFor('execute', upstreams)
+  const results = content.results as Record<string, unknown>[]
+  const caseId = String(results[0]!.caseId)
+  const manual = { ...results[0]!, status: 'fail', manualClaimed: true, sessionId: 'm-1', attestedBy: 'tester-a', note: '' }
+  const manualContent = { ...content, results: [manual, ...results.slice(1)] }
+  const rule = rules.find(r => r.id === 'R4-11')!
+  const execution = {
+    ...executionSessionFor(upstreams.design!.content as unknown as { testCases: readonly { id: string }[] }),
+    manualSessions: [{ id: 'm-1', attestedBy: 'tester-a', startedAt: 1000, expiresAt: 9000, status: 'open' as const }],
+    manualAttestations: [{ caseId, sessionId: 'm-1', attestedBy: 'tester-a', at: 2000, status: 'fail' as const }],
+  }
+  const violations = rule.judge({ stageId: 'execute', artifact: artifact('execute', manualContent), upstreams, execution })
+  assert.ok(violations.some(v => v.rule === 'R4-11' && v.detail.includes('failed without a note')))
+})

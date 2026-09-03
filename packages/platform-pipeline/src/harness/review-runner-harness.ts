@@ -28,6 +28,8 @@ export interface HarnessReviewDeps {
   readonly maxDepth?: number
   /** 审核 agent 工具限制（盲审只需只读；默认由宿主决定）。 */
   readonly toolFilter?: ToolRestriction
+  /** 阶段附加只读路径（如 execute 的 executor 会话/证据清单），并入审核 prompt 的输入清单。 */
+  readonly extraPaths?: (stageId: StageId) => Readonly<Record<string, string>>
 }
 
 /** 审核报告结构化 schema（docs/03 第 7.4 节；outputSchema 用，断言子集兼容）。 */
@@ -77,6 +79,11 @@ export class HarnessReviewRunner implements ReviewRunner {
     const upstreamPaths: Record<string, string> = {}
     for (const upstream of Object.keys(artifact.inputs)) {
       upstreamPaths[upstream] = `${dir}/${upstream}.json`
+    }
+    // 宿主附加只读路径（如 execute 的 executor 会话/证据清单）：审核可见性对齐必查清单
+    const extra = this.deps.extraPaths?.(stageId)
+    if (extra !== undefined) {
+      for (const [label, path] of Object.entries(extra)) upstreamPaths[label] = path
     }
     const prompt = assembleReviewPrompt({
       stageId,

@@ -259,6 +259,53 @@ export function stageRules(options: StageRulesOptions = {}): readonly GateRule[]
       },
     },
 
+    // R4-11a execute：manual 信任规则——manual 结果必须带 sessionId + attestedBy，
+    // 且宿主提供的见证记录在会话窗口内（docs/08 第 4.5 节）
+    {
+      id: 'R4-11', level: 'BLOCKING', stages: ['execute'],
+      judge: ({ artifact, execution }) => {
+        const content = artifact.content as Content
+        const results = asArray(content.results)
+        const violations: Violation[] = []
+        const sessions = new Map((execution?.manualSessions ?? []).map(s => [s.id, s]))
+        const attestations = execution?.manualAttestations ?? []
+        for (const raw of results) {
+          const result = asObj(raw)
+          if (result.manualClaimed !== true) continue
+          const caseId = String(result.caseId ?? '')
+          const sessionId = String(result.sessionId ?? '')
+          const attestedBy = String(result.attestedBy ?? '')
+          if (sessionId === '') violations.push(v('R4-11', `manual result "${caseId}" missing sessionId (R4-11a)`))
+          if (attestedBy === '') violations.push(v('R4-11', `manual result "${caseId}" missing attestedBy (R4-11a)`))
+          // 宿主提供了会话数据时：见证必须存在、身份一致、时间戳在窗口内
+          if (execution?.manualAttestations !== undefined) {
+            const attestation = attestations.find(a => a.caseId === caseId)
+            if (attestation === undefined) {
+              violations.push(v('R4-11', `manual result "${caseId}" has no attestation record (R4-11a)`))
+              continue
+            }
+            if (attestation.sessionId !== sessionId) {
+              violations.push(v('R4-11', `manual result "${caseId}" sessionId "${sessionId}" != attestation "${attestation.sessionId}" (R4-11a)`))
+            }
+            if (attestation.attestedBy !== attestedBy) {
+              violations.push(v('R4-11', `manual result "${caseId}" attestedBy "${attestedBy}" != attestation "${attestation.attestedBy}" (R4-11a)`))
+            }
+            const session = sessions.get(attestation.sessionId)
+            if (session === undefined) {
+              violations.push(v('R4-11', `manual result "${caseId}" attestation references unknown session "${attestation.sessionId}" (R4-11a)`))
+            } else if (attestation.at < session.startedAt || attestation.at > session.expiresAt) {
+              violations.push(v('R4-11', `manual result "${caseId}" attestation at ${attestation.at} outside session "${session.id}" window [${session.startedAt}, ${session.expiresAt}] (R4-11a)`))
+            }
+          }
+          // R4-11b：manual 失败必须带说明
+          if (result.status === 'fail' && String(result.note ?? '').trim() === '') {
+            violations.push(v('R4-11', `manual result "${caseId}" failed without a note (R4-11b)`))
+          }
+        }
+        return violations
+      },
+    },
+
     // R5-01 report：stats 数字与源一致（passRate ≈ passed/total；total === passed + failed）
     {
       id: 'R5-01', level: 'BLOCKING', stages: ['report'],
