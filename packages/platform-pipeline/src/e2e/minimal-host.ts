@@ -27,6 +27,8 @@ import { PipelineDriver, type HumanGatePort } from '../driver.ts'
 import { HarnessStageSpawner } from '../harness/stage-spawner-harness.ts'
 import { HarnessReviewRunner } from '../harness/review-runner-harness.ts'
 import { applyToolTimeoutPolicy } from '../harness/tool-timeout.ts'
+import { UiUserQuestionsHumanGate, APPROVE } from '../human-gate.ts'
+import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import { HttpExecutor, type HttpCase, type HttpStep } from '../executor/http.ts'
 
 /** 工具调用超时上限：3 分钟（用户硬性要求：超时自动退出并汇报）。 */
@@ -294,14 +296,41 @@ function registerTools(ctx: Context, baseDir: string, baseUrl: string): void {
   }))
 }
 
-class ApprovingHuman implements HumanGatePort {
-  readonly gates: string[] = []
-  async gate(stageId: string): Promise<'approved'> {
-    this.gates.push(stageId)
-    console.log(`[minimal-host] 人工门 ${stageId}: 通过（脚本替身）`)
-    return 'approved'
+/** e2e 用的自动人工门 provider（复用 ctx.userQuestions 服务）：默认每门批准；
+ * 可通过环境变量 E2E_HUMAN_GATES="execute=需修改,report=批准" 注入脚本化裁决。 */
+function makeHumanGate(ctx: Context, parentSessionId: string): HumanGatePort {
+  const answers: Record<string, string> = {}
+  const raw = process.env.E2E_HUMAN_GATES
+  if (raw) {
+    for (const kv of raw.split(',')) {
+      const [stage, decision] = kv.split('=').map(s => s.trim())
+      if (stage && decision) answers[stage] = decision
+    }
   }
-  async gateFailed(): Promise<void> {}
+  const onDecisions: Array<{ stageId: string; action: string; note: string }> = []
+
+  // 注册一个 in-process 的 UI provider（替代真实弹窗；e2e 用）
+  const dispose = ctx.userQuestions.registerProvider({
+    ask: async (request: { questions: Array<{ id: string }> }) => {
+      const q = request.questions[0]!
+      const stageId = q.id.replace(/^gate(?:-failed)?-/, '')
+      const defaultChoice = answers[stageId] ?? APPROVE
+      console.log(`[minimal-host] 人工门 ${stageId}: 自动裁决 → ${defaultChoice}（user-questions provider）`)
+      return { answers: [{ id: q.id, selected: [defaultChoice] }] }
+    },
+  })
+
+  return Object.assign(
+    new UiUserQuestionsHumanGate({
+      userQuestions: ctx.userQuestions,
+      by: parentSessionId,
+      onDecision: (record) => {
+        onDecisions.push({ stageId: record.stageId, action: record.action, note: record.note })
+        console.log(`[minimal-host] 人工门 ${record.stageId} 记录：${record.action}${record.note ? `（${record.note}）` : ''}`)
+      },
+    }),
+    { _onDecisions: onDecisions, _dispose: dispose },
+  )
 }
 
 const PIPELINE_YAML = `
@@ -405,6 +434,7 @@ async function main(): Promise<void> {
     systemPrompt: { persona: 'You are a careful testing engineer agent. Follow your instructions precisely.' },
   })
   await ctx.plugin(AgentLoop, { agents: [] })
+  await ctx.plugin(UserQuestionService) // ctx.userQuestions：人工门 UI 审核（I-2）
   registerTools(ctx, workdir, baseUrl)
   applyToolTimeoutPolicy(ctx) // 工具调用 >3 分钟自动中止并汇报（用户硬性要求）
   // 千问需要禁用 thinking（避免发送 reasoning_effort），并覆盖模型目录
@@ -470,7 +500,7 @@ async function main(): Promise<void> {
       [...platformGenericRules(pipelineContractSchemas()), ...stageRules({ maxManualClaimedRatio: 0.3 })],
       'e2e-v1',
     ),
-    human: new ApprovingHuman(),
+    human: makeHumanGate(ctx, parent.id),
     artifacts: new FsArtifactStore(workdir), // 基址 = agent CWD，artifactPath 相对路径直接解析
     checkpoint: new FsCheckpointPort(),
     // 交叉检查（docs/03 第 7 节）：独立审核 agent 盲审；cfg 开启的阶段（analyze/design/execute/report）生效。

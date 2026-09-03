@@ -121,6 +121,16 @@ export {
 } from './driver.ts'
 
 export {
+  UiUserQuestionsHumanGate,
+  APPROVE,
+  CHANGES_NEEDED,
+  REJECT,
+  type UserQuestions,
+  type HumanGateDeps,
+  type HumanGateAuditRecord,
+} from './human-gate.ts'
+
+export {
   makeRecord,
   hashRecord,
   verifyChain,
