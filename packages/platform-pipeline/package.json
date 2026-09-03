@@ -3,11 +3,24 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "测试辅助平台六阶段流水线插件包（设计文档 docs/09 实现骨架第 1 步：配置解析 / 检查点 / ACL）",
+  "description": "测试辅助平台六阶段流水线插件包（独立 npm 包部署 I-4：配置解析 / 检查点 / ACL / 机器门禁 / 执行可信 / 重入与交叉检查）",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./*.js": "./dist/*.js",
+    "./package.json": "./package.json"
+  },
   "engines": {
     "node": ">=24"
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
     "test": "node --test",
     "typecheck": "tsc --noEmit",
     "cli": "node src/cli.ts"
@@ -19,6 +32,7 @@
     "@deepseek-ai/dsh-agent": ">=0.1.0-rc.5",
     "@deepseek-ai/dsh-llm": ">=0.1.0-rc.5",
     "@deepseek-ai/dsh-subagent": ">=0.1.0-rc.5",
+    "@deepseek-ai/dsh-timeout": ">=0.1.0-rc.5",
     "@deepseek-ai/dsh-tools": ">=0.1.0-rc.5"
   },
   "devDependencies": {

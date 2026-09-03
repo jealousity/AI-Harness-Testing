@@ -34,9 +34,17 @@ npm install        # 依赖（yaml 运行时；@deepseek-ai/* 仅 devDeps/peerDe
 npm test           # node --test（原生 TS，Node >= 24）
 npm run typecheck  # tsc --noEmit
 npm run cli -- validate --config ../../examples/pipeline.yaml   # 配置自检
+
+# I-4 独立 npm 包部署
+npm run build      # tsc -p tsconfig.build.json → dist/
+npm pack           # prepack 自动 build，产出 platform-pipeline-0.1.0.tgz
+
+# 任意环境安装（零 harness 运行时依赖，仅 peerDependencies 声明宿主能力）
+npm install platform-pipeline-0.1.0.tgz
+node -e "import('platform-pipeline').then(m => console.log(m.STAGE_ORDER.join('→')))"
 ```
 
-## 宿主接线（4b，待定）
+## 宿主接线（已完成）
 
 `run`/`reenter` 需要宿主注入（`src/plugin.ts` 集成点，均标注）：
 
@@ -44,10 +52,11 @@ npm run cli -- validate --config ../../examples/pipeline.yaml   # 配置自检
 - **human**：ui-user-questions 实现的人工门（A~G；D-01 二次机器判定）
 - **review**：独立审核 agent（`outputSchema` 结构化输出）
 
-接线方式待定：独立最小 host（不碰 harness checkout）vs harness checkout 集成测试。定后即可端到端跑通 receive→analyze 闭环。
+最小宿主已落地（`src/e2e/minimal-host.ts`），真实外接 DeepSeek / 千问 六阶段端到端跑通（receive→analyze→design→execute→report→archive），含重入级联 + 故障注入审核 fail 回喂重跑闭环（见 `test/e2e/`）。
 
 ## 状态
 
 - 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）
-- 确定性代码层：**全部落地，102 单测全绿**
-- 宿主接线：待定集成方式（见上）
+- 确定性代码层：**全部落地，137 单测全绿**
+- 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
+- I-4 独立 npm 包：`platform-pipeline-0.1.0.tgz` 已产出并验证（干净目录 `npm install` → import → 解析真实 pipeline.yaml → 算 ACL 全部通过）
