@@ -79,9 +79,10 @@ async function probeEndpoint(baseURL: string, apiKey: string): Promise<boolean> 
       signal: AbortSignal.timeout(30_000),
     })
     if (resp.ok) return true
-    // 检查是否为余额不足 / 认证错误（这些情况明确不可用）
+    // 明确不可用：余额/配额不足、认证失败
     const text = await resp.text()
-    if (text.includes('Insufficient Balance') || text.includes('invalid_api_key') || text.includes('invalid_request_error')) return false
+    const exhausted = 'insufficient_balance|insufficient quota|insufficient_quota|quota has been exhausted|invalid_api_key|invalid_request_error'
+    if (new RegExp(exhausted, 'i').test(text)) return false
     // 其他 HTTP 错误也视为不可用
     return false
   } catch {
@@ -89,7 +90,7 @@ async function probeEndpoint(baseURL: string, apiKey: string): Promise<boolean> 
   }
 }
 
-/** 选择 LLM 提供者：优先 DeepSeek，余额不足时自动切换到千问。 */
+/** 选择 LLM 提供者：两端都探测，优先 DeepSeek，余额/配额不足时自动切换到千问。 */
 async function selectLlmProvider(): Promise<LlmTarget> {
   const deepseekOk = await loadKey(DEEPSEEK_TARGET.apiKeyEnv)
   const qwenOk = await loadKey(QWEN_TARGET.apiKeyEnv)
@@ -108,11 +109,15 @@ async function selectLlmProvider(): Promise<LlmTarget> {
   }
 
   if (qwenOk) {
-    console.log(`[minimal-host] LLM: 使用${QWEN_TARGET.label}`)
-    return QWEN_TARGET
+    const qwenUsable = await probeEndpoint(QWEN_TARGET.baseURL, process.env[QWEN_TARGET.apiKeyEnv]!)
+    if (qwenUsable) {
+      console.log(`[minimal-host] LLM: 使用${QWEN_TARGET.label}`)
+      return QWEN_TARGET
+    }
+    console.log(`[minimal-host] LLM: ${QWEN_TARGET.label} 配额已耗尽`)
   }
 
-  throw new Error('DeepSeek 不可用且未找到千问密钥')
+  throw new Error('DeepSeek 与千问均不可用（余额/配额已耗尽），请充值或等待配额重置后再跑全流程')
 }
 
 function textResult(text: string): ContentBlock[] {

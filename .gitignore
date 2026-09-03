@@ -2,4 +2,5 @@ node_modules/
 dist/
 *.tsbuildinfo
 .artifacts/
+.e2e-workdir/
 .DS_Store
