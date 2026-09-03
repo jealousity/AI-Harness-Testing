@@ -56,6 +56,15 @@ const QWEN_TARGET: LlmTarget = {
   model: 'qwen3.8-max',
 }
 
+/** SenseNova 统一 token 网关（OpenAI 兼容）：实测 glm-5.2 可用且返回标准 tool_calls（deepseek-v4-flash 在该网关上不产 tool_calls，不可用于工具调用阶段）。
+ * 在 DeepSeek 官方余额耗尽、千问配额耗尽时作为最后可用 LLM。 */
+const SENSENOVA_TARGET: LlmTarget = {
+  label: 'SenseNova token 网关',
+  apiKeyEnv: 'SENSENOVA_TOKEN_KEY',
+  baseURL: 'https://token.sensenova.cn/v1',
+  model: 'glm-5.2',
+}
+
 /** 从凭据库加载指定 key 到 env；返回是否成功。 */
 async function loadKey(envName: string): Promise<boolean> {
   if (process.env[envName] !== undefined && process.env[envName] !== '') return true
@@ -71,13 +80,13 @@ async function loadKey(envName: string): Promise<boolean> {
   return false
 }
 
-/** 探测端点是否可用（发一个最小请求，30 s 超时）。 */
-async function probeEndpoint(baseURL: string, apiKey: string): Promise<boolean> {
+/** 探测端点是否可用（发一个最小请求，30 s 超时；model 必须存在，否则部分网关对 404 直接判不可用）。 */
+async function probeEndpoint(baseURL: string, apiKey: string, model: string): Promise<boolean> {
   try {
     const resp = await fetch(`${baseURL}/chat/completions`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'x', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
+      body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
       signal: AbortSignal.timeout(30_000),
     })
     if (resp.ok) return true
@@ -92,17 +101,18 @@ async function probeEndpoint(baseURL: string, apiKey: string): Promise<boolean> 
   }
 }
 
-/** 选择 LLM 提供者：两端都探测，优先 DeepSeek，余额/配额不足时自动切换到千问。 */
+/** 选择 LLM 提供者：三段探测，优先 DeepSeek，余额/配额不足时依次切换千问、SenseNova 网关。 */
 async function selectLlmProvider(): Promise<LlmTarget> {
   const deepseekOk = await loadKey(DEEPSEEK_TARGET.apiKeyEnv)
   const qwenOk = await loadKey(QWEN_TARGET.apiKeyEnv)
+  const senseOk = await loadKey(SENSENOVA_TARGET.apiKeyEnv)
 
-  if (!deepseekOk && !qwenOk) {
-    throw new Error('既无 DEEPSEEK_API_KEY 也无 QWEN_TOKEN_PLAN_CN_API_KEY')
+  if (!deepseekOk && !qwenOk && !senseOk) {
+    throw new Error('既无 DEEPSEEK_API_KEY 也无 QWEN_TOKEN_PLAN_CN_API_KEY 也无 SENSENOVA_TOKEN_KEY')
   }
 
   if (deepseekOk) {
-    const usable = await probeEndpoint(DEEPSEEK_TARGET.baseURL, process.env[DEEPSEEK_TARGET.apiKeyEnv]!)
+    const usable = await probeEndpoint(DEEPSEEK_TARGET.baseURL, process.env[DEEPSEEK_TARGET.apiKeyEnv]!, DEEPSEEK_TARGET.model)
     if (usable) {
       console.log('[minimal-host] LLM: 使用 DeepSeek 官方（余额充足）')
       return DEEPSEEK_TARGET
@@ -111,7 +121,7 @@ async function selectLlmProvider(): Promise<LlmTarget> {
   }
 
   if (qwenOk) {
-    const qwenUsable = await probeEndpoint(QWEN_TARGET.baseURL, process.env[QWEN_TARGET.apiKeyEnv]!)
+    const qwenUsable = await probeEndpoint(QWEN_TARGET.baseURL, process.env[QWEN_TARGET.apiKeyEnv]!, QWEN_TARGET.model)
     if (qwenUsable) {
       console.log(`[minimal-host] LLM: 使用${QWEN_TARGET.label}`)
       return QWEN_TARGET
@@ -119,7 +129,16 @@ async function selectLlmProvider(): Promise<LlmTarget> {
     console.log(`[minimal-host] LLM: ${QWEN_TARGET.label} 配额已耗尽`)
   }
 
-  throw new Error('DeepSeek 与千问均不可用（余额/配额已耗尽），请充值或等待配额重置后再跑全流程')
+  if (senseOk) {
+    const senseUsable = await probeEndpoint(SENSENOVA_TARGET.baseURL, process.env[SENSENOVA_TARGET.apiKeyEnv]!, SENSENOVA_TARGET.model)
+    if (senseUsable) {
+      console.log(`[minimal-host] LLM: 使用${SENSENOVA_TARGET.label}`)
+      return SENSENOVA_TARGET
+    }
+    console.log(`[minimal-host] LLM: ${SENSENOVA_TARGET.label} 不可用`)
+  }
+
+  throw new Error('所有 LLM 端点均不可用（余额/配额已耗尽），请充值或等待配额重置后再跑全流程')
 }
 
 function textResult(text: string): ContentBlock[] {
@@ -444,6 +463,12 @@ async function main(): Promise<void> {
     pluginConfig.thinking = 'disabled'
     pluginConfig.models = [{ id: 'qwen3.8-max', name: 'Qwen3.8 Max', contextWindow: 1_000_000, maxTokens: 131_072 }]
   }
+  if (target === SENSENOVA_TARGET) {
+    // SenseNova 网关：glm-5.2 非流式能正常返回 tool_calls；纯推理会全塞 reasoning_content。
+    // TODO（明晚续）：流式链路直测显示 agent-loop 的 stream 只收到 reasoning block → 子 agent 判零内容 error；
+    // 需确认加 tool 后 stream 是否产出 tool_calls，或改用 reasoning_effort=none。
+    pluginConfig.models = [{ id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_048_576, maxTokens: 65_536 }]
+  }
   await ctx.plugin(LlmDeepSeek, pluginConfig as never)
   await ctx.plugin(SubagentRuntime)
   await ctx.plugin(Spawn, { providerName: 'spawn' })
@@ -481,9 +506,11 @@ async function main(): Promise<void> {
       })
       try {
         const result = await run.result
-        const text = result.output.map(b => 'text' in b ? String(b.text ?? '') : '').join('').slice(0, 600)
+        const text = result.output.map(b => 'text' in b ? String(b.text ?? '') : '').join('')
         console.log(`[minimal-host] --- child ${request.stageId} stop=${result.stopReason} diag=${result.diagnostic ?? ''}`)
-        if (text) console.log(`[minimal-host] --- child output: ${JSON.stringify(text)}`)
+        console.log(`[minimal-host] --- child result keys: ${Object.keys(result).join(',')}`)
+        console.log(`[minimal-host] --- child full result: ${JSON.stringify({ ...result, output: result.output.map((b: unknown) => b), }, null, 0).slice(0, 2500)}`)
+        console.log(`[minimal-host] --- child output (${text.length} chars): ${JSON.stringify(text.slice(0, 2500))}`)
       } finally {
         run.dispose()
       }
@@ -522,6 +549,55 @@ async function main(): Promise<void> {
       },
     },
   })
+
+  // 隔离探针：spawn 一个极简子 agent（无工具、仅回复），区分 LLM 流式链路 vs 工具/pipeline 层
+  console.log('[minimal-host] === 探针：极简子 agent（无工具）===')
+  {
+    try {
+      const probe = await ctx.subagents.start('spawn', {
+        label: 'probe-trivial',
+        prompt: [{ type: 'text', text: 'Just reply with the word OK and nothing else.' }],
+        parent,
+        signal: new AbortController().signal,
+      })
+      const pr = await probe.result
+      console.log(`[minimal-host] probe-trivial stop=${pr.stopReason} outputLen=${pr.output.length}`)
+      probe.dispose()
+    } catch (err) {
+      console.log(`[minimal-host] probe-trivial THREW: ${(err as Error).name}: ${(err as Error).message}`)
+      console.log(`[minimal-host] probe-trivial stack: ${((err as Error).stack ?? '').slice(0, 1400)}`)
+    }
+    // agent-loop 只走 stream()：用同一路径直接测，拿到真实错误
+    console.log('[minimal-host] === 探针：ctx.llm.stream 直测（agent-loop 同路径）===')
+    {
+      const llm = ctx.llm
+      const models = await llm.listModels('deepseek-official')
+      console.log(`[minimal-host] 注册模型：${models.map((m: unknown) => JSON.stringify(m).slice(0, 120)).join(' | ')}`)
+      try {
+        const stream = llm.stream({
+          provider: 'deepseek-official',
+          model: SENSENOVA_TARGET.model,
+          system: 'Be terse.',
+          messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'Say OK in one word.' }] }],
+          maxTokens: 20,
+          signal: new AbortController().signal,
+        })
+        let n = 0, out = ''
+        for await (const chunk of stream) {
+          n += 1
+          out += JSON.stringify(chunk).slice(0, 220)
+          if (n >= 12) break
+        }
+        console.log(`[minimal-host] stream OK chunks=${n} 首段: ${out.slice(0, 1500)}`)
+      } catch (err) {
+        const e = err as Error & { code?: string, response?: unknown, cause?: unknown }
+        console.log(`[minimal-host] stream THREW ${e.name} code=${e.code} msg=${e.message}`)
+        console.log(`[minimal-host] stream stack: ${(e.stack ?? '').slice(0, 1600)}`)
+        if (e.response) console.log(`[minimal-host] stream response: ${JSON.stringify(e.response).slice(0, 600)}`)
+        if (e.cause) console.log(`[minimal-host] stream cause: ${JSON.stringify(e.cause).slice(0, 600)}`)
+      }
+    }
+  }
 
   console.log('[minimal-host] driver run start...')
   const outcome = await driver.run()
