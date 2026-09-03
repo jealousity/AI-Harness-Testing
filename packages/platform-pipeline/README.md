@@ -19,7 +19,7 @@
 | `gates/` | 机器门禁引擎：JSON Schema 子集校验器 + G-01~08 规则（含 G-08 摘要锁） | 01 |
 | `driver.ts` | PipelineDriver 编排核心：恢复续跑 / 门禁重试 / 人工门 / 交叉检查 / 重入级联 | 09/03 |
 | `stage-spawner.ts` | StageSpawner 接口 + 生效 ACL 解析 + 运行上下文推导 | 09/06 |
-| `harness/` | HarnessStageSpawner：`ctx.subagents.start` + toolFilter 映射（type-only 依赖，运行时零 harness 引用） | 09/06 |
+| `harness/` | HarnessStageSpawner：`ctx.subagents.start` + toolFilter 映射（type-only 依赖，运行时零 harness 引用）；execute 走 `startContinuable` 后台可续跑 + `listChildren` 轮询（docs/09 验证点 5，无 `prepareContinuable` 能力时降级 one-shot） | 09/06 |
 | `executor/` | 执行可信：时序链（R4-09）/ 对账（R4-08）/ 证据锚定（R4-10）/ HttpExecutor（wire 留痕）/ env_diag 探针 | 08 |
 | `stores/` | FsArtifactStore / FsCheckpointPort / MarkdownKnowledgeStore / MarkdownCaseStore（版本化回流） | 02/07 |
 | `report/` | 报告渲染器（六段人读报告，确定性代码） | 02/12 |
@@ -57,6 +57,6 @@ node -e "import('platform-pipeline').then(m => console.log(m.STAGE_ORDER.join('�
 ## 状态
 
 - 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）
-- 确定性代码层：**全部落地，137 单测全绿**
+- 确定性代码层：**全部落地，145 单测全绿**
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
 - I-4 独立 npm 包：`platform-pipeline-0.1.0.tgz` 已产出并验证（干净目录 `npm install` → import → 解析真实 pipeline.yaml → 算 ACL 全部通过）

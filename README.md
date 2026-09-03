@@ -59,5 +59,5 @@
 - 设计文档：**9 份全部定稿**，开放问题全部清零
 - 决策：**24 条全部确认**（D-01~D-20 + I-1~I-4）
 - 六阶段 prompt 模板：**全部评审通过**
-- 实现：docs/09 落地顺序 1~7 步全部完成（`packages/platform-pipeline`，137 单测全绿；真实 LLM 六阶段端到端通过，含重入级联与故障注入审核 fail 回喂重跑）
+- 实现：docs/09 落地顺序 1~7 步全部完成（`packages/platform-pipeline`，145 单测全绿；真实 LLM 六阶段端到端通过，含重入级联、故障注入审核 fail 回喂重跑、execute 后台可续跑恢复）
 - I-4 独立 npm 包：`platform-pipeline-0.1.0.tgz` 已产出并验证可独立安装调用（clean-install → import → 解析 pipeline.yaml → 算 ACL）

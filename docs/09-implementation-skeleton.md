@@ -383,10 +383,10 @@ export function effectiveAcl(stageId: StageId, cfg: PipelineConfig): ToolFilter 
    与 platform-pipeline 的 `ToolFilter` 结构一致，可直接映射。
 3. ✅ toolFilter 需 provider capability `toolFilter`（in-process 后端 `tools.restrict()`：被禁工具从子 agent prompt 消失 + 执行被拒，unknown-name 响亮失败）。
 
-**待解决（集成时定）**：
+**集成验证点（已全部解决）**：
 
 4. ✅ **版本对齐**（I-4 已落地）：独立 npm 包 `platform-pipeline` 对 harness 仅以 peerDependencies 声明（`@deepseek-ai/*` `>=0.1.0-rc.5` 范围，覆盖 rc.5 checkout 与 rc.8+ npm next，宿主按自身部署版本提供）；devDependencies 锁 `0.1.0-rc.8` 用于单测；harness 相关模块 type-only import，运行时零 harness 依赖（除 `dsh-timeout` 一个运行时 peerDep）。
-5. ⏳ execute 阶段后台可续跑 spawn 的确切方式（continuation manager API：`prepareContinuable` / 续跑驱动）。
+5. ✅ execute 阶段后台可续跑 spawn（`HarnessStageSpawner`：`mode='continuable'` → `ctx.subagents.startContinuable`，`listChildren` 轮询 child activity 转 `inactive` 视为完成，无 `prepareContinuable` 能力时降级 one-shot；`PipelineDriver` 复用既有 child 恢复续跑，childSessionId 持久化进检查点）。
 6. ✅ `structured_output` 在审核 agent 场景的接入方式：`HarnessReviewRunner` 用 `outputSchema` 结构化输出，start/运行失败降级 degraded 不阻塞。
 7. ✅ goal pause/resume 与"人工门等待"的对接——D-20 后 mainAgent 为纯代码，已降级为"human-gate.ts 用 ui-user-questions 阻塞等待"，无 goal 依赖。
 

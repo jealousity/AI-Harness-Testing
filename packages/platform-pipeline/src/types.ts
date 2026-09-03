@@ -143,6 +143,8 @@ export interface StageState {
     readonly human: HumanGateState
   }
   readonly failures: readonly { readonly kind: string; readonly rule?: string; readonly detail?: string; readonly at: number }[]
+  /** 后台可续跑 child session id（execute 等长任务；docs/09 验证点 5）。持久化供恢复续跑时复用同一 child，避免重复 spawn。 */
+  readonly childSessionId?: string
 }
 
 export interface ReentryRecord {

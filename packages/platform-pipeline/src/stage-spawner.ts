@@ -17,12 +17,21 @@ export interface SpawnRequest {
   readonly extraContext?: string
   /** 门禁重跑时回喂的违规清单。 */
   readonly previousViolations?: readonly { rule: string; level: 'BLOCKING' | 'WARNING'; detail: string; at: number }[]
+  /**
+   * Spawn 模式（docs/09 验证点 5）：
+   * - 'oneshot'：前台一次性，spawn 结束后等待 result。
+   * - 'continuable'：后台可续跑（execute 等长任务），child 由 continuation manager 托管，
+   *   父进程崩溃可冷恢复；要求 provider 具备 prepareContinuable 能力，否则降级为 oneshot。
+   */
+  readonly mode?: 'oneshot' | 'continuable'
 }
 
 export interface SpawnedRun {
   readonly stageId: StageId
   /** 阶段 agent 产物路径（spawn 结束后由调用方读取并交机器门禁）。 */
   readonly artifactPath: string
+  /** 后台可续跑 child session id（mode='continuable' 时存在；续跑恢复依据）。 */
+  readonly childId?: string
 }
 
 /**
@@ -34,6 +43,8 @@ export interface SpawnedRun {
  */
 export interface StageSpawner {
   runStage(request: SpawnRequest, cfg: PipelineConfig): Promise<SpawnedRun>
+  /** 等待一个已存在的后台可续跑 child 完成（恢复续跑复用，docs/09 验证点 5）。不存在则实现为 no-op 降级。 */
+  waitContinuable?(childId: string, signal?: AbortSignal): Promise<void>
 }
 
 /** 宿主实现前的纯逻辑辅助：解析生效 ACL 并校验（供实现与测试复用）。 */

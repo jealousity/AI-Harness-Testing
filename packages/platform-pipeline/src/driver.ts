@@ -8,7 +8,7 @@
  */
 
 import { initialCheckpoint } from './checkpoint.ts'
-import { stageRunContext, type StageSpawner } from './stage-spawner.ts'
+import { stageRunContext, type SpawnedRun, type StageSpawner } from './stage-spawner.ts'
 import { MachineGateEngine, computeArtifactDigest, type JudgeResult } from './gates/machine.ts'
 import type { ExecutionSession } from './executor/executor.ts'
 import {
@@ -72,6 +72,8 @@ export interface DriverOptions {
   readonly receiveInput?: string
   /** 门禁语义重试次数（docs/01 ET-01：默认 2）。 */
   readonly maxGateRetries?: number
+  /** 取消信号（供后台可续跑等待复用 child 时观察；docs/09 验证点 5）。 */
+  readonly signal?: AbortSignal
 }
 
 export type RunOutcome =
@@ -106,14 +108,27 @@ export class PipelineDriver {
 
       const runCtx = stageRunContext(stageId, cp)
       const inputPaths = this.inputPathsOf(stageId, cp)
-      const spawned = await this.options.spawn.runStage({
-        stageId,
-        pipelineId: this.options.pipelineId,
-        inputPaths,
-        artifactPath: state.artifact,
-        ...(runCtx.extra === undefined ? {} : { extraContext: runCtx.extra }),
-        previousViolations: state.gate.machine.violations.length === 0 ? undefined : state.gate.machine.violations,
-      }, this.options.cfg)
+      let spawned: SpawnedRun
+      if (state.childSessionId !== undefined && this.options.spawn.waitContinuable !== undefined
+          && !this.isReSpawnState(state.status)) {
+        // 恢复续跑（docs/09 验证点 5）：复用既有后台 child，不重复 spawn。
+        await this.options.spawn.waitContinuable(state.childSessionId, this.options.signal)
+        spawned = { stageId, artifactPath: state.artifact, childId: state.childSessionId }
+      } else {
+        spawned = await this.options.spawn.runStage({
+          stageId,
+          pipelineId: this.options.pipelineId,
+          inputPaths,
+          artifactPath: state.artifact,
+          mode: stageId === 'execute' ? 'continuable' : 'oneshot',
+          ...(runCtx.extra === undefined ? {} : { extraContext: runCtx.extra }),
+          previousViolations: state.gate.machine.violations.length === 0 ? undefined : state.gate.machine.violations,
+        }, this.options.cfg)
+        if (spawned.childId !== undefined) {
+          cp = await this.update(cp, stageId, { childSessionId: spawned.childId })
+          state = cp.stageStates[stageId]!
+        }
+      }
 
       const artifact = await this.options.artifacts.read(spawned.artifactPath)
       if (artifact === null) {
@@ -301,5 +316,10 @@ export class PipelineDriver {
     const next: Checkpoint = { ...cp, cursor: cp.cursor + 1 }
     await this.options.checkpoint.save(this.options.root, next)
     return next
+  }
+
+  /** 需要重新 spawn（而非复用既有 child）的状态：门禁回喂 / 人工重入 = 全新生命周期。 */
+  private isReSpawnState(status: StageState['status']): boolean {
+    return status === 'needs-fix' || status === 'needs-reentry'
   }
 }

@@ -6,26 +6,34 @@
  * - 前台等待 run.result（stopReason === 'completed' 为成功）。
  *
  * 依赖声明为 peerDependencies（由宿主 harness 提供）；devDependencies 仅用于
- * typecheck。execute 阶段的后台可续跑 spawn（continuation manager）为 TODO：
- * 见 docs/09 验证点 5，先用前台 one-shot 覆盖（execute 长任务后续接入）。
+ * typecheck。execute 阶段的后台可续跑 spawn（docs/09 验证点 5）已落地：
+ * request.mode === 'continuable' 时走 ctx.subagents.startContinuable，
+ * 再用 listChildren 轮询 child activity 转 'inactive' 视为完成；provider
+ * 无 prepareContinuable 能力时透明降级为前台 one-shot。
  *
  * ⚠️ 运行时零 harness 依赖：本模块对 @deepseek-ai/* 全部为 type-only import，
  * 类型擦除后无运行时引用——保持"独立 npm 包"部署模型（I-4）。
  * @module platform-pipeline/harness/stage-spawner-harness
  */
 
-import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import type { SubagentRuntime, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
-import type { ToolRestriction } from '@deepseek-ai/dsh-tools'
+import type {
+  Agent,
+  ContentBlock,
+  SubagentListEntry,
+  SubagentStartRequest,
+  SubagentRuntime,
+  ToolRestriction,
+} from '@deepseek-ai/dsh-subagent'
+import type { ContentBlock as LlMContentBlock } from '@deepseek-ai/dsh-llm'
+import type { ToolRestriction as ToolsToolRestriction } from '@deepseek-ai/dsh-tools'
 import { assemblePrompt } from '../prompt/assemble.ts'
 import { resolveStageAcl, type SpawnRequest, type SpawnedRun, type StageSpawner } from '../stage-spawner.ts'
 import type { PipelineConfig, ToolFilter } from '../types.ts'
 
 /** 宿主注入面：subagents 服务 + 当前 agent（parent）+ 取消信号。 */
 export interface HarnessSpawnerDeps {
-  /** `ctx.subagents` 的 start 面。 */
-  readonly subagents: Pick<SubagentRuntime, 'start'>
+  /** `ctx.subagents` 的 start 面；可选附带 startContinuable/listChildren 以启用后台可续跑。 */
+  readonly subagents: Pick<SubagentRuntime, 'start'> & Partial<ContinuableOps>
   /** 发起 spawn 的宿主 agent（in-process provider 从此派生 workspace/lineage/depth）。 */
   readonly parent: Agent
   /** 取消信号（来自宿主调用上下文）。 */
@@ -34,6 +42,19 @@ export interface HarnessSpawnerDeps {
   readonly providerName?: string
   /** 子 agent 委托深度上限（可选）。 */
   readonly maxDepth?: number
+  /** 后台可续跑轮询间隔（测试可注入；默认 2000ms）。 */
+  readonly continuablePollMs?: number
+}
+
+/** 后台可续跑所需子集（harness 提供；本包仅 type 引用，运行时由宿主注入）。 */
+interface ContinuableOps {
+  startContinuable(spec: {
+    provider: string
+    label: string
+    request: Omit<SubagentStartRequest, 'label' | 'signal' | 'outputSchema'>
+    signal: AbortSignal
+  }): Promise<{ readonly childId: string; readonly messageId: string }>
+  listChildren(parentSessionId: string, signal?: AbortSignal): Promise<SubagentListEntry[]>
 }
 
 /** prompt 字符串 → harness ContentBlock[]（text 消息）。 */
@@ -81,6 +102,13 @@ export class HarnessStageSpawner implements StageSpawner {
       toolFilter: toToolRestriction(resolved.acl),
       ...(this.deps.maxDepth === undefined ? {} : { maxDepth: this.deps.maxDepth }),
     }
+
+    // 后台可续跑（execute 等长任务；provider 无 prepareContinuable 时透明降级为 oneshot）。
+    if (request.mode === 'continuable' && this.deps.subagents.startContinuable !== undefined) {
+      const childId = await this.startContinuable_(startRequest)
+      return { stageId: request.stageId, artifactPath: request.artifactPath, childId }
+    }
+
     const run = await this.deps.subagents.start(this.deps.providerName ?? 'spawn', startRequest)
     try {
       const result = await run.result
@@ -94,5 +122,44 @@ export class HarnessStageSpawner implements StageSpawner {
       run.dispose()
     }
     return { stageId: request.stageId, artifactPath: request.artifactPath }
+  }
+
+  /** 启动后台可续跑 child，并等待其完成（写产物）后才返回。 */
+  private async startContinuable_(startRequest: SubagentStartRequest): Promise<string> {
+    const ops = this.deps.subagents
+    const spec: Parameters<typeof ops.startContinuable>[0] = {
+      provider: this.deps.providerName ?? 'spawn',
+      label: startRequest.label ?? this.deps.parent.id,
+      request: {
+        prompt: startRequest.prompt,
+        parent: startRequest.parent,
+        toolFilter: startRequest.toolFilter,
+        ...(startRequest.agentOptions !== undefined ? { agentOptions: startRequest.agentOptions } : {}),
+        ...(startRequest.maxDepth !== undefined ? { maxDepth: startRequest.maxDepth } : {}),
+        ...(startRequest.persona !== undefined ? { persona: startRequest.persona } : {}),
+      },
+      signal: this.deps.signal,
+    }
+    const { childId } = await ops.startContinuable(spec)
+    await this.waitContinuable(childId, this.deps.signal)
+    return childId
+  }
+
+  /** 等待一个已存在的后台可续跑 child 完成（activity 转 'inactive'）。恢复续跑复用此路径。 */
+  async waitContinuable(childId: string, signal?: AbortSignal): Promise<void> {
+    const list = this.deps.subagents.listChildren
+    if (list === undefined) return // 无 listChildren 能力：no-op 降级
+    const parentSessionId = this.deps.parent.id
+    const poll = this.deps.continuablePollMs ?? 2000
+    while (!signal?.aborted) {
+      const entries = await list(parentSessionId, signal)
+      const entry = entries.find(e => e.id === childId)
+      if (entry?.kind === 'child' && entry.activity === 'inactive') return
+      if (entry?.kind === 'diagnostic') {
+        throw new Error(`stage continuable child "${childId}" ended in diagnostic state: ${entry.reason}`)
+      }
+      // 尚处于创建窗口或仍 running：轮询等待
+      await new Promise<void>(resolve => setTimeout(resolve, poll))
+    }
   }
 }

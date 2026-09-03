@@ -337,3 +337,98 @@ test('reenter rolls back cursor, marks downstream needs-reentry, and resumes', a
   assert.equal(cp.value?.cursor, 6)
   assert.equal(cp.value?.stageStates.analyze.status, 'done')
 })
+
+test('resume reuses an existing continuable child instead of re-spawning (验证点 5)', async () => {
+  const artifacts = new MemoryArtifacts()
+
+  /** 记录 runStage（重新 spawn）与 waitContinuable（复用既有 child）调用。 */
+  class DedupSpawn implements StageSpawner {
+    readonly calls: StageId[] = []
+    readonly waits: string[] = []
+    async runStage(request: SpawnRequest): Promise<SpawnedRun> {
+      this.calls.push(request.stageId)
+      const artifact: StageArtifact = {
+        pipelineId: request.pipelineId, stageId: request.stageId, version: 1,
+        inputs: {}, content: { ok: true }, digest: '', path: request.artifactPath,
+      }
+      artifacts.put({ ...artifact, digest: computeArtifactDigest(artifact) })
+      return request.mode === 'continuable'
+        ? { stageId: request.stageId, artifactPath: request.artifactPath, childId: `child-${request.stageId}` }
+        : { stageId: request.stageId, artifactPath: request.artifactPath }
+    }
+    async waitContinuable(childId: string): Promise<void> {
+      this.waits.push(childId)
+      const artifact: StageArtifact = {
+        pipelineId: 'pipe-1', stageId: 'execute', version: 1,
+        inputs: {}, content: { ok: true }, digest: '', path: 'artifacts/pipe-1/execute.json',
+      }
+      artifacts.put({ ...artifact, digest: computeArtifactDigest(artifact) })
+    }
+  }
+
+  const spawn = new DedupSpawn()
+  const human = new ScriptedHuman()
+  const cp = new MemoryCheckpoint()
+  // 模拟「execute 已 startContinuable 但父进程崩溃」：cursor 停在 execute，childSessionId 已持久化，状态仍 idle
+  const base = initialCheckpoint('pipe-1', 'v1', 'rules-v1')
+  cp.value = {
+    ...base,
+    cursor: 3,
+    stageStates: { ...base.stageStates, execute: { ...base.stageStates.execute, childSessionId: 'child-execute' } },
+  }
+  const d = new PipelineDriver({
+    cfg: cfg(), pipelineId: 'pipe-1', root: 'artifacts/pipe-1', rulesetVersion: 'v1',
+    spawn, gates: engine(), human, artifacts, checkpoint: cp, review: undefined,
+  })
+
+  const outcome = await d.run()
+  assert.deepEqual(outcome, { outcome: 'completed' })
+  // execute 走复用，未重新 spawn；下游 report/archive 正常 one-shot spawn
+  assert.deepEqual(spawn.calls, ['report', 'archive'])
+  assert.deepEqual(spawn.waits, ['child-execute'])
+})
+
+test('needs-reentry re-spawns even when a prior childSessionId exists', async () => {
+  const artifacts = new MemoryArtifacts()
+  class DedupSpawn implements StageSpawner {
+    readonly calls: StageId[] = []
+    readonly waits: string[] = []
+    async runStage(request: SpawnRequest): Promise<SpawnedRun> {
+      this.calls.push(request.stageId)
+      const artifact: StageArtifact = {
+        pipelineId: request.pipelineId, stageId: request.stageId, version: 1,
+        inputs: {}, content: { ok: true }, digest: '', path: request.artifactPath,
+      }
+      artifacts.put({ ...artifact, digest: computeArtifactDigest(artifact) })
+      return request.mode === 'continuable'
+        ? { stageId: request.stageId, artifactPath: request.artifactPath, childId: `child-${request.stageId}` }
+        : { stageId: request.stageId, artifactPath: request.artifactPath }
+    }
+    async waitContinuable(childId: string): Promise<void> {
+      this.waits.push(childId)
+    }
+  }
+  const spawn = new DedupSpawn()
+  const human = new ScriptedHuman()
+  const cp = new MemoryCheckpoint()
+  const base = initialCheckpoint('pipe-1', 'v1', 'rules-v1')
+  cp.value = {
+    ...base,
+    cursor: 3,
+    stageStates: {
+      ...base.stageStates,
+      execute: { ...base.stageStates.execute, status: 'needs-reentry', childSessionId: 'child-execute' },
+    },
+  }
+  const d = new PipelineDriver({
+    cfg: cfg(), pipelineId: 'pipe-1', root: 'artifacts/pipe-1', rulesetVersion: 'v1',
+    spawn, gates: engine(), human, artifacts, checkpoint: cp, review: undefined,
+  })
+
+  const outcome = await d.run()
+  assert.deepEqual(outcome, { outcome: 'completed' })
+  // 重入 = 全新生命周期：必须重新 spawn，不得复用旧 child
+  assert.deepEqual(spawn.calls, ['execute', 'report', 'archive'])
+  assert.deepEqual(spawn.waits, [])
+  assert.equal(cp.value?.stageStates.execute.childSessionId, 'child-execute')
+})
