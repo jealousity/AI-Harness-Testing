@@ -50,27 +50,40 @@ function textResult(text: string) {
 }
 
 /**
- * 在产物根下定位最新的 <pipelineId>/design.json。
- * 工具是全局注册的（不绑定某个 pipelineId），所以调用期动态定位。
+ * 在产物根下定位最新的 design.json。
+ *
+ * 布局注意：检查点把产物路径钉成 `artifacts/<pipelineId>/<stage>.json`，所以相对
+ * artifactsRoot 实际还多一层 `artifacts/`。实测踩到过：只找 `<root>/*\/design.json`
+ * 时 executor 永远找不到 design 产物，execute 阶段 11 条用例全部 pending、零执行
+ * （子会话逐字报告「executor 无法定位上游 design 产物」）。故两级都找。
  */
 async function findNewestDesignArtifact(artifactsRoot: string): Promise<string | undefined> {
-  let entries: string[]
-  try {
-    entries = await readdir(artifactsRoot)
-  } catch {
-    return undefined
-  }
-  let best: { path: string; mtime: number } | undefined
-  for (const entry of entries) {
-    const candidate = join(artifactsRoot, entry, 'design.json')
+  const candidates: Array<{ path: string; mtime: number }> = []
+  const consider = async (path: string): Promise<void> => {
     try {
-      const info = await stat(candidate)
-      if (best === undefined || info.mtimeMs > best.mtime) best = { path: candidate, mtime: info.mtimeMs }
+      const info = await stat(path)
+      candidates.push({ path, mtime: info.mtimeMs })
     } catch {
-      // 非产物目录，跳过
+      // 不存在，跳过
     }
   }
-  return best?.path
+
+  // 直接子目录（<root>/<pipelineId>/design.json）与标准布局（<root>/artifacts/<pipelineId>/design.json）
+  for (const base of [artifactsRoot, join(artifactsRoot, 'artifacts')]) {
+    let entries: string[]
+    try {
+      entries = await readdir(base)
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      await consider(join(base, entry, 'design.json'))
+    }
+  }
+
+  if (candidates.length === 0) return undefined
+  candidates.sort((a, b) => b.mtime - a.mtime)
+  return candidates[0]!.path
 }
 
 /**

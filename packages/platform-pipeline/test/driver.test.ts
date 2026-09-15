@@ -548,3 +548,93 @@ test('注入给下一个阶段的 digest 就是门禁将要重算的那个值（
   assert.ok(injected !== undefined && injected !== '')
   assert.equal(injected, gateSawReceive, '注入值与门禁重算值必须一致，否则 agent 抄写的锁必然与门禁对不上')
 })
+
+/**
+ * 原始 JSON 字符串库：read 时真解析（模拟 FsArtifactStore——坏 JSON 抛 SyntaxError）。
+ */
+class RawJsonArtifacts implements ArtifactStore {
+  readonly raw = new Map<string, string>()
+  setJson(path: string, content: unknown): void {
+    this.raw.set(path, JSON.stringify(content))
+  }
+  async read(path: string): Promise<StageArtifact | null> {
+    const text = this.raw.get(path)
+    if (text === undefined) return null
+    const parsed = JSON.parse(text) as Record<string, unknown>
+    const segments = path.split('/')
+    const stageId = (segments[segments.length - 1] ?? '').replace(/\.json$/, '') as StageId
+    return {
+      pipelineId: segments[1] ?? 'pipe-1',
+      stageId,
+      version: 1,
+      path,
+      content: (parsed['content'] ?? parsed) as never,
+      inputs: {},
+      digest: 'digest-0',
+    } as StageArtifact
+  }
+}
+
+/**
+ * 回归：产物损坏（非法 JSON）必须走「阶段失败 → 回喂重做」路径，
+ * 而不是让整条流水线以一句 SyntaxError 崩掉。
+ * 实测踩到：execute 阶段 agent 在字符串里嵌了未转义双引号，产物非法 JSON，
+ * 旧行为直接打断整个 run —— 既没重试、也没走到人工门。
+ */
+test('产物非法 JSON：按阶段失败重试并回喂解析错误，重做成功后继续', async () => {
+  const artifacts = new RawJsonArtifacts()
+  const cp = new MemoryCheckpoint()
+  const seenViolations: string[] = []
+  let receiveAttempts = 0
+  const spawn: StageSpawner = {
+    async runStage(request: SpawnRequest): Promise<SpawnedRun> {
+      if (request.stageId === 'receive') {
+        receiveAttempts += 1
+        if (request.previousViolations !== undefined) {
+          seenViolations.push(...request.previousViolations.map(v => v.detail))
+        }
+        // 第一次写坏 JSON（模拟未转义引号），第二次写合法 JSON
+        if (receiveAttempts === 1) {
+          artifacts.raw.set(request.artifactPath, '{"requirements":[{"id":"R-1","text":"含 "裸引号" 的值"}]}')
+        } else {
+          artifacts.setJson(request.artifactPath, { requirements: [{ id: 'R-1', text: 'ok' }] })
+        }
+      } else {
+        artifacts.setJson(request.artifactPath, { ok: true, stage: request.stageId })
+      }
+      return { stageId: request.stageId, artifactPath: request.artifactPath }
+    },
+  }
+  const d = new PipelineDriver({
+    cfg: cfg(), pipelineId: 'pipe-1', root: 'artifacts/pipe-1', rulesetVersion: 'v1',
+    spawn, gates: engine([]), human: new ScriptedHuman(), artifacts, checkpoint: cp, review: undefined,
+  })
+
+  assert.deepEqual(await d.run(), { outcome: 'completed' })
+  assert.equal(receiveAttempts, 2, '坏产物必须触发一次重做')
+  assert.ok(
+    seenViolations.some(v => /不是合法 JSON/.test(v)),
+    `重做时必须回喂解析错误，实际回喂：${JSON.stringify(seenViolations)}`,
+  )
+})
+
+test('产物非法 JSON 且重试耗尽：升级到人工 gateFailed，而不是崩掉', async () => {
+  const artifacts = new RawJsonArtifacts()
+  const cp = new MemoryCheckpoint()
+  const human = new ScriptedHuman()
+  const spawn: StageSpawner = {
+    async runStage(request: SpawnRequest): Promise<SpawnedRun> {
+      artifacts.raw.set(request.artifactPath, '{"broken": "裸 "引号" 值"}')
+      return { stageId: request.stageId, artifactPath: request.artifactPath }
+    },
+  }
+  const d = new PipelineDriver({
+    cfg: cfg(), pipelineId: 'pipe-1', root: 'artifacts/pipe-1', rulesetVersion: 'v1',
+    spawn, gates: engine([]), human, artifacts, checkpoint: cp, review: undefined,
+  })
+
+  const outcome = await d.run()
+  assert.equal(outcome.outcome, 'gate-failed')
+  assert.equal(outcome.stageId, 'receive')
+  assert.ok(human.gateFailedCalls.includes('receive'), '重试耗尽必须走人工门 gateFailed')
+})

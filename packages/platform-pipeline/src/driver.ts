@@ -132,9 +132,36 @@ export class PipelineDriver {
         }
       }
 
-      const artifact = await this.options.artifacts.read(spawned.artifactPath)
-      if (artifact === null) {
-        throw new Error(`stage "${stageId}" produced no artifact at ${spawned.artifactPath}`)
+      // 读取产物。损坏（非法 JSON）与缺失都按「阶段失败」处理，走与机器门禁失败
+// 完全相同的重试路径（违规清单回喂 → agent 重做 → 重判），而不是让整条流水线
+// 以一句 SyntaxError 崩掉。实测：execute 阶段 agent 在字符串里嵌了未转义的
+// 双引号，产物非法 JSON，旧行为直接把整个 run 打断，既没重试也没到人工门。
+      let artifact: StageArtifact | null = null
+      let unreadable: string | undefined
+      try {
+        artifact = await this.options.artifacts.read(spawned.artifactPath)
+      } catch (error) {
+        unreadable = error instanceof Error ? error.message : String(error)
+      }
+      if (artifact === null || unreadable !== undefined) {
+        const detail = unreadable !== undefined
+          ? `阶段产物不是合法 JSON（${unreadable}）：请以合法 JSON 重写 ${spawned.artifactPath}；`
+            + '特别注意字符串内部的双引号必须转义（\\"），否则会切断字符串。'
+          : `阶段未产出产物：${spawned.artifactPath}`
+        const violation = { rule: 'R-ARTIFACT-READABLE', level: 'BLOCKING' as const, detail, at: Date.now() }
+        const machine = {
+          ...state.gate.machine,
+          status: 'failed' as const,
+          violations: [violation],
+          attempts: state.gate.machine.attempts + 1,
+        }
+        if (state.gate.machine.attempts < this.maxGateRetries) {
+          cp = await this.update(cp, stageId, { status: 'needs-fix', gate: { ...state.gate, machine } })
+          continue // 违规清单经 stageRunContext 回喂重跑
+        }
+        cp = await this.update(cp, stageId, { status: 'gate-failed', gate: { ...state.gate, machine } })
+        await this.options.human.gateFailed(stageId, machine)
+        return { outcome: 'gate-failed', stageId }
       }
       const upstreams = await this.loadUpstreams(stageId, cp)
       // 宿主填充输入摘要锁（G-08）：优先用检查点持久化的 inputs（冻结），首次运行从当前上游填充

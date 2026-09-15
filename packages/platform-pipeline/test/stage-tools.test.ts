@@ -205,3 +205,38 @@ test('executor_run 对真实 design 产物发起真实 HTTP 并落执行会话',
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }
 })
+/**
+ * 回归：executor 必须能在**标准布局**下找到 design 产物。
+ * 检查点把产物路径钉成 `artifacts/<pipelineId>/<stage>.json`，故相对 artifactsRoot
+ * 还多一层 `artifacts/`。实测踩到过：只找 `<root>/<pid>/design.json` 时 executor
+ * 永远找不到 design 产物，execute 阶段全部用例 pending、零执行。
+ */
+test('executor_run 能在标准布局 <artifactsRoot>/artifacts/<pid>/design.json 下找到 design 产物', async () => {
+  const ctx = await mount()
+  ctx.tools.register(subagentStub())
+  const d = await deps()
+  // 标准布局：artifactsRoot/artifacts/<pipelineId>/design.json
+  await mkdir(join(d.artifactsRoot, 'artifacts', 'host-2026'), { recursive: true })
+  await writeFile(
+    join(d.artifactsRoot, 'artifacts', 'host-2026', 'design.json'),
+    JSON.stringify({ testCases: [{ id: 'TC-1', steps: [{ action: 'GET /health', expected: ['200'] }] }] }),
+  )
+
+  const { createServer } = await import('node:http')
+  const server = createServer((_req, res) => { res.writeHead(200); res.end('ok') })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  const port = typeof address === 'object' && address !== null ? address.port : 0
+
+  try {
+    registerStageTools(ctx, { ...d, baseDir: d.artifactsRoot, targetBaseUrl: `http://127.0.0.1:${port}` })
+    const result = await ctx.tools.get('executor_run')!.execute({ caseIds: ['TC-1'] } as never, {} as never) as {
+      records?: Array<{ caseId: string; status: string }>
+      error?: string
+    }
+    assert.equal(result.error, undefined, `标准布局下不应报错：${result.error ?? ''}`)
+    assert.equal(result.records?.[0]?.status, 'pass')
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+})
