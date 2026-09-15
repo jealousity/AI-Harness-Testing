@@ -254,4 +254,11 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
       }
     },
   }))
+
+  // 装载可见性：日志放在 register 之后 —— 打印出来即证明服务与工具都已注册成功
+  // （无脚本跳过的人工门渠道必须能从启动日志确认，否则「装没装上」无从判断）。
+  console.log(
+    `[platform-pipeline] 已装载：工具 ${toolName}；人工门 = ctx.userQuestions 真弹窗`
+    + `（阻塞等真人裁决，无自动批准）；审计 → ${auditPath}`,
+  )
 }

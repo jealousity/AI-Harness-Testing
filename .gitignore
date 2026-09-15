@@ -3,4 +3,5 @@ dist/
 *.tsbuildinfo
 .artifacts/
 .e2e-workdir/
+.host-run/
 .DS_Store
