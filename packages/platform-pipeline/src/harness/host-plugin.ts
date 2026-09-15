@@ -21,7 +21,7 @@
  * @module platform-pipeline/harness/host-plugin
  */
 
-import { appendFile, mkdir, readFile, stat } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -50,7 +50,7 @@ export const name = 'platform-pipeline-host'
  * 每次改动插件代码**必须递增**本值，并用 pipeline_run action=status 确认宿主
  * 实际加载的是哪一版，避免盲目重启 / 盲目重试。
  */
-export const HOST_PLUGIN_BUILD = 'build-2026-09-15-2205'
+export const HOST_PLUGIN_BUILD = 'build-2026-09-15-2215'
 
 /** 依赖的 harness 服务。 */
 export const inject = ['agents', 'userQuestions', 'subagents', 'tools']
@@ -145,6 +145,30 @@ async function runWithDiagnostics<T>(
     lines.push(`  （pipelineId=${pipelineId}）`)
     throw new Error(lines.join('\n'))
   }
+}
+
+/**
+ * 把契约 schema 落盘到 `<artifactsRoot>/schemas/<stage>.schema.json`。
+ *
+ * 为什么需要：阶段提示词写着「完整 schema 文件：schemas/<stage>.schema.json
+ * （可 read 读取，以文件为准）」，但这些文件**此前从未被写到磁盘上**——schema 只
+ * 存在于代码里（contracts/schemas.ts）。实测后果：阶段 agent 按提示词去 read 一律
+ * ENOENT，只能照正文散文模板构造结构，并在产物里如实抱怨「契约声明的
+ * schemas/execute.schema.json 在工作区不存在」。
+ *
+ * 每次跑之前重新落盘（而非只在装载时），保证与当前代码里的 schema 一致。
+ */
+export async function materializeContractSchemas(artifactsRoot: string): Promise<string[]> {
+  const dir = join(artifactsRoot, 'schemas')
+  await mkdir(dir, { recursive: true })
+  const schemas = pipelineContractSchemas()
+  const written: string[] = []
+  for (const [stageId, schema] of Object.entries(schemas)) {
+    const path = join(dir, `${stageId}.schema.json`)
+    await writeFile(path, `${JSON.stringify(schema, null, 2)}\n`, 'utf8')
+    written.push(path)
+  }
+  return written
 }
 
 /** 真人裁决 JSONL 审计：追加一条不可变的裁决记录。 */
@@ -349,6 +373,10 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
           ].join('\n'),
         }
       }
+
+      // 阶段提示词指向 schemas/<stage>.schema.json（"以文件为准"），跑之前保证它真在磁盘上
+      const schemaFiles = await materializeContractSchemas(config.artifactsRoot)
+      console.log(`[platform-pipeline] 已落盘契约 schema ${schemaFiles.length} 份 → ${dirname(schemaFiles[0] ?? config.artifactsRoot)}`)
 
       const { driver, decisions } = await assemble(pipelineId, agent, exec.signal)
 

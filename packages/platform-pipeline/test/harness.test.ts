@@ -207,3 +207,33 @@ test('服务方法若被解构则会失败——反证上面的约束真的起�
     'mock 必须真的依赖 this，否则这条回归测试是空的',
   )
 })
+
+/**
+ * 回归：阶段提示词引用的 schema 文件必须真的在磁盘上。
+ *
+ * 提示词写着「完整 schema 文件：schemas/<stage>.schema.json（可 read 读取，以文件为准）」，
+ * 但宿主从不落盘——实测阶段 agent 按提示词 read 一律 ENOENT，只能照散文结构构造，
+ * 并在产物里抱怨「契约声明的 schemas/execute.schema.json 在工作区不存在」。
+ * 这条测试把「提示词里的路径 == 落盘路径 == 可解析的 schema」钉在一起。
+ */
+test('阶段提示词引用的 schema 路径与实际落盘一致且可解析', async () => {
+  const { materializeContractSchemas } = await import('../src/harness/host-plugin.ts')
+  const { pipelineContractSchemas } = await import('../src/contracts/schemas.ts')
+  const { mkdtemp, readFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+
+  const root = await mkdtemp(join(tmpdir(), 'schemas-'))
+  const written = await materializeContractSchemas(root)
+  assert.equal(written.length, 6, '六个阶段各一份')
+
+  for (const stageId of ['receive', 'analyze', 'design', 'execute', 'report', 'archive']) {
+    // 提示词里的写法就是 `schemas/<stage>.schema.json`（相对工作区根）
+    const promptPath = `schemas/${stageId}.schema.json`
+    const onDisk = join(root, promptPath)
+    assert.ok(written.includes(onDisk), `${promptPath} 必须落在提示词指向的位置`)
+
+    const parsed = JSON.parse(await readFile(onDisk, 'utf8')) as unknown
+    assert.deepEqual(parsed, pipelineContractSchemas()[stageId as never], `${stageId} schema 内容须与代码一致`)
+  }
+})
