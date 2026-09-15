@@ -210,7 +210,12 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
   //   tools.restrict() names unknown global tools "parse_doc", "fs_read", ...
   const executorDir = dirname(config.executionSessionPath ?? join(dirname(config.artifactsRoot), 'executor', 'session.json'))
   registerStageTools(ctx, {
-    baseDir: dirname(config.artifactsRoot),
+    // baseDir 必须等于 artifactsRoot：检查点把产物路径钉成
+    // `artifacts/<pipelineId>/<stage>.json`（见 checkpoint.ts 初始 stageStates），
+    // 而 FsArtifactStore 以 artifactsRoot 为基准解析该相对路径。阶段 agent 用
+    // fs_write 写同一个相对路径——只有 baseDir == artifactsRoot 时写入点与读取点
+    // 才重合；取 dirname(artifactsRoot) 会让每个阶段都报 "produced no artifact"。
+    baseDir: config.artifactsRoot,
     artifactsRoot: config.artifactsRoot,
     evidenceDir: config.evidenceDir ?? join(executorDir, 'evidence'),
     sessionPath: config.executionSessionPath ?? join(executorDir, 'session.json'),

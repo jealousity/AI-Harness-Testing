@@ -8,6 +8,7 @@ import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-test
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { PLATFORM_ACL, TOOL_CATALOG } from '../src/tool-catalog.ts'
 import { registerStageTools } from '../src/harness/stage-tools.ts'
+import { FsArtifactStore } from '../src/stores/fs.ts'
 
 async function mount(): Promise<Context> {
   const ctx = new Context()
@@ -46,6 +47,54 @@ async function deps() {
     sessionPath: join(base, 'executor', 'session.json'),
   }
 }
+
+/**
+ * 回归：检查点把产物路径钉成 `artifacts/<pipelineId>/<stage>.json`（带硬编码
+ * `artifacts/` 前缀），FsArtifactStore 以 artifactsRoot 为基准解析它。阶段 agent
+ * 用 fs_write 写**同一个相对路径**——所以 baseDir 必须等于 artifactsRoot，
+ * 否则写入点与读取点不重合，每个阶段都报 "produced no artifact"。
+ */
+test('阶段写入点与 driver 读取点重合：baseDir == artifactsRoot（否则阶段全部 no artifact）', async () => {
+  const ctx = await mount()
+  ctx.tools.register(subagentStub())
+  const d = await deps()
+
+  // 模拟宿主插件的接线：baseDir = artifactsRoot（这正是被这条测试钉住的性质）
+  registerStageTools(ctx, { ...d, baseDir: d.artifactsRoot })
+
+  // 阶段 agent 拿到的路径来自检查点初始 stageStates
+  const { initialCheckpoint } = await import('../src/checkpoint.ts')
+  const pipelineId = 'host-2026'
+  const artifactPath = initialCheckpoint(pipelineId, 'v1', 'v1').stageStates.receive!.artifact
+  assert.equal(artifactPath, `artifacts/${pipelineId}/receive.json`)
+
+  // 阶段 agent 通过 fs_write 写它（提示词里说这是"唯一写路径"）
+  await ctx.tools.get('fs_write')!.execute(
+    { path: artifactPath, content: JSON.stringify({ requirements: [{ id: 'R-1', text: '登录改造' }] }) } as never,
+    {} as never,
+  )
+
+  // driver 通过 FsArtifactStore(artifactsRoot) 读同一个路径，必须能读到
+  const store = new FsArtifactStore(d.artifactsRoot)
+  const artifact = await store.read(artifactPath)
+  assert.ok(artifact !== null, `driver 读不到阶段产物（写入点≠读取点）：${artifactPath}`)
+  assert.equal(artifact.pipelineId, pipelineId)
+  assert.equal(artifact.stageId, 'receive')
+})
+
+test('baseDir 取 dirname(artifactsRoot) 会让写入点与读取点错开（反向验证，防回归）', async () => {
+  const ctx = await mount()
+  ctx.tools.register(subagentStub())
+  const d = await deps()
+  const wrongBase = join(d.artifactsRoot, '..') // 错误接线的等价形式
+
+  registerStageTools(ctx, { ...d, baseDir: wrongBase })
+  const artifactPath = 'artifacts/pipe-2/receive.json'
+  await ctx.tools.get('fs_write')!.execute({ path: artifactPath, content: '{"a":1}' } as never, {} as never)
+
+  const store = new FsArtifactStore(d.artifactsRoot)
+  assert.equal(await store.read(artifactPath), null, '错误基准下 driver 必须读不到——证明该约束真的起作用')
+})
 
 /**
  * 回归：阶段 ACL 用的是**设计文档定义的抽象工具名**，tools.restrict() 会校验
