@@ -19,6 +19,8 @@ export interface PromptInput {
   readonly pipelineId: string
   /** 上游产物路径（仅路径，不传正文——docs/03 第 2.3 节）。 */
   readonly inputPaths: Readonly<Record<string, string>>
+  /** 上游产物的权威 digest（编排器注入；agent 无哈希工具，须原样抄写进 inputs）。 */
+  readonly inputDigests?: Readonly<Record<string, string>>
   readonly artifactPath: string
   readonly budget: StageBudget
   /** 生效 ACL（声明层展示；强制层由 stage-spawner 的 toolFilter 保证）。 */
@@ -38,10 +40,18 @@ export function capExtraContext(text: string | undefined, maxChars = MAX_EXTRA_C
   return `${text.slice(0, maxChars)}${TRUNCATED_MARK}`
 }
 
-function renderInputLocks(stageId: StageId, inputPaths: Readonly<Record<string, string>>): string {
-  const entries = Object.entries(inputPaths)
-  if (entries.length === 0) return '' // receive 无上游：保留空对象以示合规
-  return entries.map(([upstream]) => `"${upstream}": "<${upstream}.json 当前 digest>"`).join(', ')
+/**
+ * 渲染输入摘要锁：给出编排器注入的**权威 digest 真值**供 agent 原样抄写。
+ * 无 digest 的上游不渲染占位符——agent 无哈希工具，任何占位符都只能是编造值，
+ * 会让 G-08 误判并污染证据链；缺项由 driver.fillInputLocks 兜底补全。
+ */
+function renderInputLocks(
+  inputPaths: Readonly<Record<string, string>>,
+  inputDigests: Readonly<Record<string, string>> | undefined,
+): string {
+  const entries = Object.entries(inputDigests ?? {})
+    .filter(([upstream]) => inputPaths[upstream] !== undefined)
+  return entries.map(([upstream, digest]) => `"${upstream}": "${digest}"`).join(', ')
 }
 
 function renderViolations(violations: readonly Violation[] | undefined): string {
@@ -73,7 +83,7 @@ export function assemblePrompt(input: PromptInput): string {
     task: spec.task,
     artifactPath: input.artifactPath,
     schemaInline: spec.schemaInline,
-    inputLocks: renderInputLocks(input.stageId, input.inputPaths),
+    inputLocks: renderInputLocks(input.inputPaths, input.inputDigests),
     schemaFileNote: input.schemaFilePath === undefined
       ? ''
       : `- 完整 schema 文件：${input.schemaFilePath}（可 read 读取，以文件为准）`,

@@ -21,7 +21,9 @@ export const COMMON_SKELETON = `# 阶段 {{stageName}}：{{stageTitle}}
 {{schemaInline}}
 - 产物必须声明输入摘要锁（G-08）：
   "inputs": { {{inputLocks}} }
-  读取上游产物后计算其 digest 填入；digest 不匹配将导致门禁 BLOCKING。
+  上面的 digest 值由编排器注入，是权威真值——**原样抄写，禁止自行计算、改写或编造占位符**
+  （你的工具集不含哈希能力，任何自造值都会让门禁判 BLOCKING、并破坏证据链可追溯性）。
+  若上面为空（本阶段无上游），则写 "inputs": {} 。
 {{schemaFileNote}}
 
 ## 4. 工具与权限（白名单）

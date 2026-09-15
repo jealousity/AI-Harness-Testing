@@ -108,6 +108,7 @@ export class PipelineDriver {
 
       const runCtx = stageRunContext(stageId, cp)
       const inputPaths = this.inputPathsOf(stageId, cp)
+      const inputDigests = await this.inputDigestsOf(stageId, cp)
       let spawned: SpawnedRun
       if (state.childSessionId !== undefined && this.options.spawn.waitContinuable !== undefined
           && !this.isReSpawnState(state.status)) {
@@ -119,6 +120,7 @@ export class PipelineDriver {
           stageId,
           pipelineId: this.options.pipelineId,
           inputPaths,
+          inputDigests,
           artifactPath: state.artifact,
           mode: stageId === 'execute' ? 'continuable' : 'oneshot',
           ...(runCtx.extra === undefined ? {} : { extraContext: runCtx.extra }),
@@ -268,6 +270,23 @@ export class PipelineDriver {
     const out: Record<string, string> = {}
     for (const upstream of STAGE_UPSTREAMS[stageId]!) {
       out[upstream] = cp.stageStates[upstream]!.artifact
+    }
+    return out
+  }
+
+  /**
+   * 上游产物的权威 digest（供 prompt 注入，让 agent 原样抄写）。
+   *
+   * 口径与机器门禁**同源**：直接取自 `loadUpstreams`（即 ArtifactStore.read 的结果，
+   * 磁盘口径重算、可检出事后改文件——docs/08「digest 可重算」）。若改用检查点里
+   * 冻结的 digest，注入值与门禁重算值会分属两套口径，且会丧失篡改检测。
+   */
+  private async inputDigestsOf(stageId: StageId, cp: Checkpoint): Promise<Readonly<Record<string, string>>> {
+    const upstreams = await this.loadUpstreams(stageId, cp)
+    const out: Record<string, string> = {}
+    for (const upstream of STAGE_UPSTREAMS[stageId] ?? []) {
+      const digest = upstreams[upstream]?.digest
+      if (digest !== undefined && digest !== '') out[upstream] = digest
     }
     return out
   }

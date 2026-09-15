@@ -50,7 +50,8 @@ test('stage difference segment is injected and values interpolated', () => {
   const text = prompt()
   assert.ok(text.includes(STAGE_SPECS.analyze.task.split('\n')[0] ?? ''))
   assert.ok(text.includes('artifacts/pipe-1/analyze.json'))
-  assert.ok(text.includes('"receive": "<receive.json 当前 digest>"'))
+  // 不再渲染"让 agent 自己算 digest"的占位符：agent 无哈希工具，占位符只会诱导编造
+  assert.ok(!text.includes('当前 digest'))
   assert.ok(text.includes('schemas/analyze.schema.json'))
   assert.ok(text.includes('kb_query、case_query、fs_read、fs_write'))
 })
@@ -59,6 +60,25 @@ test('receive has empty input lock and no upstream paths', () => {
   const text = prompt('receive')
   assert.ok(text.includes('（无上游产物）'))
   assert.ok(text.includes('"inputs": {  }'))
+})
+
+test('编排器注入的权威 digest 原样渲染进输入摘要锁（agent 无哈希工具，不得自算）', () => {
+  const text = prompt('analyze', { inputDigests: { receive: 'abc123def456' } })
+  assert.ok(text.includes('"receive": "abc123def456"'), '应渲染编排器注入的真实 digest')
+  assert.ok(text.includes('原样抄写'), '应明确指示原样抄写、禁止编造')
+  assert.ok(!text.includes('当前 digest'), '不得再出现要求 agent 自行计算的占位符')
+})
+
+test('未注入 digest 的上游不渲染占位符（缺项由 driver.fillInputLocks 兜底）', () => {
+  const text = prompt('analyze')
+  assert.ok(text.includes('"inputs": {  }'))
+  assert.ok(!text.includes('<receive.json'))
+})
+
+test('inputDigests 中与 inputPaths 不对应的键被忽略（只锁实际给出的上游）', () => {
+  const text = prompt('analyze', { inputDigests: { receive: 'r1', design: 'd1' } })
+  assert.ok(text.includes('"receive": "r1"'))
+  assert.ok(!text.includes('"design": "d1"'), '非本阶段上游不应出现在摘要锁里')
 })
 
 test('execute prompt declares orchestrator role (not executor)', () => {

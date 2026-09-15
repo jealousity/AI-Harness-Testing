@@ -118,6 +118,75 @@ function noteFrom(answer: AskAnswerItem | undefined): string {
   return answer?.custom ?? ''
 }
 
+// ─ 呈送给真人的内容（各人工门渠道共用一份，避免两套呈现漂移）──
+
+export interface GatePresentation {
+  readonly letter: string
+  readonly question: string
+  readonly header: string
+  readonly detail: string
+  readonly options: readonly AskOption[]
+}
+
+/** 阶段门：产物 + 机器门禁判定 + 交叉检查 findings，供真人裁决。 */
+export function buildGatePresentation(
+  stageId: StageId,
+  artifact: StageArtifact,
+  gate: JudgeResult,
+  review?: { readonly verdict: string; readonly findings: readonly string[] } | undefined,
+  letters?: HumanGateDeps['gateLetterByStage'],
+): GatePresentation {
+  const letter = gateLetter(stageId, letters)
+  const artifactStr = safeContentStr(artifact.content)
+  const reviewLine = review === undefined
+    ? '交叉检查：未启用'
+    : `交叉检查：${review.verdict}${review.findings.length ? ' — ' + review.findings.join('；') : ''}`
+
+  const detail = [
+    `阶段 ${stageId}${letter ? `（人工门 ${letter}）` : ''} 已完成，产物：${artifact.path}（version ${artifact.version}）。`,
+    formatGate(gate),
+    reviewLine,
+    `产物摘要：\n${artifactStr}`,
+  ].join('\n')
+
+  return {
+    letter,
+    question: `阶段 ${stageId} 已完成，请审核后裁决。`,
+    header: `人工门 ${letter} · ${stageId}`,
+    detail,
+    options: [
+      { label: APPROVE, description: '通过，继续下一阶段' },
+      { label: CHANGES_NEEDED, description: '打回重做（违规/审核建议回喂）' },
+      { label: REJECT, description: '终止本阶段，标记 rejected' },
+    ],
+  }
+}
+
+/** 门禁重试耗尽后的升级提示（确认是否仍要终止）。 */
+export function buildGateFailedPresentation(
+  stageId: StageId,
+  gate: JudgeResult,
+  letters?: HumanGateDeps['gateLetterByStage'],
+): GatePresentation {
+  const letter = gateLetter(stageId, letters)
+  const blocking = gate.violations.filter(v => v.level === 'BLOCKING')
+  const detail = [
+    `阶段 ${stageId}${letter ? `（人工门 ${letter}）` : ''} 门禁重试耗尽，已升级人工。`,
+    `阻断违规 ${blocking.length} 项：` + blocking.map(v => `[${v.rule}] ${v.detail}`).join('；'),
+  ].join('\n')
+
+  return {
+    letter,
+    question: '门禁已升级人工，请确认是否仍要终止本阶段。',
+    header: `门禁升级 · ${stageId}`,
+    detail,
+    options: [
+      { label: '确认终止', description: '按门禁结果终止（默认）' },
+      { label: '记备注', description: '记录备注后仍终止' },
+    ],
+  }
+}
+
 /** 人工门 UI 审核（阻塞等真人裁决）。 */
 export class UiUserQuestionsHumanGate implements HumanGatePort {
   private readonly deps: HumanGateDeps
@@ -127,29 +196,37 @@ export class UiUserQuestionsHumanGate implements HumanGatePort {
   }
 
   async gate(stageId: StageId, artifact: StageArtifact, gate: JudgeResult, review?: { readonly verdict: string; readonly findings: readonly string[] } | undefined): Promise<HumanDecision> {
-    const letter = gateLetter(stageId, this.deps.gateLetterByStage)
-    const artifactStr = safeContentStr(artifact.content)
-    const reviewLine = review === undefined
-      ? '交叉检查：未启用'
-      : `交叉检查：${review.verdict}${review.findings.length ? ' — ' + review.findings.join('；') : ''}`
+    const p = buildGatePresentation(stageId, artifact, gate, review, this.deps.gateLetterByStage)
+    return this.askDecision(stageId, p)
+  }
 
-    const detail = [
-      `阶段 ${stageId}${letter ? `（人工门 ${letter}）` : ''} 已完成，产物：${artifact.path}（version ${artifact.version}）。`,
-      formatGate(gate),
-      reviewLine,
-      `产物摘要：\n${artifactStr}`,
-    ].join('\n')
+  async gateFailed(stageId: StageId, gate: JudgeResult): Promise<void> {
+    const p = buildGateFailedPresentation(stageId, gate, this.deps.gateLetterByStage)
+    try {
+      const answer = await this.deps.userQuestions.ask({
+        questions: [{ id: `gate-failed-${stageId}`, question: p.question, header: p.header, detail: p.detail, options: p.options }],
+        signal: this.deps.signal,
+        // 真 provider（web）强制要求 agent 归属；漏传会 ASK_MISSING_AGENT。
+        ...(this.deps.agent === undefined ? {} : { agent: this.deps.agent }),
+      })
+      const note = noteFrom(answer.answers[0])
+      this.deps.onDecision?.({ by: this.deps.by ?? 'system', action: 'rejected', note: `gate-failed 确认：${note}`.replace(/^gate-failed 确认：$/, 'gate-failed 已确认'), stageId, at: Date.now() })
+    } catch (error) {
+      // 升级提示不应因无 provider / 取消而崩溃（pipeline 即将以 gate-failed 终止）
+      if (error instanceof Error && 'code' in error && (error as { code?: string }).code === 'ASK_ABORTED') return
+      if (error instanceof Error && 'code' in error && (error as { code?: string }).code === 'ASK_MISSING_AGENT') return
+      throw error
+    }
+  }
 
+  /** 发起真实问答并记录裁决。 */
+  private async askDecision(stageId: StageId, p: GatePresentation): Promise<HumanDecision> {
     const q: AskItem = {
       id: `gate-${stageId}`,
-      question: `阶段 ${stageId} 已完成，请审核后裁决。`,
-      header: `人工门 ${letter} · ${stageId}`,
-      detail,
-      options: [
-        { label: APPROVE, description: '通过，继续下一阶段' },
-        { label: CHANGES_NEEDED, description: '打回重做（违规/审核建议回喂）' },
-        { label: REJECT, description: '终止本阶段，标记 rejected' },
-      ],
+      question: p.question,
+      header: p.header,
+      detail: p.detail,
+      options: p.options,
     }
 
     let answer: AskAnswer
@@ -175,34 +252,5 @@ export class UiUserQuestionsHumanGate implements HumanGatePort {
     const note = noteFrom(ansItem)
     this.deps.onDecision?.({ by: this.deps.by ?? 'system', action: decision, note, stageId, at: Date.now() })
     return decision
-  }
-
-  async gateFailed(stageId: StageId, gate: JudgeResult): Promise<void> {
-    const letter = gateLetter(stageId, this.deps.gateLetterByStage)
-    const blocking = gate.violations.filter(v => v.level === 'BLOCKING')
-    const detail = [
-      `阶段 ${stageId}${letter ? `（人工门 ${letter}）` : ''} 门禁重试耗尽，已升级人工。`,
-      `阻断违规 ${blocking.length} 项：` + blocking.map(v => `[${v.rule}] ${v.detail}`).join('；'),
-    ].join('\n')
-
-    const q: AskItem = {
-      id: `gate-failed-${stageId}`,
-      question: '门禁已升级人工，请确认是否仍要终止本阶段。',
-      header: `门禁升级 · ${stageId}`,
-      detail,
-      options: [
-        { label: '确认终止', description: '按门禁结果终止（默认）' },
-        { label: '记备注', description: '记录备注后仍终止' },
-      ],
-    }
-
-    try {
-      const answer = await this.deps.userQuestions.ask({ questions: [q], signal: this.deps.signal })
-      const note = noteFrom(answer.answers[0])
-      this.deps.onDecision?.({ by: this.deps.by ?? 'system', action: 'rejected', note: `gate-failed 确认：${note}`.replace(/^gate-failed 确认：$/, 'gate-failed 已确认'), stageId, at: Date.now() })
-    } catch (error) {
-      // 升级提示不应因无 provider / 取消而崩溃（pipeline 即将以 gate-failed 终止）
-      if (error instanceof Error && 'code' in error && (error as { code?: string }).code === 'ASK_ABORTED') return
-    }
   }
 }

@@ -9,6 +9,7 @@ import { readFile, writeFile, mkdir, rm } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { Readable } from 'node:stream'
 import { Context } from '@deepseek-ai/cordis'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
@@ -27,7 +28,7 @@ import { PipelineDriver, type HumanGatePort } from '../driver.ts'
 import { HarnessStageSpawner } from '../harness/stage-spawner-harness.ts'
 import { HarnessReviewRunner } from '../harness/review-runner-harness.ts'
 import { applyToolTimeoutPolicy } from '../harness/tool-timeout.ts'
-import { UiUserQuestionsHumanGate, APPROVE } from '../human-gate.ts'
+import { TerminalHumanGate } from '../human-gate-terminal.ts'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import { HttpExecutor, type HttpCase, type HttpStep } from '../executor/http.ts'
 
@@ -315,42 +316,33 @@ function registerTools(ctx: Context, baseDir: string, baseUrl: string): void {
   }))
 }
 
-/** e2e 用的自动人工门 provider（复用 ctx.userQuestions 服务）：默认每门批准；
- * 可通过环境变量 E2E_HUMAN_GATES="execute=需修改,report=批准" 注入脚本化裁决。 */
-function makeHumanGate(ctx: Context, parentSessionId: string, parent: { id: string }): HumanGatePort {
-  const answers: Record<string, string> = {}
-  const raw = process.env.E2E_HUMAN_GATES
-  if (raw) {
-    for (const kv of raw.split(',')) {
-      const [stage, decision] = kv.split('=').map(s => s.trim())
-      if (stage && decision) answers[stage] = decision
-    }
+/**
+ * 人工门接线（真实现，无脚本跳过）：
+ * - 默认：真终端人工门 TerminalHumanGate —— 必须真人在 TTY 上当面裁决；
+ *   无 TTY（无人值守）时抛 NO_HUMAN_AT_CONSOLE，流水线**响亮失败**而非假批准。
+ * - E2E_HUMAN_ANSWERS="1,1,2 理由,1,1,1"：无人值守回归用，把预置输入喂给
+ *   **同一个真实现**（仍走校验/必填理由/审计记录），不注入任何伪造裁决的 provider。
+ */
+function makeHumanGate(parentSessionId: string): HumanGatePort {
+  const onDecision = (record: { stageId: string; action: string; note: string }): void => {
+    console.log(`[minimal-host] 人工门 ${record.stageId} 裁决记录：${record.action}${record.note ? `（${record.note}）` : ''}`)
   }
-  const onDecisions: Array<{ stageId: string; action: string; note: string }> = []
 
-  // 注册一个 in-process 的 UI provider（替代真实弹窗；e2e 用）
-  const dispose = ctx.userQuestions.registerProvider({
-    ask: async (request: { questions: Array<{ id: string }> }) => {
-      const q = request.questions[0]!
-      const stageId = q.id.replace(/^gate(?:-failed)?-/, '')
-      const defaultChoice = answers[stageId] ?? APPROVE
-      console.log(`[minimal-host] 人工门 ${stageId}: 自动裁决 → ${defaultChoice}（user-questions provider）`)
-      return { answers: [{ id: q.id, selected: [defaultChoice] }] }
-    },
-  })
+  const scripted = process.env.E2E_HUMAN_ANSWERS
+  if (scripted !== undefined && scripted !== '') {
+    const lines = scripted.split(',').map(s => s.trim())
+    console.warn(`[minimal-host] ⚠ 人工门输入来自 E2E_HUMAN_ANSWERS（${lines.length} 条）——非真实人工，仅供无人值守回归`)
+    return new TerminalHumanGate({
+      input: Readable.from(lines.map(l => `${l}\n`)),
+      output: process.stdout,
+      allowNonTty: true,
+      by: 'e2e-scripted-input',
+      onDecision,
+    })
+  }
 
-  return Object.assign(
-    new UiUserQuestionsHumanGate({
-      userQuestions: ctx.userQuestions,
-      agent: parent,
-      by: parentSessionId,
-      onDecision: (record) => {
-        onDecisions.push({ stageId: record.stageId, action: record.action, note: record.note })
-        console.log(`[minimal-host] 人工门 ${record.stageId} 记录：${record.action}${record.note ? `（${record.note}）` : ''}`)
-      },
-    }),
-    { _onDecisions: onDecisions, _dispose: dispose },
-  )
+  console.log('[minimal-host] 人工门 = 真终端问答：需要真人在场，逐门当面裁决（无默认值、无自动批准）')
+  return new TerminalHumanGate({ by: parentSessionId, onDecision })
 }
 
 const PIPELINE_YAML = `
@@ -440,7 +432,52 @@ function makeReviewWithFaultInjection(ctx: Context, parent: import('@deepseek-ai
   }
 }
 
+/**
+ * 诊断：拦截出站 fetch，记录发往 LLM 网关的请求关键字段与错误响应体。
+ * 仅在 E2E_LLM_TRACE=1 时安装。只在非 2xx 时读响应体，避免干扰 SSE 流。
+ */
+function installLlmTrace(): void {
+  if (process.env.E2E_LLM_TRACE !== '1') return
+  const gateway = process.env.E2E_LLM_TRACE_HOST ?? 'token.sensenova.cn'
+  const realFetch = globalThis.fetch
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : (input as { url?: string })?.url ?? String(input)
+    if (!url.includes(gateway)) return realFetch(input as RequestInfo, init)
+
+    let summary = ''
+    try {
+      const b = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : null
+      if (b) {
+        const tools = Array.isArray(b.tools) ? (b.tools as unknown[]).length : 0
+        summary = ` model=${String(b.model)} stream=${String(b.stream)} max_tokens=${String(b.max_tokens)}`
+          + ` temp=${String(b.temperature)} tools=${tools}`
+          + ` thinking=${JSON.stringify(b.thinking ?? null)} reasoning_effort=${JSON.stringify(b.reasoning_effort ?? null)}`
+          + ` msgs=${Array.isArray(b.messages) ? (b.messages as unknown[]).length : 0}`
+          + ` bodyKeys=${Object.keys(b).join(',')}`
+      }
+    } catch { summary = ' <unparsable body>' }
+
+    const t0 = Date.now()
+    try {
+      const r = await realFetch(input as RequestInfo, init)
+      const ms = Date.now() - t0
+      if (!r.ok) {
+        const txt = await r.clone().text().catch(() => '')
+        console.log(`[llm-trace] ${r.status} ${ms}ms${summary}\n[llm-trace]     err → ${txt.slice(0, 500)}`)
+      } else {
+        console.log(`[llm-trace] ${r.status} ${ms}ms${summary}`)
+      }
+      return r
+    } catch (err) {
+      console.log(`[llm-trace] THREW ${Date.now() - t0}ms${summary} → ${(err as Error).name}: ${(err as Error).message}`)
+      throw err
+    }
+  }) as typeof fetch
+  console.log(`[llm-trace] 已安装 fetch 拦截（网关 ${gateway}）`)
+}
+
 async function main(): Promise<void> {
+  installLlmTrace()
   const target = await selectLlmProvider()
   const { baseUrl } = await startFakeApi()
   const workdir = join(process.cwd(), '.e2e-workdir')
@@ -490,6 +527,7 @@ async function main(): Promise<void> {
         stageId: request.stageId,
         pipelineId: request.pipelineId,
         inputPaths: request.inputPaths,
+        inputDigests: request.inputDigests,
         artifactPath: request.artifactPath,
         budget: cfg.stages[request.stageId]!.budget,
         toolAcl: resolved.acl,
@@ -528,7 +566,7 @@ async function main(): Promise<void> {
       [...platformGenericRules(pipelineContractSchemas()), ...stageRules({ maxManualClaimedRatio: 0.3 })],
       'e2e-v1',
     ),
-    human: makeHumanGate(ctx, parent.id, parent),
+    human: makeHumanGate(parent.id),
     artifacts: new FsArtifactStore(workdir), // 基址 = agent CWD，artifactPath 相对路径直接解析
     checkpoint: new FsCheckpointPort(),
     // 交叉检查（docs/03 第 7 节）：独立审核 agent 盲审；cfg 开启的阶段（analyze/design/execute/report）生效。
@@ -574,21 +612,29 @@ async function main(): Promise<void> {
       const models = await llm.listModels('deepseek-official')
       console.log(`[minimal-host] 注册模型：${models.map((m: unknown) => JSON.stringify(m).slice(0, 120)).join(' | ')}`)
       try {
+        // 诊断探针：Message 需要 branded id + source（由 agent-loop 正常构造），
+        // 这里只为直测 stream 通路，按目标参数类型精确断言。
+        const probeMessages = [{ role: 'user', content: [{ type: 'text', text: 'Say OK in one word.' }] }] as unknown as
+          Parameters<typeof llm.stream>[0]['messages']
         const stream = llm.stream({
           provider: 'deepseek-official',
-          model: SENSENOVA_TARGET.model,
+          model: target.model,
           system: 'Be terse.',
-          messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'Say OK in one word.' }] }],
-          maxTokens: 20,
+          messages: probeMessages,
+          maxTokens: 2000,
           signal: new AbortController().signal,
         })
-        let n = 0, out = ''
+        let n = 0
+        const kinds: string[] = []
+        let tail = ''
         for await (const chunk of stream) {
           n += 1
-          out += JSON.stringify(chunk).slice(0, 220)
-          if (n >= 12) break
+          const k = (chunk as { type?: string }).type ?? '?'
+          if (!kinds.includes(k)) kinds.push(k)
+          tail = JSON.stringify(chunk).slice(0, 300)
         }
-        console.log(`[minimal-host] stream OK chunks=${n} 首段: ${out.slice(0, 1500)}`)
+        console.log(`[minimal-host] stream OK chunks=${n} chunkTypes=[${kinds.join(',')}]`)
+        console.log(`[minimal-host] stream 末段: ${tail}`)
       } catch (err) {
         const e = err as Error & { code?: string, response?: unknown, cause?: unknown }
         console.log(`[minimal-host] stream THREW ${e.name} code=${e.code} msg=${e.message}`)

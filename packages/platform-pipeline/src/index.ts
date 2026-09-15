@@ -125,10 +125,20 @@ export {
   APPROVE,
   CHANGES_NEEDED,
   REJECT,
+  buildGatePresentation,
+  buildGateFailedPresentation,
+  type GatePresentation,
   type UserQuestions,
   type HumanGateDeps,
   type HumanGateAuditRecord,
 } from './human-gate.ts'
+
+export {
+  TerminalHumanGate,
+  NoHumanAtConsoleError,
+  HumanGateAbortedError,
+  type TerminalHumanGateDeps,
+} from './human-gate-terminal.ts'
 
 export {
   makeRecord,

@@ -35,15 +35,15 @@ class MemoryArtifacts implements ArtifactStore {
   }
 }
 
-/** Mock spawn：生成通用产物写入内存库，记录调用（stageId + extraContext）。 */
+/** Mock spawn：生成通用产物写入内存库，记录调用（stageId + extraContext + inputDigests）。 */
 class MockSpawn implements StageSpawner {
-  readonly calls: Array<{ stageId: StageId; extraContext?: string }> = []
+  readonly calls: Array<{ stageId: StageId; extraContext?: string; inputDigests?: Readonly<Record<string, string>> }> = []
   private readonly artifacts: MemoryArtifacts
   constructor(artifacts: MemoryArtifacts) {
     this.artifacts = artifacts
   }
   async runStage(request: SpawnRequest, _cfg: PipelineConfig): Promise<SpawnedRun> {
-    this.calls.push({ stageId: request.stageId, extraContext: request.extraContext })
+    this.calls.push({ stageId: request.stageId, extraContext: request.extraContext, inputDigests: request.inputDigests })
     const artifact: StageArtifact = {
       pipelineId: request.pipelineId,
       stageId: request.stageId,
@@ -431,4 +431,120 @@ test('needs-reentry re-spawns even when a prior childSessionId exists', async ()
   assert.deepEqual(spawn.calls, ['execute', 'report', 'archive'])
   assert.deepEqual(spawn.waits, [])
   assert.equal(cp.value?.stageStates.execute.childSessionId, 'child-execute')
+})
+
+/**
+ * 模拟真实磁盘存储语义：只存 content，读回时以 inputs={} 重建 wrapper
+ * （与 FsArtifactStore.wrapContent 一致）。用于暴露「digest 跨持久化/重载漂移」缺陷。
+ */
+class DiskLikeArtifacts implements ArtifactStore {
+  readonly content = new Map<string, unknown>()
+  async read(path: string): Promise<StageArtifact | null> {
+    if (!this.content.has(path)) return null
+    const segments = path.split('/')
+    const stageId = (segments.pop() ?? '').replace(/\.json$/, '')
+    const pipelineId = segments.pop() ?? 'unknown'
+    const base: StageArtifact = {
+      pipelineId, stageId: stageId as StageId, version: 1, inputs: {},
+      content: this.content.get(path), digest: '', path,
+    }
+    return { ...base, digest: computeArtifactDigest(base) }
+  }
+}
+
+test('driver 向 spawn 注入上游权威 digest（agent 无哈希工具，只能原样抄写）', async () => {
+  const { driver, spawn, cp } = harness()
+  await driver.run()
+
+  const analyze = spawn.calls.find(c => c.stageId === 'analyze')
+  const persistedReceive = cp.value?.stageStates.receive.digest
+  assert.ok(persistedReceive !== undefined && persistedReceive !== '')
+  assert.equal(analyze?.inputDigests?.receive, persistedReceive, 'analyze 应收到 receive 的权威 digest')
+
+  // receive 无上游：不得注入任何 digest（空对象，不是缺省 undefined）
+  const receive = spawn.calls.find(c => c.stageId === 'receive')
+  assert.deepEqual(receive?.inputDigests, {})
+
+  // archive 是末级：应拿到上游全部（传递性）权威 digest，不含未产出的阶段
+  const archive = spawn.calls.find(c => c.stageId === 'archive')
+  assert.deepEqual(
+    Object.keys(archive?.inputDigests ?? {}).sort(),
+    ['analyze', 'design', 'execute', 'receive', 'report'],
+  )
+})
+
+test('上游 digest 与机器门禁同源：注入值 == 门禁读盘重算值（注入不得另立口径）', async () => {
+  const artifacts = new DiskLikeArtifacts()
+  const cp = new MemoryCheckpoint()
+  const seen: Array<{ stage: StageId; upstream: string; digest: string }> = []
+  const capture: GateRule = {
+    id: 'CAPTURE', level: 'WARNING', stages: 'all',
+    judge: ({ stageId, upstreams }) => {
+      for (const [up, art] of Object.entries(upstreams)) {
+        seen.push({ stage: stageId, upstream: up, digest: art.digest })
+      }
+      return []
+    },
+  }
+  const spawn: StageSpawner = {
+    async runStage(request: SpawnRequest): Promise<SpawnedRun> {
+      artifacts.content.set(request.artifactPath, { ok: true, stage: request.stageId })
+      return { stageId: request.stageId, artifactPath: request.artifactPath }
+    },
+  }
+  const d = new PipelineDriver({
+    cfg: cfg(), pipelineId: 'pipe-1', root: 'artifacts/pipe-1', rulesetVersion: 'v1',
+    spawn, gates: engine([capture]), human: new ScriptedHuman(), artifacts, checkpoint: cp, review: undefined,
+  })
+
+  assert.deepEqual(await d.run(), { outcome: 'completed' })
+
+  // 门禁判定 design 时看到的上游 analyze digest
+  const gateSaw = seen.find(r => r.stage === 'design' && r.upstream === 'analyze')
+  assert.ok(gateSaw !== undefined, 'design 门禁应看到 analyze 上游')
+  assert.notEqual(gateSaw.digest, '')
+
+  const analyzePath = cp.value?.stageStates.analyze.artifact
+  const analyzeRead = await artifacts.read(analyzePath!)
+  assert.equal(
+    gateSaw.digest, analyzeRead?.digest,
+    '门禁必须用读盘重算值（磁盘内容变 → digest 变，可检出事后改文件）',
+  )
+  assert.notEqual(
+    gateSaw.digest, cp.value?.stageStates.analyze.digest,
+    '门禁不得盲信检查点冻结的 digest，否则丧失篡改检测（docs/08 digest 可重算）',
+  )
+})
+
+test('注入给下一个阶段的 digest 就是门禁将要重算的那个值（prompt 与门禁同源）', async () => {
+  const artifacts = new DiskLikeArtifacts()
+  const cp = new MemoryCheckpoint()
+  const seen: Array<{ stage: StageId; upstream: string; digest: string }> = []
+  const captured: Array<{ stage: StageId; inputDigests?: Readonly<Record<string, string>> }> = []
+  const capture: GateRule = {
+    id: 'CAPTURE', level: 'WARNING', stages: 'all',
+    judge: ({ stageId, upstreams }) => {
+      for (const [up, art] of Object.entries(upstreams)) seen.push({ stage: stageId, upstream: up, digest: art.digest })
+      return []
+    },
+  }
+  const spawn: StageSpawner = {
+    async runStage(request: SpawnRequest): Promise<SpawnedRun> {
+      captured.push({ stage: request.stageId, inputDigests: request.inputDigests })
+      artifacts.content.set(request.artifactPath, { ok: true, stage: request.stageId })
+      return { stageId: request.stageId, artifactPath: request.artifactPath }
+    },
+  }
+  const d = new PipelineDriver({
+    cfg: cfg(), pipelineId: 'pipe-1', root: 'artifacts/pipe-1', rulesetVersion: 'v1',
+    spawn, gates: engine([capture]), human: new ScriptedHuman(), artifacts, checkpoint: cp, review: undefined,
+  })
+
+  assert.deepEqual(await d.run(), { outcome: 'completed' })
+
+  // analyze 收到的注入值，必须等于门禁判定 analyze 时对 receive 的重算值
+  const injected = captured.find(c => c.stage === 'analyze')?.inputDigests?.receive
+  const gateSawReceive = seen.find(r => r.stage === 'analyze' && r.upstream === 'receive')?.digest
+  assert.ok(injected !== undefined && injected !== '')
+  assert.equal(injected, gateSawReceive, '注入值与门禁重算值必须一致，否则 agent 抄写的锁必然与门禁对不上')
 })

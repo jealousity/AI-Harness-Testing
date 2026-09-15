@@ -81,6 +81,7 @@ export class HarnessStageSpawner implements StageSpawner {
       stageId: request.stageId,
       pipelineId: request.pipelineId,
       inputPaths: request.inputPaths,
+      inputDigests: request.inputDigests,
       artifactPath: request.artifactPath,
       budget: cfg.stages[request.stageId].budget,
       toolAcl: resolved.acl,

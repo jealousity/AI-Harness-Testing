@@ -13,6 +13,11 @@ export interface SpawnRequest {
   readonly stageId: StageId
   readonly pipelineId: string
   readonly inputPaths: Readonly<Record<string, string>>
+  /**
+   * 上游产物的权威 digest（编排器注入）。阶段 agent 的 ACL 无哈希工具、算不出 sha256，
+   * 故由编排器给出真值让 agent 原样填入 `inputs`，杜绝编造占位符（G-08 证据链）。
+   */
+  readonly inputDigests?: Readonly<Record<string, string>>
   readonly artifactPath: string
   readonly extraContext?: string
   /** 门禁重跑时回喂的违规清单。 */
