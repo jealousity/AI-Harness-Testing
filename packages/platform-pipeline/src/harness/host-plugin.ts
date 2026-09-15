@@ -38,6 +38,7 @@ import { UiUserQuestionsHumanGate, type HumanGateAuditRecord } from '../human-ga
 import { HarnessStageSpawner } from './stage-spawner-harness.ts'
 import { HarnessReviewRunner } from './review-runner-harness.ts'
 import { applyToolTimeoutPolicy } from './tool-timeout.ts'
+import { registerStageTools } from './stage-tools.ts'
 import type { StageId } from '../types.ts'
 
 /** 插件名（cordis 生命周期标识）。 */
@@ -63,6 +64,10 @@ export interface HostPluginConfig {
    * 对账需要它，缺省则 execute 门禁拿不到执行数据。
    */
   readonly executionSessionPath?: string
+  /** 执行证据落盘目录（缺省：executionSessionPath 同级的 evidence/）。 */
+  readonly evidenceDir?: string
+  /** 被测服务基址。缺省时 executor_run 拒绝伪造执行记录。 */
+  readonly targetBaseUrl?: string
   /** subagent provider 名（默认 'spawn'）。 */
   readonly providerName?: string
   /** 是否启用交叉检查（默认启用）。 */
@@ -197,6 +202,21 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
       const { driver } = await assemble(pipelineId, agent, AbortSignal.timeout(config.timeoutMs ?? 120 * 60 * 1000))
       await driver.reenter(stageId, by, reason)
     },
+  })
+
+  // 阶段工具集：阶段 ACL（tool-catalog.ts）用的是**设计文档定义的抽象工具名**
+  // （parse_doc / fs_read / fs_write / kb_query / ...），而 tools.restrict() 会校验
+  // 所有 filter 名必须存在。宿主不注册这些名字时，阶段子会话直接起不来：
+  //   tools.restrict() names unknown global tools "parse_doc", "fs_read", ...
+  const executorDir = dirname(config.executionSessionPath ?? join(dirname(config.artifactsRoot), 'executor', 'session.json'))
+  registerStageTools(ctx, {
+    baseDir: dirname(config.artifactsRoot),
+    artifactsRoot: config.artifactsRoot,
+    evidenceDir: config.evidenceDir ?? join(executorDir, 'evidence'),
+    sessionPath: config.executionSessionPath ?? join(executorDir, 'session.json'),
+    ...(config.targetBaseUrl === undefined ? {} : { targetBaseUrl: config.targetBaseUrl }),
+    ...(config.receiveInput === undefined ? {} : { receiveInput: config.receiveInput }),
+    checkpointRoot: config.checkpointRoot,
   })
 
   // 工具调用超时强制（docs：>3 分钟自动中止）——全局钩子，装一次
