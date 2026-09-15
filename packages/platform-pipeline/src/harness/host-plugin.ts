@@ -71,7 +71,8 @@ export interface HostPluginConfig {
   readonly reviewAllowTools?: readonly string[]
   /** 工具名（默认 'pipeline_run'）。 */
   readonly toolName?: string
-  /** 工具与整条流水线的超时（毫秒，默认 30 分钟）。 */
+  /** 工具与整条流水线的超时（毫秒，默认 120 分钟）。
+   * 含 6 次人工门等待，30 分钟不够——超时会由工具超时策略强制中止。 */
   readonly timeoutMs?: number
 }
 
@@ -187,13 +188,13 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
     run: async (pipelineId: string): Promise<RunOutcome> => {
       const agent = ctx.agents.roots()[0]
       if (agent === undefined) throw new Error('当前没有活体根会话 agent，无法运行流水线。')
-      const { driver } = await assemble(pipelineId, agent, AbortSignal.timeout(config.timeoutMs ?? 30 * 60 * 1000))
+      const { driver } = await assemble(pipelineId, agent, AbortSignal.timeout(config.timeoutMs ?? 120 * 60 * 1000))
       return driver.run()
     },
     reenter: async (pipelineId: string, stageId: StageId, by: string, reason: string): Promise<void> => {
       const agent = ctx.agents.roots()[0]
       if (agent === undefined) throw new Error('当前没有活体根会话 agent，无法重入流水线。')
-      const { driver } = await assemble(pipelineId, agent, AbortSignal.timeout(config.timeoutMs ?? 30 * 60 * 1000))
+      const { driver } = await assemble(pipelineId, agent, AbortSignal.timeout(config.timeoutMs ?? 120 * 60 * 1000))
       await driver.reenter(stageId, by, reason)
     },
   })
@@ -209,7 +210,7 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
       + 'Set action="reenter" with stageId + reason to cascade a re-run after an upstream change.',
     parameters: {
       pipelineId: { type: 'string', required: true, description: 'pipeline id (artifact directory name), e.g. e2e-2026' },
-      action: { type: 'string', description: 'run (default) | reenter' },
+      action: { type: 'string', description: 'run (default) | reenter | status' },
       stageId: { type: 'string', description: 'reenter only: stage to re-enter from' },
       reason: { type: 'string', description: 'reenter only: why this re-entry happens' },
     },
@@ -225,7 +226,7 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
       },
       render: (_args, value) => textResult(value.summary ?? String(value.outcome ?? '')),
     },
-    timeoutMs: config.timeoutMs ?? 30 * 60 * 1000,
+    timeoutMs: config.timeoutMs ?? 120 * 60 * 1000,
     async execute(args, exec) {
       const agent = requireRootAgent(ctx, exec as { readonly agent?: Agent })
       const pipelineId = args.pipelineId
@@ -233,6 +234,26 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
         throw new Error('pipelineId 必填。')
       }
       const action = typeof args.action === 'string' ? args.action : 'run'
+
+      // 只读自检：确认插件在本宿主里确实装载、配置可解析、人工门渠道就绪。
+      // 不运行流水线、不发起任何问答——用于集成后安全验证（否则一跑就要等真人点 6 次）。
+      if (action === 'status') {
+        const cfg = await loadPipelineConfig(config.configPath)
+        const roots = ctx.agents.roots()
+        return {
+          outcome: 'status',
+          pipelineId,
+          humanDecisions: 0,
+          summary: [
+            'platform-pipeline 已接入本宿主。',
+            `项目 ${cfg.projectId} / 模板 ${cfg.templateVersion} / 人工门渠道 = ctx.userQuestions 真弹窗（无自动批准）`,
+            `产物根 ${config.artifactsRoot}`,
+            `需求输入 ${config.receiveInput ?? '（未配置）'}`,
+            `当前活体根会话 agent ${roots.length} 个；本次调用归属 ${agent.id}`,
+            '调用 pipeline_run（action 省略或 "run"）即开始，六阶段将逐个弹窗等你裁决。',
+          ].join('\n'),
+        }
+      }
 
       const { driver, decisions } = await assemble(pipelineId, agent, exec.signal)
 
@@ -261,4 +282,12 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
     `[platform-pipeline] 已装载：工具 ${toolName}；人工门 = ctx.userQuestions 真弹窗`
     + `（阻塞等真人裁决，无自动批准）；审计 → ${auditPath}`,
   )
+
+  // 落一条装载标记：宿主（GUI/桌面应用）的标准输出通常拿不到，
+  // 标记文件是判断「配置热重载是否真的加载了插件」的唯一可靠证据。
+  void appendFile(
+    join(config.checkpointRoot, 'plugin-loads.jsonl'),
+    `${JSON.stringify({ at: Date.now(), pid: process.pid, toolName, note: 'host-plugin loaded' })}\n`,
+    'utf8',
+  ).catch(() => { /* 标记失败不影响装载 */ })
 }
