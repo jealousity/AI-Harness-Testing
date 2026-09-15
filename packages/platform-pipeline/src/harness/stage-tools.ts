@@ -89,6 +89,25 @@ async function findNewestDesignArtifact(artifactsRoot: string): Promise<string |
 /**
  * 注册阶段工具集。已存在的同名工具会被跳过（不覆盖宿主真工具）。
  */
+/**
+ * 读既有执行会话（用于续接链）。文件不存在 → undefined（首次执行）。
+ * 文件存在但读不动/不是合法 JSON → 抛错：**不覆盖**，把未损坏的原件留给诊断，
+ * 因为静默丢弃既有记录等于销毁执行真相。
+ */
+async function readSessionFile(
+  path: string,
+): Promise<{ records: Array<{ seq: number; ownHash: string; segment: number }>; evidence: unknown[] } | undefined> {
+  let text: string
+  try {
+    text = await readFile(path, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
+  }
+  const parsed = JSON.parse(text) as { records?: never[]; evidence?: never[] }
+  return { records: parsed.records ?? [], evidence: parsed.evidence ?? [] }
+}
+
 export function registerStageTools(ctx: Context, deps: StageToolsDeps): void {
   const timeoutMs = deps.timeoutMs ?? TOOL_TIMEOUT_MS
   const resolve = (path: string): string => (path.startsWith('/') ? path : join(deps.baseDir, path))
@@ -289,12 +308,31 @@ export function registerStageTools(ctx: Context, deps: StageToolsDeps): void {
             await writeFile(join(deps.evidenceDir, path.split('/').pop() ?? 'x'), content)
           },
         })
+        // 续接既有会话，而不是覆盖：executor_run 会被多次调用（分批执行），
+        // 每次覆盖会让先前批次的记录消失，门禁对账 R4-08 随即判定它们「漏跑」。
+        // 实测踩到：先跑 10 条、再单独跑 1 条 → 会话只剩最后 1 条 → 10 条 pass 被判无记录。
+        const prior = await readSessionFile(deps.sessionPath)
+        const last = prior?.records[prior.records.length - 1]
         const session = await executor.run(args.caseIds ?? cases.map((c) => c.id), {
           designArtifactPath: designPath,
           evidenceDir: deps.evidenceDir,
           invocationId: `inv-${Date.now()}`,
+          ...(last === undefined
+            ? {}
+            : {
+                continuation: {
+                  startSeq: last.seq + 1,
+                  prevHash: last.ownHash,
+                  segment: last.segment, // 同一执行链的连续批次：不开新段，链保持完整可验
+                },
+              }),
         })
-        await writeFile(deps.sessionPath, JSON.stringify(session))
+        // 合并：旧记录 + 新记录（证据同样合并），保持一条完整可验证的链
+        const merged = {
+          records: [...(prior?.records ?? []), ...session.records],
+          evidence: [...(prior?.evidence ?? []), ...session.evidence],
+        }
+        await writeFile(deps.sessionPath, JSON.stringify(merged))
         // 只给 agent 记录摘要（caseId/status/evidenceRefs/真实时长），不暴露实现细节
         return {
           records: session.records.map((r) => ({

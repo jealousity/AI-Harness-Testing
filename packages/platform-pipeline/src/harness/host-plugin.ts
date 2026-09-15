@@ -50,7 +50,7 @@ export const name = 'platform-pipeline-host'
  * 每次改动插件代码**必须递增**本值，并用 pipeline_run action=status 确认宿主
  * 实际加载的是哪一版，避免盲目重启 / 盲目重试。
  */
-export const HOST_PLUGIN_BUILD = 'build-2026-09-15-2215'
+export const HOST_PLUGIN_BUILD = 'build-2026-09-15-2240'
 
 /** 依赖的 harness 服务。 */
 export const inject = ['agents', 'userQuestions', 'subagents', 'tools']

@@ -240,3 +240,58 @@ test('executor_run 能在标准布局 <artifactsRoot>/artifacts/<pid>/design.jso
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }
 })
+
+/**
+ * 回归：executor_run 被多次调用（分批执行）时必须**续接**会话，不能覆盖。
+ *
+ * 实测踩到的严重后果：子会话先跑一批 [TC-1..TC-3]、又单独跑 [TC-4]，
+ * 旧实现每次 writeFile 覆盖 → 会话里只剩最后 1 条记录 → 机器门禁 R4-08
+ * 去查权威记录，判定前 3 条「漏跑」，把一份「4 条全 pass」的产物判成 BLOCKING，
+ * 三次重试耗尽后升级到人工门终止。即：产物自述 pass，权威记录却不存在。
+ *
+ * 该测试同时钉住 seq 连续与哈希链完整（verifyChain）。
+ */
+test('executor_run 分批调用必须续接记录链：第二批不得吞掉第一批', async () => {
+  const ctx = await mount()
+  ctx.tools.register(subagentStub())
+  const d = await deps()
+
+  const { createServer } = await import('node:http')
+  const server = createServer((_req, res) => { res.writeHead(200); res.end('ok') })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  const port = typeof address === 'object' && address !== null ? address.port : 0
+
+  try {
+    await mkdir(join(d.artifactsRoot, 'artifacts', 'host-2026'), { recursive: true })
+    await writeFile(
+      join(d.artifactsRoot, 'artifacts', 'host-2026', 'design.json'),
+      JSON.stringify({
+        testCases: ['TC-1', 'TC-2', 'TC-3', 'TC-4'].map(id => ({ id, steps: [{ action: 'GET /health', expected: ['200'] }] })),
+      }),
+    )
+    registerStageTools(ctx, { ...d, baseDir: d.artifactsRoot, targetBaseUrl: `http://127.0.0.1:${port}` })
+
+    // 第一批 3 条
+    await ctx.tools.get('executor_run')!.execute({ caseIds: ['TC-1', 'TC-2', 'TC-3'] } as never, {} as never)
+    // 第二批 1 条（旧实现在这里覆盖掉前 3 条）
+    await ctx.tools.get('executor_run')!.execute({ caseIds: ['TC-4'] } as never, {} as never)
+
+    const session = JSON.parse(await readFile(d.sessionPath, 'utf8')) as {
+      records: Array<{ seq: number; caseId: string }>
+    }
+    assert.deepEqual(
+      session.records.map(r => r.caseId),
+      ['TC-1', 'TC-2', 'TC-3', 'TC-4'],
+      '两批记录必须都在（旧实现在此只剩 ["TC-4"]）',
+    )
+    assert.deepEqual(session.records.map(r => r.seq), [1, 2, 3, 4], 'seq 必须连续续接，不重开')
+
+    // 链必须完整可验（R4-09/10 会验链）：续接若断链，这里会暴露
+    const { verifyChain } = await import('../src/executor/records.ts')
+    const chainViolations = verifyChain(session.records as never)
+    assert.deepEqual(chainViolations, [], `续接后链必须完整，实际：${JSON.stringify(chainViolations)}`)
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+})

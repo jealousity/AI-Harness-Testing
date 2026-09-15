@@ -75,7 +75,10 @@ export class HttpExecutor implements Executor {
   async run(caseIds: readonly string[], ctx: ExecutorContext): Promise<ExecutionSession> {
     const records: ExecutionRecord[] = []
     const evidence: EvidenceEntry[] = []
-    let prevHash = ''
+    // 续跑：从既有链尾续接（seq 水位 + 新链段），否则从头开链。
+    const startSeq = ctx.continuation?.startSeq ?? 1
+    const segment = ctx.continuation?.segment ?? 1
+    let prevHash = ctx.continuation?.prevHash ?? ''
     let prevCapturedAt = 0
 
     for (const caseId of caseIds) {
@@ -84,12 +87,12 @@ export class HttpExecutor implements Executor {
         // 用例缺失 = 执行器无法运行：记 fail + 诊断证据（R4-02 fail 必带证据）
         const capturedAt = Math.max(Date.now(), prevCapturedAt + 1)
         const entry = await this.capture(
-          ctx, `${caseId}-missing`, `{"error":"case ${caseId} not found in design artifact"}`, capturedAt, records.length + 1,
+          ctx, `${caseId}-missing`, `{"error":"case ${caseId} not found in design artifact"}`, capturedAt, startSeq + records.length,
         )
         evidence.push(entry)
         const record = makeRecord({
-          seq: records.length + 1, caseId, capturedAt, durationMs: 0,
-          status: 'fail', evidenceRefs: [entry.id], prevHash, segment: 1,
+          seq: startSeq + records.length, caseId, capturedAt, durationMs: 0,
+          status: 'fail', evidenceRefs: [entry.id], prevHash, segment,
         })
         records.push(record)
         prevHash = record.ownHash
@@ -111,7 +114,7 @@ export class HttpExecutor implements Executor {
           const body = await response.text()
           const ok = (step.expectedStatus === undefined || response.status === step.expectedStatus)
             && (step.expectedContains === undefined || body.includes(step.expectedContains))
-          const entry = await this.capture(ctx, `${caseId}-${step.name}`, wireCapture(step, response.status, body), capturedAt, records.length + 1)
+          const entry = await this.capture(ctx, `${caseId}-${step.name}`, wireCapture(step, response.status, body), capturedAt, startSeq + records.length)
           evidence.push(entry)
           refs.push(entry.id)
           if (!ok) { passed = false; break }
@@ -119,7 +122,7 @@ export class HttpExecutor implements Executor {
           const entry = await this.capture(
             ctx, `${caseId}-${step.name}-error`,
             JSON.stringify({ error: error instanceof Error ? error.message : String(error), step: step.name }),
-            capturedAt, records.length + 1,
+            capturedAt, startSeq + records.length,
           )
           evidence.push(entry)
           refs.push(entry.id)
@@ -130,10 +133,10 @@ export class HttpExecutor implements Executor {
       const end = Date.now()
       const capturedAt = Math.max(start, prevCapturedAt + 1)
       const record = makeRecord({
-        seq: records.length + 1, caseId,
+        seq: startSeq + records.length, caseId,
         capturedAt, durationMs: end - start,
         status: passed ? 'pass' : 'fail',
-        evidenceRefs: refs, prevHash, segment: 1,
+        evidenceRefs: refs, prevHash, segment,
       })
       records.push(record)
       prevHash = record.ownHash

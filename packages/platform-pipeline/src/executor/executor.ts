@@ -20,6 +20,23 @@ export interface ExecutorContext {
   readonly evidenceDir: string
   /** 本次执行调用身份（capturedBy 前缀）。 */
   readonly invocationId: string
+  /**
+   * 续跑：上一次会话的链尾与 seq 水位（ET-02「环境中断续跑开启新链段，
+   * 段头 prevHash 链接旧链尾」）。
+   *
+   * 为什么必须有：executor_run 可被多次调用（分批执行）。若每次都从 seq=1、
+   * prevHash=''、segment=1 重开，则后一次调用会覆盖/断开前一次的记录链，
+   * 门禁对账（R4-08）就会判定先前批次"漏跑"。实测踩到：先跑一批 10 条、
+   * 再单独跑 1 条，会话文件里只剩最后 1 条 → 10 条 pass 反而被判无记录。
+   */
+  readonly continuation?: ExecutorContinuation
+}
+
+/** 续跑水位：新链段从 startSeq 起编号，段头 prevHash 链接旧链尾。 */
+export interface ExecutorContinuation {
+  readonly startSeq: number
+  readonly prevHash: string
+  readonly segment: number
 }
 
 /** 一次执行会话：记录链 + 证据 + manifest 索引。 */
