@@ -21,7 +21,7 @@
  * @module platform-pipeline/harness/host-plugin
  */
 
-import { appendFile, mkdir, readFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -43,6 +43,14 @@ import type { StageId } from '../types.ts'
 
 /** 插件名（cordis 生命周期标识）。 */
 export const name = 'platform-pipeline-host'
+
+/**
+ * 构建标识：宿主插件没有可靠的「代码是否已加载」信号——配置热重载会重新 apply
+ * 但**不重新 import 模块**，所以改了代码不重启就仍是旧代码在跑（已反复踩到）。
+ * 每次改动插件代码**必须递增**本值，并用 pipeline_run action=status 确认宿主
+ * 实际加载的是哪一版，避免盲目重启 / 盲目重试。
+ */
+export const HOST_PLUGIN_BUILD = 'build-2026-09-15-2130'
 
 /** 依赖的 harness 服务。 */
 export const inject = ['agents', 'userQuestions', 'subagents', 'tools']
@@ -83,6 +91,60 @@ export interface HostPluginConfig {
 
 function textResult(text: string): ContentBlock[] {
   return [{ type: 'text', text }]
+}
+
+/**
+ * 把 driver 的 "produced no artifact" 失败改写成可定位的诊断。
+ *
+ * 实测踩到的坑：产物路径是相对路径（`artifacts/<pipelineId>/<stage>.json`），
+ * 阶段子会话带着自己的工作区根（cwd），会把该相对路径**绝对化**后写入。若
+ * artifactsRoot 与子会话工作区根不一致，产物会落到别处，driver 只报一句
+ * "produced no artifact"，看不出是路径口径不一致。这里主动去找产物实际落点。
+ */
+async function runWithDiagnostics<T>(
+  run: () => Promise<T>,
+  pipelineId: string,
+  artifactsRoot: string,
+): Promise<T> {
+  try {
+    return await run()
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    const matched = /produced no artifact at (\S+)/.exec(message)
+    if (matched === null) {
+      // 非产物路径问题：补上栈回溯。宿主里的失败常常只回一句 message，
+      // 定位不到真正的抛出点（已实测吃过这个亏）。
+      const stack = error instanceof Error && error.stack !== undefined
+        ? error.stack.split('\n').slice(0, 12).join('\n')
+        : '(no stack)'
+      throw new Error(`${message}\n\n【栈回溯（宿主插件 ${HOST_PLUGIN_BUILD}）】\n${stack}`)
+    }
+    const artifactPath = matched[1]!
+    const expected = join(artifactsRoot, artifactPath)
+    const lines = [
+      message,
+      '',
+      '【产物路径口径诊断】',
+      `  期望读取点：${expected}`,
+      `  artifactsRoot：${artifactsRoot}`,
+      '  产物路径是相对路径，阶段子会话会按**自己的工作区根**（harness 写进它的',
+      '  系统提示，可在子会话 session.jsonl 的 cwd 字段核对）绝对化后写入。',
+      `  不变式：artifactsRoot 必须等于阶段子会话的工作区根（会话 cwd）。`,
+      '  若不一致，产物会落在 <子会话 cwd>/' + artifactPath + '。',
+    ]
+    // 主动找产物是否落在子会话工作区根下（补一条确证，而不是让调用方自己猜）
+    for (const root of [process.cwd()]) {
+      try {
+        const found = await stat(join(root, artifactPath))
+        lines.push(`  已确认产物实际落点：${join(root, artifactPath)}（${found.size} 字节）`)
+        lines.push('  → 把 artifactsRoot 改成该工作区根即可对齐。')
+      } catch {
+        // 不在此根下，跳过
+      }
+    }
+    lines.push(`  （pipelineId=${pipelineId}）`)
+    throw new Error(lines.join('\n'))
+  }
 }
 
 /** 真人裁决 JSONL 审计：追加一条不可变的裁决记录。 */
@@ -210,11 +272,19 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
   //   tools.restrict() names unknown global tools "parse_doc", "fs_read", ...
   const executorDir = dirname(config.executionSessionPath ?? join(dirname(config.artifactsRoot), 'executor', 'session.json'))
   registerStageTools(ctx, {
-    // baseDir 必须等于 artifactsRoot：检查点把产物路径钉成
-    // `artifacts/<pipelineId>/<stage>.json`（见 checkpoint.ts 初始 stageStates），
-    // 而 FsArtifactStore 以 artifactsRoot 为基准解析该相对路径。阶段 agent 用
-    // fs_write 写同一个相对路径——只有 baseDir == artifactsRoot 时写入点与读取点
-    // 才重合；取 dirname(artifactsRoot) 会让每个阶段都报 "produced no artifact"。
+    // 【不变式】baseDir == artifactsRoot == **阶段子会话继承的工作区根**。
+    //
+    // 检查点把产物路径钉成 `artifacts/<pipelineId>/<stage>.json`（checkpoint.ts 的
+    // initialState），FsArtifactStore 以 artifactsRoot 为基准解析这条相对路径。
+    //
+    // 而阶段子会话带着自己的 cwd（harness 会把工作目录写进它的系统提示），模型会把
+    // 提示词里的相对路径**绝对化**为 `<cwd>/artifacts/...` 再调 fs_write，绝对路径被
+    // 原样透传。于是三者必须指向同一个根，否则：
+    //   - baseDir ≠ artifactsRoot        → 写入点与读取点错开（下方测试双向钉住）
+    //   - artifactsRoot ≠ 子会话工作区根 → 模型绝对化后写到别处，driver 报
+    //     "stage ... produced no artifact"（已在真实 GUI 宿主实测到）
+    //
+    // 故 artifactsRoot 应配置为阶段子会话的工作区根（GUI 会话里即会话 cwd）。
     baseDir: config.artifactsRoot,
     artifactsRoot: config.artifactsRoot,
     evidenceDir: config.evidenceDir ?? join(executorDir, 'evidence'),
@@ -270,7 +340,7 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
           pipelineId,
           humanDecisions: 0,
           summary: [
-            'platform-pipeline 已接入本宿主。',
+            `platform-pipeline 已接入本宿主（${HOST_PLUGIN_BUILD}）。`,
             `项目 ${cfg.projectId} / 模板 ${cfg.templateVersion} / 人工门渠道 = ctx.userQuestions 真弹窗（无自动批准）`,
             `产物根 ${config.artifactsRoot}`,
             `需求输入 ${config.receiveInput ?? '（未配置）'}`,
@@ -290,7 +360,11 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
         await driver.reenter(stageId as StageId, agent.id, typeof args.reason === 'string' ? args.reason : '')
       }
 
-      const outcome = await driver.run()
+      const outcome = await runWithDiagnostics(
+        () => driver.run(),
+        pipelineId,
+        config.artifactsRoot,
+      )
       const outcomeKind = outcome.outcome
       return {
         outcome: outcomeKind,

@@ -144,3 +144,66 @@ test('waitContinuable is a no-op when listChildren capability is absent', async 
   }))
   await spawner.waitContinuable('child-1', signal)
 })
+
+/**
+ * 回归：subagents 服务的方法**必须带接收者调用**。
+ *
+ * 真实 SubagentService.startContinuable 内部是 `this.requireContinuations()`，
+ * 一旦像 `const f = ops.startContinuable; f(spec)` 这样解构后调用，this 丢失，
+ * 报 "Cannot read properties of undefined (reading 'requireContinuations')"。
+ * 已在真实 GUI 宿主实测到该失败。
+ *
+ * 既有 mock 用箭头函数，天然不依赖 this —— 所以这类 bug 漏网。这里改用
+ * **依赖 this 的类方法**当 mock，脱离接收者调用必然失败。
+ */
+class ServiceLikeSubagents {
+  readonly calls: string[] = []
+  #ready = true
+
+  private requireReady(): boolean {
+    if (!this.#ready) throw new Error('service not ready')
+    return true
+  }
+
+  async startContinuable(spec: { provider: string }): Promise<{ childId: string }> {
+    this.requireReady() // 解构调用会在此处因 this === undefined 而抛错
+    this.calls.push(`startContinuable:${spec.provider}`)
+    return { childId: 'child-1' }
+  }
+
+  async listChildren(parentSessionId: string, _signal?: AbortSignal): Promise<unknown[]> {
+    this.requireReady()
+    this.calls.push(`listChildren:${parentSessionId}`)
+    return [{ id: 'child-1', kind: 'child', activity: 'inactive' }]
+  }
+
+  async start(): Promise<never> {
+    this.requireReady()
+    throw new Error('must not use one-shot for continuable mode')
+  }
+}
+
+test('mode=continuable 带接收者调用 startContinuable（解构会丢 this 而失败）', async () => {
+  const service = new ServiceLikeSubagents()
+  const spawner = new HarnessStageSpawner(deps(service))
+  const out = await spawner.runStage({ ...runReq, mode: 'continuable' }, cfg())
+  assert.equal(out.childId, 'child-1')
+  assert.deepEqual(service.calls, ['startContinuable:spawn', 'listChildren:parent-session'])
+})
+
+test('waitContinuable 带接收者调用 listChildren（解构会丢 this 而失败）', async () => {
+  const service = new ServiceLikeSubagents()
+  const spawner = new HarnessStageSpawner(deps(service))
+  await spawner.waitContinuable('child-1', signal)
+  assert.deepEqual(service.calls, ['listChildren:parent-session'])
+})
+
+test('服务方法若被解构则会失败——反证上面的约束真的起作用', async () => {
+  const service = new ServiceLikeSubagents()
+  const unbound = service.startContinuable // 故意解构
+  await assert.rejects(
+    () => unbound({ provider: 'spawn' }),
+    /Cannot read properties of undefined/,
+    'mock 必须真的依赖 this，否则这条回归测试是空的',
+  )
+})

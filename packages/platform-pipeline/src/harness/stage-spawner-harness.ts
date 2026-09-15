@@ -127,8 +127,7 @@ export class HarnessStageSpawner implements StageSpawner {
   /** 启动后台可续跑 child，并等待其完成（写产物）后才返回。 */
   private async startContinuable_(startRequest: SubagentStartRequest): Promise<string> {
     const ops = this.deps.subagents
-    const startContinuable = ops.startContinuable
-    if (startContinuable === undefined) {
+    if (ops.startContinuable === undefined) {
       throw new Error('HarnessStageSpawner: startContinuable is not provided by the subagents adapter')
     }
     type ContinuableSpec = {
@@ -150,19 +149,23 @@ export class HarnessStageSpawner implements StageSpawner {
       },
       signal: this.deps.signal,
     }
-    const { childId } = await startContinuable(spec)
+    // 必须带接收者调用：解构出来的方法会丢 this
+    // （SubagentService.startContinuable 内部是 this.requireContinuations()，
+    //  脱离接收者调用会报 "Cannot read properties of undefined"，已在真实宿主实测到）
+    const { childId } = await ops.startContinuable(spec)
     await this.waitContinuable(childId, this.deps.signal)
     return childId
   }
 
   /** 等待一个已存在的后台可续跑 child 完成（activity 转 'inactive'）。恢复续跑复用此路径。 */
   async waitContinuable(childId: string, signal?: AbortSignal): Promise<void> {
-    const list = this.deps.subagents.listChildren
-    if (list === undefined) return // 无 listChildren 能力：no-op 降级
+    const ops = this.deps.subagents
+    if (ops.listChildren === undefined) return // 无 listChildren 能力：no-op 降级
     const parentSessionId = this.deps.parent.id
     const poll = this.deps.continuablePollMs ?? 2000
     while (!signal?.aborted) {
-      const entries = await list(parentSessionId, signal)
+      // 同样必须带接收者调用（见上：解构会丢 this）
+      const entries = await ops.listChildren(parentSessionId, signal)
       const entry = entries.find(e => e.id === childId)
       if (entry?.kind === 'child' && entry.activity === 'inactive') return
       if (entry?.kind === 'diagnostic') {
