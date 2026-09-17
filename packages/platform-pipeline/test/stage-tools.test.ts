@@ -179,7 +179,7 @@ test('知识库和用例库工具接入 markdown-fs，并返回来源与可用�
     tags: ['接口'], entities: ['PaymentService', '幂等'], body: '重复请求只产生一次副作用', sourcePipeline: 'pipe-1',
     confidence: 'verified', sourceRefs: ['report.json#/risks/0'],
   } } as never, {} as never) as { available: boolean; id?: string }
-  assert.deepEqual(write, { available: true, id: 'kb-1' })
+  assert.deepEqual(write, { available: true, id: 'kb-1', conflict: false })
   const query = await ctx.tools.get('kb_query')!.execute({ entities: ['幂等'], limit: 5 } as never, {} as never) as { available: boolean; entries: Array<{ id: string; confidence?: string; sourceRefs?: string[] }> }
   assert.equal(query.available, true)
   assert.equal(query.entries[0]?.id, 'kb-1')
@@ -193,6 +193,24 @@ test('知识库和用例库工具接入 markdown-fs，并返回来源与可用�
   const cases = await ctx.tools.get('case_query')!.execute({ requirement: 'REQ-1' } as never, {} as never) as { available: boolean; cases: Array<{ caseId: string }> }
   assert.equal(cases.available, true)
   assert.equal(cases.cases[0]?.caseId, 'TC-1')
+})
+
+test('kb_write returns structured conflict instead of overwriting contradictory knowledge', async () => {
+  const ctx = await mount()
+  ctx.tools.register(subagentStub())
+  const d = await deps()
+  const knowledgeStore = new MarkdownKnowledgeStore(join(d.baseDir, 'kb'))
+  registerStageTools(ctx, { ...d, knowledgeStore, projectId: 'acme-pay' })
+  await ctx.tools.get('kb_write')!.execute({ entry: {
+    id: 'kb-existing', title: '支付结论', date: '2026-09-17', project: 'acme-pay', version: 'v1',
+    tags: ['接口'], entities: ['PaymentService'], body: '旧结论', sourcePipeline: 'pipe-1',
+  } } as never, {} as never)
+  const result = await ctx.tools.get('kb_write')!.execute({ entry: {
+    id: 'kb-new', title: '支付新结论', date: '2026-09-17', project: 'acme-pay', version: 'v2',
+    tags: ['接口'], entities: ['PaymentService'], body: '新结论', sourcePipeline: 'pipe-2',
+  } } as never, {} as never) as { conflict?: boolean; conflicts?: Array<{ existingId: string }> }
+  assert.equal(result.conflict, true)
+  assert.equal(result.conflicts?.[0]?.existingId, 'kb-existing')
 })
 
 test('知识库未配置时明确返回 available=false', async () => {

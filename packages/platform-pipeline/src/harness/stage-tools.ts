@@ -17,7 +17,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { mkdir, readdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { HttpExecutor, type HttpCase, type HttpStep } from '../executor/http.ts'
-import { MarkdownCaseStore, MarkdownKnowledgeStore, type KnowledgeEntry, type VersionedCase } from '../stores/markdown.ts'
+import { KnowledgeConflictError, MarkdownCaseStore, MarkdownKnowledgeStore, type KnowledgeEntry, type VersionedCase } from '../stores/markdown.ts'
 import { loadCheckpoint } from '../checkpoint.ts'
 
 const TOOL_TIMEOUT_MS = 180_000
@@ -257,7 +257,7 @@ export function registerStageTools(ctx: Context, deps: StageToolsDeps): void {
     description: 'Write one approved structured knowledge entry to the configured knowledge store.',
     parameters: { entry: { type: 'json', required: true, description: 'knowledge entry object' } },
     output: {
-      schema: { type: 'object', additionalProperties: false, properties: { available: { type: 'boolean' }, id: { type: 'string' }, error: { type: 'string' } } },
+      schema: { type: 'object', additionalProperties: false, properties: { available: { type: 'boolean' }, id: { type: 'string' }, conflict: { type: 'boolean' }, conflicts: { type: 'array', items: { type: 'json' } }, error: { type: 'string' } } },
       render: (_args, value) => textResult(JSON.stringify(value)),
     },
     timeoutMs,
@@ -266,8 +266,13 @@ export function registerStageTools(ctx: Context, deps: StageToolsDeps): void {
       const entry = args.entry as unknown as KnowledgeEntry
       if (entry === null || typeof entry !== 'object' || typeof entry.id !== 'string' || entry.id.trim() === '') return { available: true, error: 'entry.id is required' }
       if (deps.projectId !== undefined && entry.project !== deps.projectId) return { available: true, error: `entry.project must equal ${deps.projectId}` }
-      const id = await deps.knowledgeStore.write(entry)
-      return { available: true, id }
+      try {
+        const id = await deps.knowledgeStore.write(entry)
+        return { available: true, id, conflict: false }
+      } catch (error) {
+        if (error instanceof KnowledgeConflictError) return { available: true, conflict: true, conflicts: [...error.conflicts] } as never
+        throw error
+      }
     },
   }))
 

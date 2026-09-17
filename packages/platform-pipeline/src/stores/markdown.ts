@@ -7,7 +7,7 @@
  * @module platform-pipeline/stores/markdown
  */
 
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 export type KnowledgeKind =
@@ -34,6 +34,8 @@ export interface KnowledgeEntry {
   readonly sourceRefs?: readonly string[]
   readonly scope?: Readonly<{ services?: readonly string[]; environments?: readonly string[] }>
   readonly validUntil?: string
+  readonly supersedes?: readonly string[]
+  readonly supersededBy?: string
 }
 
 export interface KnowledgeQuery {
@@ -42,7 +44,24 @@ export interface KnowledgeQuery {
   readonly text?: string
   readonly project?: string
   readonly status?: KnowledgeStatus
+  readonly includeExpired?: boolean
   readonly limit: number
+}
+
+export interface KnowledgeConflict {
+  readonly existingId: string
+  readonly existingVersion: string
+  readonly detail: string
+}
+
+export class KnowledgeConflictError extends Error {
+  readonly conflicts: readonly KnowledgeConflict[]
+
+  constructor(conflicts: readonly KnowledgeConflict[]) {
+    super(`knowledge write conflicts with active entries: ${conflicts.map(conflict => conflict.existingId).join(', ')}`)
+    this.name = 'KnowledgeConflictError'
+    this.conflicts = conflicts
+  }
 }
 
 export interface KnowledgeHit {
@@ -114,7 +133,9 @@ export class MarkdownKnowledgeStore {
       const meta = decodeMeta(firstLine)
       if (meta === null) continue
       if (query.project !== undefined && meta.project !== query.project) continue
-      if (query.status !== undefined && (meta.status ?? 'active') !== query.status) continue
+      const status = meta.status ?? 'active'
+      if ((query.status ?? 'active') !== status) continue
+      if (!query.includeExpired && meta.validUntil !== undefined && meta.validUntil < new Date().toISOString().slice(0, 10)) continue
       const searchable = [meta.title, ...meta.tags, ...meta.entities, meta.body].map(normalizeTerm).join(' ')
       const matchedEntities = entities.filter(term => searchable.includes(term))
       const matchedTags = tags.filter(term => meta.tags.map(normalizeTerm).some(tag => tag.includes(term)))
@@ -135,7 +156,33 @@ export class MarkdownKnowledgeStore {
     return hits.slice(0, Math.max(0, query.limit))
   }
 
-  /** 写入条目；同 id 幂等覆盖（R6-03 归档幂等）。 */
+  async findConflicts(entry: KnowledgeEntry): Promise<KnowledgeConflict[]> {
+    const files = await this.listMd()
+    const conflicts: KnowledgeConflict[] = []
+    const incomingEntities = new Set(entry.entities.map(normalizeTerm))
+    const incomingTags = new Set(entry.tags.map(normalizeTerm))
+    const supersedes = new Set(entry.supersedes ?? [])
+    for (const file of files) {
+      const raw = await readFile(join(this.dir, file), 'utf8')
+      const existing = decodeMeta(raw.split('\n', 1)[0] ?? '')
+      if (existing === null || existing.id === entry.id || existing.project !== entry.project) continue
+      if ((existing.status ?? 'active') !== 'active' || supersedes.has(existing.id)) continue
+      const sharedEntities = existing.entities.filter(value => incomingEntities.has(normalizeTerm(value)))
+      const sharedTags = existing.tags.filter(value => incomingTags.has(normalizeTerm(value)))
+      const sameTitle = normalizeTerm(existing.title) === normalizeTerm(entry.title)
+      const differentBody = normalizeTerm(existing.body) !== normalizeTerm(entry.body)
+      if (differentBody && (sharedEntities.length > 0 || sharedTags.length > 0 || sameTitle)) {
+        conflicts.push({
+          existingId: existing.id,
+          existingVersion: existing.version,
+          detail: `与 ${existing.id}@${existing.version} 的结论存在重叠实体/标签但正文不同；请显式 supersedes 旧条目或先人工确认`,
+        })
+      }
+    }
+    return conflicts
+  }
+
+  /** 写入条目；冲突必须显式 supersedes，版本变化会保留历史快照。 */
   async write(entry: KnowledgeEntry): Promise<string> {
     await mkdir(this.dir, { recursive: true })
     const target = join(this.dir, `${safeName(entry.id)}.md`)
@@ -144,10 +191,42 @@ export class MarkdownKnowledgeStore {
       status: entry.status ?? 'active',
       confidence: entry.confidence ?? 'unverified',
       sourceRefs: entry.sourceRefs ?? [],
+      supersedes: entry.supersedes ?? [],
+    }
+    if (normalized.status === 'active') {
+      const conflicts = await this.findConflicts(normalized)
+      if (conflicts.length > 0) throw new KnowledgeConflictError(conflicts)
+    }
+    let previous: KnowledgeEntry | null = null
+    try {
+      const raw = await readFile(target, 'utf8')
+      previous = decodeMeta(raw.split('\n', 1)[0] ?? '')
+    } catch {
+      previous = null
+    }
+    if (previous !== null && previous.version !== normalized.version) {
+      const historyDir = join(this.dir, '.history')
+      await mkdir(historyDir, { recursive: true })
+      await writeFile(join(historyDir, `${safeName(previous.id)}@${safeName(previous.version)}.md`), `${encodeMeta(previous)}\n${previous.body}\n`)
+    }
+    for (const supersededId of normalized.supersedes ?? []) {
+      const supersededPath = join(this.dir, `${safeName(supersededId)}.md`)
+      try {
+        const raw = await readFile(supersededPath, 'utf8')
+        const old = decodeMeta(raw.split('\n', 1)[0] ?? '')
+        if (old !== null && (old.status ?? 'active') === 'active') {
+          const superseded = { ...old, status: 'superseded' as const, supersededBy: normalized.id }
+          await writeFile(supersededPath, `${encodeMeta(superseded)}\n${superseded.body}\n`)
+        }
+      } catch {
+        // Missing supersedes target is reported by the caller as a conflict-safe no-op.
+      }
     }
     const content = `${encodeMeta(normalized)}\n${normalized.body}\n`
-    await writeFile(target, content)
-    return entry.id
+    const temp = `${target}.${process.pid}.tmp`
+    await writeFile(temp, content)
+    await rename(temp, target)
+    return normalized.id
   }
 
   private async listMd(): Promise<string[]> {

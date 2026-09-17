@@ -62,6 +62,14 @@ ALLOW_PRIVATE_API=1 node server.mjs
 - archive prompt 要求记录本次写入的 `expectedIds`，再通过 `kb_query` 回读并写入 `verifiedIds/allExpectedHit`；R6-05 会检查是否命中本次归档的全部知识 ID，而不仅仅是任意旧条目。
 - host-plugin 会根据 pipeline 配置自动解析 `stores.knowledge.path` 与 `stores.cases.path`，构造本地 Markdown 存储适配器。
 
+### 知识库 P1 生命周期与冲突治理
+
+- 默认只检索 `active` 条目，并自动排除已过期条目；可显式查询其他状态。
+- 新条目支持 `supersedes` / `supersededBy`；替代旧条目时旧条目会标记为 `superseded`，默认检索不会再返回旧结论。
+- 同项目下，若新条目与现有 active 条目共享实体/标签但正文不同，写入会返回结构化冲突，不会静默覆盖。
+- 只有显式 `supersedes` 旧条目时才允许替代，并保留旧版本快照到知识库 `.history/`。
+- `kb_write` 会返回 `conflict` 与冲突详情，交由人工门 G 决定，不把冲突交给模型自行覆盖。
+
 ## 架构决策摘要
 
 | 决策 | 内容 |

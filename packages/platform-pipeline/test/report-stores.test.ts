@@ -98,6 +98,33 @@ test('MarkdownKnowledgeStore write→read round-trips and filters by entity/proj
   assert.equal(limit[0]?.id, 'kb-pay-1')
 })
 
+test('MarkdownKnowledgeStore defaults to active and excludes superseded entries', async () => {
+  const kb = new MarkdownKnowledgeStore(dir)
+  await kb.write(entry1)
+  await kb.write({
+    ...entry1,
+    id: 'kb-pay-2',
+    version: '2026.09',
+    body: '新的幂等结论',
+    supersedes: ['kb-pay-1'],
+    sourceRefs: ['report.json#/risks/1'],
+    confidence: 'verified',
+  })
+  const active = await kb.read({ entities: ['PaymentService'], limit: 10 })
+  assert.deepEqual(active.map(entry => entry.id), ['kb-pay-2'])
+  const superseded = await kb.read({ entities: ['PaymentService'], status: 'superseded', limit: 10 })
+  assert.deepEqual(superseded.map(entry => entry.id), ['kb-pay-1'])
+})
+
+test('MarkdownKnowledgeStore rejects contradictory active entries without supersedes', async () => {
+  const kb = new MarkdownKnowledgeStore(dir)
+  await kb.write(entry1)
+  await assert.rejects(
+    () => kb.write({ ...entry2, id: 'kb-pay-conflict', title: '支付新结论', entities: ['PaymentService'], body: '互相矛盾的新正文' }),
+    (error: unknown) => error instanceof Error && error.name === 'KnowledgeConflictError' && error.message.includes('kb-pay-1'),
+  )
+})
+
 test('MarkdownKnowledgeStore write is idempotent by id', async () => {
   const kb = new MarkdownKnowledgeStore(dir)
   await kb.write(entry1)
