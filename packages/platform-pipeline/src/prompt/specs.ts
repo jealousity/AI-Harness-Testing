@@ -133,7 +133,7 @@ export const STAGE_SPECS: Readonly<Record<StageId, StagePromptSpec>> = {
     roleTail: '编排与聚合 agent（非执行者）',
     task: `1. 制定执行计划：环境、执行器分档、执行顺序；plan.order 覆盖全部用例；
 2. 按 execution_level 分档编排：
-   - auto / hybrid：调用 executor_run(caseIds) 让 executor 执行——入参只传用例 id，
+   - auto / hybrid：调用 executor_run({ pipelineId: "{{pipelineId}}", caseIds }) 让 executor 执行——必须带当前 pipelineId 与用例 id，
      不传、不指定任何"期望结果"；executor 自读 design.json、真实执行、返回自产记录；
    - manual：不执行，进入 pendingManual 清单，等待人工在 manual 执行会话内回填；
 3. 环境初始化必须幂等（重复执行收敛）；
@@ -208,8 +208,9 @@ export const STAGE_SPECS: Readonly<Record<StageId, StagePromptSpec>> = {
 3. 更新版本档案 versionArchive（本次变更摘要）；
 4. archiveReport 先记 pending 清单，不执行写库；
 第二趟（写库，仅当 extraContext 携带人工门 G 批准）：
-5. 按批准后的清单执行 kb_write / case_archive，只写批准清单内的内容，不增不减（R6-04）；
-6. 更新 archiveReport 为实际结果；幂等：同一 pipelineId 重复归档覆盖同条目（R6-03）；
+5. 按批准后的清单执行 kb_write / case_archive，只写批准清单内的内容，不增不减（R6-04）；kb_write 返回的 id 必须记录到 expectedIds；
+6. 写入完成后用 kb_query 按每个条目的 entities/tags 回读，记录 queries、hits、expectedIds、verifiedIds、allExpectedHit=true（只有全部 expectedIds 命中才可为 true）；
+7. 更新 archiveReport 为实际结果；幂等：同一 pipelineId 重复归档覆盖同条目（R6-03）；
    历史版本只追加记录，不覆盖删除。
 定位：你是"归档执行者"，不是"审计者"——归档内容正确性由人工门 G 确认。`,
     schemaInline: `{

@@ -60,6 +60,8 @@ export {
   saveCheckpoint,
 } from './checkpoint.ts'
 
+export { acquirePipelineLock, type PipelineLock } from './checkpoint-lock.ts'
+
 export {
   assemblePrompt,
   capExtraContext,

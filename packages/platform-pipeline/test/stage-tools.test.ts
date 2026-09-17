@@ -9,6 +9,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { PLATFORM_ACL, TOOL_CATALOG } from '../src/tool-catalog.ts'
 import { registerStageTools } from '../src/harness/stage-tools.ts'
 import { FsArtifactStore } from '../src/stores/fs.ts'
+import { MarkdownCaseStore, MarkdownKnowledgeStore } from '../src/stores/markdown.ts'
 
 async function mount(): Promise<Context> {
   const ctx = new Context()
@@ -139,6 +140,15 @@ test('不覆盖宿主已有的同名真工具（如 subagent），避免把真�
   assert.equal(ctx.tools.get('subagent')?.description, 'real host subagent tool')
 })
 
+test('fs_read / fs_write 拒绝工作区外路径', async () => {
+  const ctx = await mount()
+  ctx.tools.register(subagentStub())
+  const d = await deps()
+  registerStageTools(ctx, d)
+  await assert.rejects(() => ctx.tools.get('fs_write')!.execute({ path: '../escape.txt', content: 'x' } as never, {} as never), /escapes workspace root/)
+  await assert.rejects(() => ctx.tools.get('fs_read')!.execute({ path: '/etc/hosts' } as never, {} as never), /escapes workspace root/)
+})
+
 test('fs_write / fs_read 真实读写工作区（阶段 agent 靠它们产出产物）', async () => {
   const ctx = await mount()
   ctx.tools.register(subagentStub())
@@ -154,6 +164,44 @@ test('fs_write / fs_read 真实读写工作区（阶段 agent 靠它们产出产
 
   const read = await ctx.tools.get('fs_read')!.execute({ path: 'nested/out.json' } as never, {} as never)
   assert.deepEqual(read, { text: '{"ok":true}' })
+})
+
+test('知识库和用例库工具接入 markdown-fs，并返回来源与可用性', async () => {
+  const ctx = await mount()
+  ctx.tools.register(subagentStub())
+  const d = await deps()
+  const knowledgeStore = new MarkdownKnowledgeStore(join(d.baseDir, 'kb'))
+  const caseStore = new MarkdownCaseStore(join(d.baseDir, 'cases'))
+  registerStageTools(ctx, { ...d, knowledgeStore, caseStore, projectId: 'acme-pay' })
+
+  const write = await ctx.tools.get('kb_write')!.execute({ entry: {
+    id: 'kb-1', title: '支付幂等', date: '2026-09-17', project: 'acme-pay', version: 'v1',
+    tags: ['接口'], entities: ['PaymentService', '幂等'], body: '重复请求只产生一次副作用', sourcePipeline: 'pipe-1',
+    confidence: 'verified', sourceRefs: ['report.json#/risks/0'],
+  } } as never, {} as never) as { available: boolean; id?: string }
+  assert.deepEqual(write, { available: true, id: 'kb-1' })
+  const query = await ctx.tools.get('kb_query')!.execute({ entities: ['幂等'], limit: 5 } as never, {} as never) as { available: boolean; entries: Array<{ id: string; confidence?: string; sourceRefs?: string[] }> }
+  assert.equal(query.available, true)
+  assert.equal(query.entries[0]?.id, 'kb-1')
+  assert.equal(query.entries[0]?.confidence, 'verified')
+  assert.deepEqual(query.entries[0]?.sourceRefs, ['report.json#/risks/0'])
+
+  const archived = await ctx.tools.get('case_archive')!.execute({ case: {
+    caseId: 'TC-1', version: 'v1', project: 'acme-pay', sourceRequirement: 'REQ-1', ticketRef: 'PAY-1', content: { title: '登录' },
+  } } as never, {} as never) as { available: boolean; caseId?: string }
+  assert.deepEqual(archived, { available: true, caseId: 'TC-1' })
+  const cases = await ctx.tools.get('case_query')!.execute({ requirement: 'REQ-1' } as never, {} as never) as { available: boolean; cases: Array<{ caseId: string }> }
+  assert.equal(cases.available, true)
+  assert.equal(cases.cases[0]?.caseId, 'TC-1')
+})
+
+test('知识库未配置时明确返回 available=false', async () => {
+  const ctx = await mount()
+  ctx.tools.register(subagentStub())
+  registerStageTools(ctx, await deps())
+  const result = await ctx.tools.get('kb_query')!.execute({ entities: ['missing'] } as never, {} as never) as { available: boolean; entries: unknown[] }
+  assert.equal(result.available, false)
+  assert.deepEqual(result.entries, [])
 })
 
 test('executor_run 在未配置被测服务时拒绝产出执行记录（不允许伪造证据）', async () => {
@@ -211,6 +259,28 @@ test('executor_run 对真实 design 产物发起真实 HTTP 并落执行会话',
  * 还多一层 `artifacts/`。实测踩到过：只找 `<root>/<pid>/design.json` 时 executor
  * 永远找不到 design 产物，execute 阶段全部用例 pending、零执行。
  */
+test('executor_run 按 pipelineId 精确选择 design 产物，不按 mtime 猜测', async () => {
+  const ctx = await mount()
+  ctx.tools.register(subagentStub())
+  const d = await deps()
+  await mkdir(join(d.artifactsRoot, 'pipe-a'), { recursive: true })
+  await mkdir(join(d.artifactsRoot, 'pipe-b'), { recursive: true })
+  await writeFile(join(d.artifactsRoot, 'pipe-a', 'design.json'), JSON.stringify({ pipelineId: 'pipe-a', testCases: [{ id: 'A-1', steps: [{ action: 'GET /a', expected: ['200'] }] }] }))
+  await writeFile(join(d.artifactsRoot, 'pipe-b', 'design.json'), JSON.stringify({ pipelineId: 'pipe-b', testCases: [{ id: 'B-1', steps: [{ action: 'GET /b', expected: ['200'] }] }] }))
+  const { createServer } = await import('node:http')
+  const server = createServer((_req, res) => { res.writeHead(200); res.end('ok') })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  const port = typeof address === 'object' && address !== null ? address.port : 0
+  try {
+    registerStageTools(ctx, { ...d, targetBaseUrl: `http://127.0.0.1:${port}` })
+    const result = await ctx.tools.get('executor_run')!.execute({ pipelineId: 'pipe-b', caseIds: ['B-1'] } as never, {} as never) as { records?: Array<{ caseId: string }> }
+    assert.equal(result.records?.[0]?.caseId, 'B-1')
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+})
+
 test('executor_run 能在标准布局 <artifactsRoot>/artifacts/<pid>/design.json 下找到 design 产物', async () => {
   const ctx = await mount()
   ctx.tools.register(subagentStub())

@@ -58,6 +58,10 @@ export async function apply(ctx: Context, config: PipelinePluginConfig): Promise
     [...platformGenericRules(schemas), ...stageRules({ maxManualClaimedRatio: cfg.releasePolicy.maxManualClaimedRatio })],
     config.rulesetVersion ?? cfg.templateVersion,
   )
+  for (const stageId of Object.keys(cfg.stages) as StageId[]) {
+    const missing = gates.validateRuleIds(cfg.stages[stageId]!.rules)
+    if (missing.length > 0) throw new Error(`pipeline config references unimplemented rule(s) for ${stageId}: ${missing.join(', ')}`)
+  }
 
   const makeDriver = (pipelineId: string): PipelineDriver => new PipelineDriver({
     cfg,

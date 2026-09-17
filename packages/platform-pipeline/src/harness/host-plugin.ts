@@ -22,14 +22,16 @@
  */
 
 import { appendFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SubagentRuntime } from '@deepseek-ai/dsh-subagent'
 import { loadPipelineConfig } from '../config.ts'
+import { acquirePipelineLock } from '../checkpoint-lock.ts'
 import { FsArtifactStore, FsCheckpointPort } from '../stores/fs.ts'
+import { MarkdownCaseStore, MarkdownKnowledgeStore } from '../stores/markdown.ts'
 import { MachineGateEngine, platformGenericRules } from '../gates/machine.ts'
 import { stageRules } from '../gates/stage-rules.ts'
 import { pipelineContractSchemas } from '../contracts/schemas.ts'
@@ -199,9 +201,25 @@ interface Assembled {
   readonly decisions: HumanGateAuditRecord[]
 }
 
-export function apply(ctx: Context, config: HostPluginConfig): void {
+export async function apply(ctx: Context, config: HostPluginConfig): Promise<void> {
+  const initialConfig = await loadPipelineConfig(config.configPath)
+  const configDir = dirname(config.configPath)
+  const resolveStorePath = (value: unknown): string | undefined => {
+    if (typeof value !== 'string' || value.trim() === '') return undefined
+    return isAbsolute(value) ? value : join(configDir, value)
+  }
+  const knowledgeDir = initialConfig.stores.knowledge.impl === 'markdown-fs'
+    ? resolveStorePath(initialConfig.stores.knowledge.path)
+    : undefined
+  const caseDir = initialConfig.stores.cases.impl === 'markdown-fs'
+    ? resolveStorePath(initialConfig.stores.cases.path)
+    : undefined
+  const knowledgeStore = knowledgeDir === undefined ? undefined : new MarkdownKnowledgeStore(knowledgeDir)
+  const caseStore = caseDir === undefined ? undefined : new MarkdownCaseStore(caseDir)
   const toolName = config.toolName ?? 'pipeline_run'
   const auditPath = join(config.checkpointRoot, 'human-gate-audit.jsonl')
+  let activePipelineId: string | undefined
+  const activePipelines = new Set<string>()
 
   /** 用真实 ctx 服务装配一条流水线（每次运行独立 driver，检查点负责续跑）。 */
   const assemble = async (pipelineId: string, agent: Agent, signal: AbortSignal): Promise<Assembled> => {
@@ -211,17 +229,19 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
       [...platformGenericRules(schemas), ...stageRules({ maxManualClaimedRatio: cfg.releasePolicy.maxManualClaimedRatio })],
       cfg.templateVersion,
     )
+    for (const stageId of Object.keys(cfg.stages) as StageId[]) {
+      const missing = gates.validateRuleIds(cfg.stages[stageId]!.rules)
+      if (missing.length > 0) throw new Error(`pipeline config references unimplemented rule(s) for ${stageId}: ${missing.join(', ')}`)
+    }
 
     const decisions: HumanGateAuditRecord[] = []
     const human = new UiUserQuestionsHumanGate({
       userQuestions: ctx.userQuestions,
       agent,
       by: agent.id,
-      onDecision: (record) => {
+      onDecision: async (record) => {
+        await appendAudit(auditPath, record)
         decisions.push(record)
-        void appendAudit(auditPath, record).catch((err: unknown) => {
-          ctx.logger?.warn?.(`人工门裁决审计写入失败：${String(err)}`)
-        })
       },
     })
 
@@ -239,7 +259,7 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
         parent: agent,
         signal,
         ...(config.providerName === undefined ? {} : { providerName: config.providerName }),
-        ...(config.reviewAllowTools === undefined ? {} : { toolFilter: { allow: [...config.reviewAllowTools] } }),
+        toolFilter: { allow: [...(config.reviewAllowTools ?? ['fs_read'])], deny: ['fs_write', 'subagent', 'executor_run', 'kb_write', 'case_archive'] },
       })
 
     const driver = new PipelineDriver({
@@ -260,8 +280,11 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
             load: async (stageId: StageId) => {
               if (stageId !== 'execute') return undefined
               try {
-                const raw = await readFile(config.executionSessionPath!, 'utf8')
-                return JSON.parse(raw) as never
+                const sessionPath = join(executorDir, pipelineId, 'session.json')
+                const raw = await readFile(sessionPath, 'utf8')
+                const parsed = JSON.parse(raw) as Record<string, unknown>
+                if (parsed.evidenceDir === undefined) parsed.evidenceDir = join(executorDir, pipelineId, 'evidence')
+                return parsed as never
               } catch {
                 return undefined
               }
@@ -313,9 +336,15 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
     artifactsRoot: config.artifactsRoot,
     evidenceDir: config.evidenceDir ?? join(executorDir, 'evidence'),
     sessionPath: config.executionSessionPath ?? join(executorDir, 'session.json'),
+    pipelineIdProvider: () => activePipelineId,
+    sessionPathProvider: (pipelineId) => join(executorDir, pipelineId, 'session.json'),
+    evidenceDirProvider: (pipelineId) => join(executorDir, pipelineId, 'evidence'),
     ...(config.targetBaseUrl === undefined ? {} : { targetBaseUrl: config.targetBaseUrl }),
     ...(config.receiveInput === undefined ? {} : { receiveInput: config.receiveInput }),
     checkpointRoot: config.checkpointRoot,
+    knowledgeStore,
+    caseStore,
+    projectId: initialConfig.projectId,
   })
 
   // 工具调用超时强制（docs：>3 分钟自动中止）——全局钩子，装一次
@@ -378,27 +407,44 @@ export function apply(ctx: Context, config: HostPluginConfig): void {
       const schemaFiles = await materializeContractSchemas(config.artifactsRoot)
       console.log(`[platform-pipeline] 已落盘契约 schema ${schemaFiles.length} 份 → ${dirname(schemaFiles[0] ?? config.artifactsRoot)}`)
 
-      const { driver, decisions } = await assemble(pipelineId, agent, exec.signal)
-
-      if (action === 'reenter') {
-        const stageId = args.stageId
-        if (typeof stageId !== 'string' || stageId.trim() === '') {
-          throw new Error('action="reenter" 需要 stageId。')
-        }
-        await driver.reenter(stageId as StageId, agent.id, typeof args.reason === 'string' ? args.reason : '')
+      if (activePipelines.has(pipelineId)) throw new Error(`流水线 ${pipelineId} 已有运行中的实例，拒绝并发 run/reenter`)
+      activePipelines.add(pipelineId)
+      activePipelineId = pipelineId
+      let lock: Awaited<ReturnType<typeof acquirePipelineLock>>
+      try {
+        lock = await acquirePipelineLock(config.checkpointRoot, pipelineId)
+      } catch (error) {
+        activePipelineId = undefined
+        activePipelines.delete(pipelineId)
+        throw error
       }
+      try {
+        const { driver, decisions } = await assemble(pipelineId, agent, exec.signal)
 
-      const outcome = await runWithDiagnostics(
-        () => driver.run(),
-        pipelineId,
-        config.artifactsRoot,
-      )
-      const outcomeKind = outcome.outcome
-      return {
-        outcome: outcomeKind,
-        pipelineId,
-        humanDecisions: decisions.length,
-        summary: `流水线 ${pipelineId} 结果：${outcomeKind}；真人裁决 ${decisions.length} 次（审计：${auditPath}）。`,
+        if (action === 'reenter') {
+          const stageId = args.stageId
+          if (typeof stageId !== 'string' || stageId.trim() === '') {
+            throw new Error('action="reenter" 需要 stageId。')
+          }
+          await driver.reenter(stageId as StageId, agent.id, typeof args.reason === 'string' ? args.reason : '')
+        }
+
+        const outcome = await runWithDiagnostics(
+          () => driver.run(),
+          pipelineId,
+          config.artifactsRoot,
+        )
+        const outcomeKind = outcome.outcome
+        return {
+          outcome: outcomeKind,
+          pipelineId,
+          humanDecisions: decisions.length,
+          summary: `流水线 ${pipelineId} 结果：${outcomeKind}；真人裁决 ${decisions.length} 次（审计：${auditPath}）。`,
+        }
+      } finally {
+        await lock.release()
+        activePipelineId = undefined
+        activePipelines.delete(pipelineId)
       }
     },
   }))

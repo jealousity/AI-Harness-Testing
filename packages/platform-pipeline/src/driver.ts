@@ -43,6 +43,8 @@ export interface ReviewRunner {
 /** 产物读写端口（宿主实现为 fs）。 */
 export interface ArtifactStore {
   read(path: string): Promise<StageArtifact | null>
+  /** 可选：将宿主补全后的 wrapper 元数据持久化，保证重启后 digest/inputs 不漂移。 */
+  write?(artifact: StageArtifact): Promise<void>
 }
 
 export interface CheckpointPort {
@@ -170,10 +172,22 @@ export class PipelineDriver {
       const filled = hasPersisted
         ? { ...artifact, inputs: persisted, digest: cp.stageStates[stageId]!.digest || computeArtifactDigest({ ...artifact, inputs: persisted }) }
         : this.fillInputLocks(artifact, upstreams)
+      if (this.options.artifacts.write !== undefined) {
+        await this.options.artifacts.write(filled)
+      }
 
       // 1. 机器门禁（全量重判；G-08 摘要锁在此拦截级联失效；R4-08/09/10 需 executor 执行数据）
       const execution = await this.options.execution?.load(stageId, this.options.pipelineId)
-      const gate = this.options.gates.judge(stageId, filled, upstreams, state.gate.machine.attempts + 1, execution)
+      const configuredRules = this.options.cfg.stages[stageId]!.rules
+      const ruleIds = this.options.gates.validateRuleIds(configuredRules).length === 0 ? configuredRules : undefined
+      const gate = this.options.gates.judge(
+        stageId,
+        filled,
+        upstreams,
+        state.gate.machine.attempts + 1,
+        execution,
+        ruleIds,
+      )
       if (gate.status === 'failed') {
         if (state.gate.machine.attempts < this.maxGateRetries) {
           cp = await this.update(cp, stageId, {

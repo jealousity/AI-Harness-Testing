@@ -25,7 +25,8 @@ export class FsArtifactStore implements ArtifactStore {
     try {
       const raw = await readFile(target, 'utf8')
       const parsed = JSON.parse(raw) as unknown
-      // 磁盘只存 content：一律包装（wrapper 由宿主内存构建，digest/inputs 由 driver 填充）
+      if (isPersistedArtifact(parsed)) return parsed
+      // 阶段 agent 首次写入的是裸 content；driver 读取后会补齐并持久化 wrapper。
       return wrapContent(path, parsed)
     } catch (error) {
       if (isMissingFile(error)) return null
@@ -33,11 +34,11 @@ export class FsArtifactStore implements ArtifactStore {
     }
   }
 
-  /** 只持久化 content（agent 契约）；wrapper 元数据不落盘（防 agent 镜像 wrapper 结构）。 */
+  /** 持久化完整 wrapper；stage-tools 的 fs_read 会对阶段 agent 透明解包 content。 */
   async write(artifact: StageArtifact): Promise<void> {
     const target = this.resolvePath(artifact.path)
     await mkdir(dirname(target), { recursive: true })
-    await writeFile(target, JSON.stringify(stripWrapperKeys(artifact.content), null, 2))
+    await writeFile(target, JSON.stringify({ ...artifact, content: stripWrapperKeys(artifact.content) }, null, 2))
   }
 
   private resolvePath(path: string): string {
@@ -62,7 +63,19 @@ export class FsCheckpointPort implements CheckpointPort {
 }
 
 /** 包装字段（宿主元数据；LLM 可能误写进 content，宿主归一化时剥离）。 */
-const WRAPPER_KEYS = new Set(['inputs', 'digest', 'version', 'pipelineId', 'stageId'])
+const WRAPPER_KEYS = new Set(['inputs', 'digest', 'version', 'pipelineId', 'stageId', 'path'])
+
+function isPersistedArtifact(value: unknown): value is StageArtifact {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const record = value as Record<string, unknown>
+  return typeof record.pipelineId === 'string'
+    && typeof record.stageId === 'string'
+    && typeof record.version === 'number'
+    && typeof record.digest === 'string'
+    && typeof record.path === 'string'
+    && record.inputs !== null && typeof record.inputs === 'object'
+    && 'content' in record
+}
 
 /** 剥离 content 顶层的包装字段（防止 LLM 把宿主元数据写进产物）。 */
 function stripWrapperKeys(content: unknown): unknown {

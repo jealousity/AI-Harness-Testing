@@ -66,20 +66,42 @@ export function verifyChain(records: readonly ExecutionRecord[]): readonly Chain
   const violations: ChainViolation[] = []
   if (records.length === 0) return violations
 
-  const bySeq = new Map(records.map(r => [r.seq, r]))
+  const seenKeys = new Set<string>()
   let prevOwnHash: string | undefined
   let prevCapturedAt: number | undefined
   let prevDurationMs: number | undefined
   let prevSegment: number | undefined
   let prevResumedFrom: string | undefined
 
-  for (const record of records) {
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index]!
+    const previous = records[index - 1]
+    const key = `${record.segment}:${record.seq}`
+    if (seenKeys.has(key)) {
+      violations.push({ rule: 'R4-09', detail: `seq ${record.seq}: duplicate record key in segment ${record.segment}` })
+    }
+    seenKeys.add(key)
+    if (!Number.isInteger(record.seq) || record.seq < 1) {
+      violations.push({ rule: 'R4-09', detail: `seq ${record.seq}: sequence must be a positive integer` })
+    }
+    if (!Number.isInteger(record.segment) || record.segment < 1) {
+      violations.push({ rule: 'R4-09', detail: `seq ${record.seq}: segment must be a positive integer` })
+    }
+    if (previous !== undefined && record.segment === previous.segment && record.seq !== previous.seq + 1) {
+      violations.push({ rule: 'R4-09', detail: `seq ${record.seq}: non-contiguous sequence within segment (previous ${previous.seq})` })
+    }
+    if (previous !== undefined && record.segment !== previous.segment && record.seq !== 1) {
+      violations.push({ rule: 'R4-09', detail: `seq ${record.seq}: a new chain segment must start at seq 1` })
+    }
     // hash 自洽
     const recomputed = hashRecord(record)
     if (recomputed !== record.ownHash) {
       violations.push({ rule: 'R4-09', detail: `seq ${record.seq}: ownHash mismatch (tampered)` })
     }
     // prevHash 连续（段内链接前一记录，段头链接 resumedFrom 或空）
+    if (prevOwnHash === undefined && record.segment === 1 && record.prevHash !== '') {
+      violations.push({ rule: 'R4-09', detail: `seq ${record.seq}: first chain record must have empty prevHash` })
+    }
     if (prevOwnHash !== undefined && record.segment === prevSegment) {
       if (record.prevHash !== prevOwnHash) {
         violations.push({ rule: 'R4-09', detail: `seq ${record.seq}: prevHash does not link segment ${record.segment} tail` })
@@ -101,14 +123,6 @@ export function verifyChain(records: readonly ExecutionRecord[]): readonly Chain
           rule: 'R4-09',
           detail: `seq ${record.seq - 1}: durationMs ${prevDurationMs} exceeds elapsed ${record.capturedAt - prevCapturedAt}`,
         })
-      }
-    }
-    // seq 连续
-    if (bySeq.has(record.seq - 1) && prevSegment === record.segment) {
-      // 段内 seq 必须递增 1；段边界允许 seq 重新编排（续跑新段从 1 起）——此处校验同段内连续性
-      const expectedPrev = bySeq.get(record.seq - 1)
-      if (expectedPrev !== undefined && expectedPrev.ownHash !== record.prevHash && record.segment === expectedPrev.segment) {
-        violations.push({ rule: 'R4-09', detail: `seq ${record.seq}: non-contiguous sequence within segment` })
       }
     }
     prevOwnHash = record.ownHash

@@ -88,7 +88,10 @@ export function archiveContent(design: { testCases: readonly { id: string }[] })
       caseId: t.id, version: '2026.08', sourceRequirement: 'REQ-1', ticketRef: 'PAY-1', content: { title: t.id },
     })),
     versionArchive: [{ version: '2026.08', changeSummary: '账号模块' }],
-    archiveReport: { entries: 1, cases: design.testCases.length, skipped: [], written: false },
+    archiveReport: {
+      entries: 1, cases: design.testCases.length, skipped: [], written: false,
+      readback: { queries: 1, hits: 1, verified: true, expectedIds: ['kb-1'], verifiedIds: ['kb-1'], allExpectedHit: true },
+    },
   }
 }
 

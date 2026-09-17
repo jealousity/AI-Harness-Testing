@@ -1,5 +1,6 @@
 # 示例：ACME 支付平台测试流水线（docs/02 第 2 节 schema 草案的完整示例）
-# 用法：node packages/platform-pipeline/src/cli.mjs run --config examples/pipeline.yaml --pipeline-id acme-pay-2026-01
+# 用法：node packages/platform-pipeline/dist/cli.js validate --config examples/pipeline.yaml
+# 运行/重入需要宿主注入 spawner/human，通过宿主 pipeline_run 工具执行。
 # 注："G-01..G-07" 范围记号在装载时展开（expandRuleList）。
 
 projectId: acme-pay-2026
@@ -35,31 +36,31 @@ stages:
   receive:
     gate: { human: { id: A, block: true } }
     budget: { maxSteps: 20, timeoutMs: 600000, maxRetries: 2 }
-    rules: [G-01..G-07, R1-01..R1-04]
+    rules: [G-01..G-08, R1-01..R1-04]
     review: { enabled: false }
   analyze:
     gate: { human: { id: B, block: true }, human2: { id: C, block: true } }
     budget: { maxSteps: 30, timeoutMs: 900000, maxRetries: 2 }
-    rules: [G-01..G-07, R2-01..R2-05]
+    rules: [G-01..G-08, R2-01..R2-05]
     review: { enabled: true }
     tools: { deny: [kb_query] }     # 示例：项目关掉知识库检索（收窄，delta）
   design:
     gate: { human: { id: D, block: true } }
     budget: { maxSteps: 40, timeoutMs: 1200000, maxRetries: 2, maxTestCases: 200 }
-    rules: [G-01..G-07, R3-01..R3-07]
+    rules: [G-01..G-08, R3-01..R3-07]
     review: { enabled: true }
   execute:
     gate: { human: { id: E, block: true } }
     budget: { maxSteps: 100, timeoutMs: 0, maxRetries: 2 }
-    rules: [G-01..G-07, R4-01..R4-11]
+    rules: [G-01..G-08, R4-01..R4-11]
     review: { enabled: true }
   report:
     gate: { human: { id: F, block: true } }
     budget: { maxSteps: 20, timeoutMs: 600000, maxRetries: 2 }
-    rules: [G-01..G-07, R5-01..R5-06]
+    rules: [G-01..G-08, R5-01..R5-06]
     review: { enabled: true }
   archive:
     gate: { human: { id: G, block: true } }
     budget: { maxSteps: 20, timeoutMs: 600000, maxRetries: 2 }
-    rules: [G-01..G-07, R6-01..R6-05]
+    rules: [G-01..G-08, R6-01..R6-04]
     review: { enabled: false }

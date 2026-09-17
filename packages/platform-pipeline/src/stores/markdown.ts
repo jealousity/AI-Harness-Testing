@@ -10,6 +10,14 @@
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
+export type KnowledgeKind =
+  | 'requirement-fact' | 'test-finding' | 'defect-pattern' | 'risk-pattern'
+  | 'test-strategy' | 'environment-issue' | 'reuse-candidate' | 'decision-record'
+  | 'api-contract' | 'release-lesson'
+
+export type KnowledgeStatus = 'draft' | 'reviewed' | 'active' | 'superseded' | 'archived'
+export type KnowledgeConfidence = 'unverified' | 'inferred' | 'reviewed' | 'verified'
+
 export interface KnowledgeEntry {
   readonly id: string
   readonly title: string
@@ -20,12 +28,28 @@ export interface KnowledgeEntry {
   readonly entities: readonly string[]
   readonly body: string
   readonly sourcePipeline: string
+  readonly kind?: KnowledgeKind
+  readonly status?: KnowledgeStatus
+  readonly confidence?: KnowledgeConfidence
+  readonly sourceRefs?: readonly string[]
+  readonly scope?: Readonly<{ services?: readonly string[]; environments?: readonly string[] }>
+  readonly validUntil?: string
 }
 
 export interface KnowledgeQuery {
-  readonly entities: readonly string[]
+  readonly entities?: readonly string[]
+  readonly tags?: readonly string[]
+  readonly text?: string
   readonly project?: string
+  readonly status?: KnowledgeStatus
   readonly limit: number
+}
+
+export interface KnowledgeHit {
+  readonly entry: KnowledgeEntry
+  readonly score: number
+  readonly matchedBy: readonly ('title' | 'tag' | 'entity' | 'body')[]
+  readonly matchedTerms: readonly string[]
 }
 
 export interface CaseMeta {
@@ -75,27 +99,53 @@ export class MarkdownKnowledgeStore {
   }
 
   async read(query: KnowledgeQuery): Promise<KnowledgeEntry[]> {
+    return (await this.readHits(query)).map(hit => hit.entry)
+  }
+
+  async readHits(query: KnowledgeQuery): Promise<KnowledgeHit[]> {
     const files = await this.listMd()
-    const entries: StoredKnowledge[] = []
+    const hits: KnowledgeHit[] = []
+    const entities = (query.entities ?? []).map(normalizeTerm).filter(Boolean)
+    const tags = (query.tags ?? []).map(normalizeTerm).filter(Boolean)
+    const textTerms = tokenize(query.text ?? '')
     for (const file of files) {
       const raw = await readFile(join(this.dir, file), 'utf8')
       const firstLine = raw.split('\n', 1)[0] ?? ''
       const meta = decodeMeta(firstLine)
       if (meta === null) continue
       if (query.project !== undefined && meta.project !== query.project) continue
-      const hits = query.entities.filter(e => meta.entities.includes(e))
-      if (hits.length === 0) continue
-      entries.push({ meta, body: raw.split('\n').slice(1).join('\n') })
+      if (query.status !== undefined && (meta.status ?? 'active') !== query.status) continue
+      const searchable = [meta.title, ...meta.tags, ...meta.entities, meta.body].map(normalizeTerm).join(' ')
+      const matchedEntities = entities.filter(term => searchable.includes(term))
+      const matchedTags = tags.filter(term => meta.tags.map(normalizeTerm).some(tag => tag.includes(term)))
+      const matchedText = textTerms.filter(term => searchable.includes(term))
+      if (entities.length + tags.length + textTerms.length === 0) continue
+      if (matchedEntities.length + matchedTags.length + matchedText.length === 0) continue
+      const matchedBy: KnowledgeHit['matchedBy'] = [
+        ...(matchedEntities.length > 0 ? ['entity' as const] : []),
+        ...(matchedTags.length > 0 ? ['tag' as const] : []),
+        ...(matchedText.some(term => normalizeTerm(meta.title).includes(term)) ? ['title' as const] : []),
+        ...(matchedText.some(term => normalizeTerm(meta.body).includes(term)) ? ['body' as const] : []),
+      ]
+      const score = matchedEntities.length * 4 + matchedTags.length * 3 + matchedText.length
+        + (meta.confidence === 'verified' ? 1 : 0) + (meta.status === 'active' || meta.status === undefined ? 1 : 0)
+      hits.push({ entry: meta, score, matchedBy, matchedTerms: [...new Set([...matchedEntities, ...matchedTags, ...matchedText])] })
     }
-    entries.sort((a, b) => (a.meta.date < b.meta.date ? 1 : a.meta.date > b.meta.date ? -1 : 0))
-    return entries.slice(0, query.limit).map(e => e.meta)
+    hits.sort((a, b) => b.score - a.score || (a.entry.date < b.entry.date ? 1 : -1))
+    return hits.slice(0, Math.max(0, query.limit))
   }
 
   /** 写入条目；同 id 幂等覆盖（R6-03 归档幂等）。 */
   async write(entry: KnowledgeEntry): Promise<string> {
     await mkdir(this.dir, { recursive: true })
     const target = join(this.dir, `${safeName(entry.id)}.md`)
-    const content = `${encodeMeta(entry)}\n${entry.body}\n`
+    const normalized: KnowledgeEntry = {
+      ...entry,
+      status: entry.status ?? 'active',
+      confidence: entry.confidence ?? 'unverified',
+      sourceRefs: entry.sourceRefs ?? [],
+    }
+    const content = `${encodeMeta(normalized)}\n${normalized.body}\n`
     await writeFile(target, content)
     return entry.id
   }
@@ -177,6 +227,18 @@ export class MarkdownCaseStore {
       return []
     }
   }
+}
+
+function normalizeTerm(value: string): string {
+  return value.trim().toLocaleLowerCase('zh-CN').replace(/\s+/g, '')
+}
+
+function tokenize(value: string): string[] {
+  const normalized = value.trim().toLocaleLowerCase('zh-CN')
+  if (normalized === '') return []
+  const terms = normalized.split(/[\s,，、;；/]+/).filter(Boolean)
+  const chars = [...normalized.replace(/[\s,，、;；/]+/g, '')]
+  return [...new Set([...terms, ...chars.filter(char => /[\u4e00-\u9fff]/.test(char))])]
 }
 
 function titleOf(content: unknown): string {

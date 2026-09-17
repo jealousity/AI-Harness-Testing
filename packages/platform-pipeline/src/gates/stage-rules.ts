@@ -7,9 +7,18 @@
  */
 
 import type { GateRule, RuleContext } from './machine.ts'
-import { reconcile, verifyEvidence } from '../executor/verify.ts'
+import { reconcile, verifyEvidence, verifyEvidenceFiles } from '../executor/verify.ts'
 import { verifyChain } from '../executor/records.ts'
 import type { Violation } from '../types.ts'
+
+export const IMPLEMENTED_STAGE_RULE_IDS = [
+  'R1-01', 'R1-02', 'R1-03', 'R1-04',
+  'R2-01', 'R2-02', 'R2-03', 'R2-04', 'R2-05',
+  'R3-01', 'R3-02', 'R3-03', 'R3-04', 'R3-05', 'R3-06', 'R3-07',
+  'R4-01', 'R4-02', 'R4-03', 'R4-04', 'R4-05', 'R4-06', 'R4-07', 'R4-08', 'R4-09', 'R4-10', 'R4-11',
+  'R5-01', 'R5-02', 'R5-03', 'R5-04', 'R5-05', 'R5-06',
+  'R6-01', 'R6-02', 'R6-03', 'R6-04', 'R6-05',
+] as const
 
 export interface StageRulesOptions {
   /** R5-06：manual 占比阈值（默认 0.3，docs/08 ET-05）。 */
@@ -18,8 +27,16 @@ export interface StageRulesOptions {
 
 const at = (): number => Date.now()
 
-function v(rule: string, detail: string): Violation {
-  return { rule, level: 'BLOCKING', detail, at: at() }
+function v(rule: string, detail: string, level: 'BLOCKING' | 'WARNING' = 'BLOCKING'): Violation {
+  return { rule, level, detail, at: at() }
+}
+
+function nonEmpty(value: unknown): boolean {
+  return typeof value === 'string' ? value.trim() !== '' : Array.isArray(value) ? value.length > 0 : value !== undefined && value !== null
+}
+
+function uniqueStrings(values: readonly string[]): string[] {
+  return [...new Set(values)].filter(value => value !== '')
 }
 
 type Content = Record<string, unknown>
@@ -37,6 +54,31 @@ function asObj(value: unknown): Obj {
 export function stageRules(options: StageRulesOptions = {}): readonly GateRule[] {
   const maxManualClaimedRatio = options.maxManualClaimedRatio ?? 0.3
   return [
+    {
+      id: 'R1-01', level: 'BLOCKING', stages: ['receive'],
+      judge: ({ artifact }) => {
+        const ids = asArray((artifact.content as Content).requirements).map(raw => String(asObj(raw).id ?? ''))
+        return ids.length !== uniqueStrings(ids).length || ids.some(id => id === '')
+          ? [v('R1-01', 'requirements id 必须非空且唯一')]
+          : []
+      },
+    },
+    {
+      id: 'R1-02', level: 'BLOCKING', stages: ['receive'],
+      judge: ({ artifact }) => asArray((artifact.content as Content).requirements)
+        .flatMap(raw => nonEmpty(asObj(raw).sourceRef) ? [] : [v('R1-02', `requirement ${String(asObj(raw).id ?? '')} 缺少 sourceRef`)]),
+    },
+    {
+      id: 'R1-04', level: 'WARNING', stages: ['receive'],
+      judge: ({ artifact }) => {
+        const content = artifact.content as Content
+        const requirements = asArray(content.requirements)
+        const clarifications = asArray(content.clarifications)
+        return requirements.length === 0 && clarifications.length === 0
+          ? [v('R1-04', 'receive 未产生需求或澄清项，可能发生输入丢失', 'WARNING')]
+          : []
+      },
+    },
     // R1-03 receive：缺失必填字段集合 ≡ clarifications 集合
     {
       id: 'R1-03', level: 'BLOCKING', stages: ['receive'],
@@ -69,6 +111,39 @@ export function stageRules(options: StageRulesOptions = {}): readonly GateRule[]
       },
     },
 
+    {
+      id: 'R2-01', level: 'BLOCKING', stages: ['analyze'],
+      judge: ({ artifact }) => asArray((artifact.content as Content).openQuestions).flatMap(raw => {
+        const item = asObj(raw)
+        return nonEmpty(item.question) && nonEmpty(item.needs) ? [] : [v('R2-01', 'openQuestions 的 question/needs 不能为空')]
+      }),
+    },
+    {
+      id: 'R2-02', level: 'BLOCKING', stages: ['analyze'],
+      judge: ({ artifact }) => asArray((artifact.content as Content).reuseSuggestions).flatMap(raw => {
+        const item = asObj(raw)
+        return nonEmpty(item.caseId) && nonEmpty(item.reason) && nonEmpty(item.adaptation)
+          ? [] : [v('R2-02', 'reuseSuggestions 必须包含可追溯的 caseId、reason 和 adaptation')]
+      }),
+    },
+    {
+      id: 'R2-04', level: 'WARNING', stages: ['analyze'],
+      judge: ({ artifact }) => {
+        const boundaries = asObj((artifact.content as Content).boundaries)
+        const inside = new Set(asArray(boundaries.in).map(String))
+        const outside = new Set(asArray(boundaries.out).map(String))
+        return [...inside].filter(item => outside.has(item)).map(item => v('R2-04', `边界项同时出现在 in/out：${item}`, 'WARNING'))
+      },
+    },
+    {
+      id: 'R2-05', level: 'WARNING', stages: ['analyze'],
+      judge: ({ artifact }) => {
+        const content = artifact.content as Content
+        return content.retrievalTruncated === true && asArray(content.riskNotes).length === 0
+          ? [v('R2-05', 'retrievalTruncated=true 时必须在 riskNotes 披露裁剪影响', 'WARNING')]
+          : []
+      },
+    },
     // R2-03 analyze：versionImpact 每条带依据引用（引用样串，无空白）
     {
       id: 'R2-03', level: 'BLOCKING', stages: ['analyze'],
@@ -86,6 +161,30 @@ export function stageRules(options: StageRulesOptions = {}): readonly GateRule[]
       },
     },
 
+    {
+      id: 'R3-03', level: 'BLOCKING', stages: ['design'],
+      judge: ({ artifact }) => {
+        const content = artifact.content as Content
+        const total = asArray(content.testCases).length + asArray(content.reusedCases).length
+        const max = 200
+        return total > max ? [v('R3-03', `用例总数 ${total} 超过默认预算 ${max}`)] : []
+      },
+    },
+    {
+      id: 'R3-05', level: 'BLOCKING', stages: ['design'],
+      judge: ({ artifact }) => [...asArray((artifact.content as Content).testCases), ...asArray((artifact.content as Content).reusedCases)].flatMap(raw => {
+        const item = asObj(raw)
+        const missing = ['preconditions', 'steps', 'expected', 'execution_level'].filter(key => !nonEmpty(item[key]))
+        return missing.length === 0 ? [] : [v('R3-05', `用例 ${String(item.id ?? '')} 缺少：${missing.join(', ')}`)]
+      }),
+    },
+    {
+      id: 'R3-06', level: 'WARNING', stages: ['design'],
+      judge: ({ artifact }) => {
+        const items = [...asArray((artifact.content as Content).testCases), ...asArray((artifact.content as Content).reusedCases)]
+        return items.some(raw => asObj(raw).priority === 'P0') ? [] : [v('R3-06', '测试设计未包含 P0 用例', 'WARNING')]
+      },
+    },
     // R3-01 design：覆盖矩阵完备——每个上游需求点 ≥1 条用例，且矩阵 caseId 存在于 testCases ∪ reusedCases
     {
       id: 'R3-01', level: 'BLOCKING', stages: ['design'],
@@ -173,6 +272,54 @@ export function stageRules(options: StageRulesOptions = {}): readonly GateRule[]
       },
     },
 
+    {
+      id: 'R4-02', level: 'BLOCKING', stages: ['execute'],
+      judge: ({ artifact, execution }) => {
+        if (execution === undefined) return [v('R4-02', 'executor execution data not provided')]
+        const evidenceIds = new Set(execution.evidence.map(entry => entry.id))
+        return asArray((artifact.content as Content).results).flatMap(raw => {
+          const result = asObj(raw)
+          if (result.status !== 'fail' && result.status !== 'pending') return []
+          const refs = asArray(result.evidence).map(String)
+          return refs.length > 0 && refs.every(ref => evidenceIds.has(ref)) ? [] : [v('R4-02', `失败/待执行用例 ${String(result.caseId ?? '')} 缺少有效 evidence manifest 引用`)]
+        })
+      },
+    },
+    {
+      id: 'R4-04', level: 'BLOCKING', stages: ['execute'],
+      judge: ({ artifact, upstreams }) => {
+        const design = asObj(upstreams.design?.content)
+        const manualIds = [...asArray(design.testCases), ...asArray(design.reusedCases)].filter(raw => asObj(raw).execution_level === 'manual').map(raw => String(asObj(raw).id ?? ''))
+        const pending = new Set(asArray((artifact.content as Content).pendingManual).map(String))
+        return manualIds.filter(id => !pending.has(id)).map(id => v('R4-04', `manual 用例 ${id} 未进入 pendingManual`))
+      },
+    },
+    {
+      id: 'R4-05', level: 'WARNING', stages: ['execute'],
+      judge: ({ artifact }) => {
+        const content = artifact.content as Content
+        const plan = asObj(content.plan)
+        const order = asArray(plan.order).map(String)
+        return new Set(order).size !== order.length ? [v('R4-05', 'execute plan.order 存在重复用例，环境初始化/执行顺序不可审计', 'WARNING')] : []
+      },
+    },
+    {
+      id: 'R4-06', level: 'WARNING', stages: ['execute'],
+      judge: ({ artifact }) => {
+        const content = artifact.content as Content
+        if (content.resumed !== true) return []
+        const bad = asArray(content.results).filter(raw => asObj(raw).status === 'pass' && Number(asObj(raw).attempts ?? 0) !== 1)
+        return bad.length === 0 ? [] : [v('R4-06', 'resumed=true 时已有 pass 用例 attempts 必须保持原值 1', 'WARNING')]
+      },
+    },
+    {
+      id: 'R4-07', level: 'BLOCKING', stages: ['execute'],
+      judge: ({ artifact }) => asArray((artifact.content as Content).envIssues).flatMap(raw => {
+        const issue = asObj(raw)
+        return issue.severity === 'blocking' && (!nonEmpty(issue.diagnosis) || !nonEmpty(issue.recommendation))
+          ? [v('R4-07', `blocking 环境问题 ${String(issue.id ?? '')} 缺少 diagnosis 或 recommendation`)] : []
+      }),
+    },
     // R4-01 execute：results 覆盖上游 design 全部用例 id
     {
       id: 'R4-01', level: 'BLOCKING', stages: ['execute'],
@@ -237,6 +384,7 @@ export function stageRules(options: StageRulesOptions = {}): readonly GateRule[]
         for (const id of reconciled.missingRecords) violations.push(v('R4-08', `planned case "${id}" has no executor record (漏跑)`))
         for (const ref of reconciled.phantomResults) violations.push(v('R4-08', `result "${ref}" references no executor record (伪造结果)`))
         for (const seq of reconciled.unclaimedRecords) violations.push(v('R4-08', `executor record seq ${seq} is unreferenced (多余执行)`))
+        for (const mismatch of reconciled.mismatchedResults) violations.push(v('R4-08', `result/record caseId mismatch: ${mismatch}`))
         return violations
       },
     },
@@ -255,7 +403,11 @@ export function stageRules(options: StageRulesOptions = {}): readonly GateRule[]
       id: 'R4-10', level: 'BLOCKING', stages: ['execute'],
       judge: ({ execution }) => {
         if (execution === undefined) return [v('R4-10', 'executor execution data not provided')]
-        return verifyEvidence(execution.evidence, execution.records).map(entry => v('R4-10', entry.detail))
+        const violations = verifyEvidence(execution.evidence, execution.records).map(entry => v('R4-10', entry.detail))
+        if (execution.evidenceDir !== undefined) {
+          violations.push(...verifyEvidenceFiles(execution.evidence, execution.evidenceDir).map(entry => v('R4-10', entry.detail)))
+        }
+        return violations
       },
     },
 
@@ -306,6 +458,30 @@ export function stageRules(options: StageRulesOptions = {}): readonly GateRule[]
       },
     },
 
+    {
+      id: 'R5-02', level: 'BLOCKING', stages: ['report'],
+      judge: ({ artifact, upstreams }) => {
+        const evidenceIds = new Set(asArray((upstreams.execute?.content as Content | undefined)?.results).flatMap(raw => asArray(asObj(raw).evidence).map(String)))
+        return asArray((artifact.content as Content).defectAnalysis).flatMap(raw => asArray(asObj(raw).evidence).filter(ref => !evidenceIds.has(String(ref))).map(ref => v('R5-02', `报告引用不存在的执行证据：${String(ref)}`)))
+      },
+    },
+    {
+      id: 'R5-03', level: 'BLOCKING', stages: ['report'],
+      judge: ({ artifact }) => asArray((artifact.content as Content).risks).length > 0 ? [] : [v('R5-03', 'risks 必须非空；无风险也必须显式写入 none')],
+    },
+    {
+      id: 'R5-04', level: 'BLOCKING', stages: ['report'],
+      judge: ({ artifact, upstreams }) => {
+        const pending = asArray((upstreams.execute?.content as Content | undefined)?.pendingManual).map(String)
+        const unconfirmed = asArray((artifact.content as Content).unconfirmed).map(String).join(' ')
+        return pending.length > 0 && !pending.every(id => unconfirmed.includes(id))
+          ? [v('R5-04', '报告 unconfirmed 未披露全部 pendingManual 用例')] : []
+      },
+    },
+    {
+      id: 'R5-05', level: 'BLOCKING', stages: ['report'],
+      judge: ({ artifact }) => nonEmpty((artifact.content as Content).recommendationReason) ? [] : [v('R5-05', 'releaseRecommendation 必须附带 recommendationReason')],
+    },
     // R5-01 report：stats 数字与源一致（passRate ≈ passed/total；total === passed + failed）
     {
       id: 'R5-01', level: 'BLOCKING', stages: ['report'],
@@ -351,6 +527,56 @@ export function stageRules(options: StageRulesOptions = {}): readonly GateRule[]
       },
     },
 
+    {
+      id: 'R6-01', level: 'BLOCKING', stages: ['archive'],
+      judge: ({ artifact }) => asArray((artifact.content as Content).knowledgeEntries).flatMap(raw => {
+        const item = asObj(raw)
+        const missing = ['id', 'title', 'date', 'project', 'version', 'body', 'sourcePipeline'].filter(key => !nonEmpty(item[key]))
+        if (!nonEmpty(item.entities)) missing.push('entities')
+        return missing.length === 0 ? [] : [v('R6-01', `knowledge entry ${String(item.id ?? '')} 缺少：${missing.join(', ')}`)]
+      }),
+    },
+    {
+      id: 'R6-03', level: 'BLOCKING', stages: ['archive'],
+      judge: ({ artifact }) => {
+        const content = artifact.content as Content
+        const entries = asArray(content.knowledgeEntries).map(raw => String(asObj(raw).id ?? ''))
+        const cases = asArray(content.caseArchive).map(raw => `${String(asObj(raw).caseId ?? '')}:${String(asObj(raw).version ?? '')}`)
+        const report = asObj(content.archiveReport)
+        const violations: Violation[] = []
+        if (entries.length !== uniqueStrings(entries).length) violations.push(v('R6-03', 'knowledgeEntries id 必须唯一，重复归档会产生重复条目'))
+        if (cases.length !== uniqueStrings(cases).length) violations.push(v('R6-03', 'caseArchive 的 caseId+version 必须唯一'))
+        if (report.written === undefined || typeof report.written !== 'boolean') violations.push(v('R6-03', 'archiveReport.written 必须明确表示是否已写入'))
+        return violations
+      },
+    },
+    {
+      id: 'R6-05', level: 'WARNING', stages: ['archive'],
+      judge: ({ artifact }) => {
+        const report = asObj((artifact.content as Content).archiveReport)
+        const readback = asObj(report.readback)
+        const expectedIds = asArray(readback.expectedIds).map(String)
+        const verifiedIds = new Set(asArray(readback.verifiedIds).map(String))
+        const allExpectedHit = expectedIds.every(id => verifiedIds.has(id)) && readback.allExpectedHit === true
+        if (readback.verified === true && Number(readback.queries) > 0 && Number(readback.hits) > 0 && allExpectedHit) return []
+        return [v('R6-05', '归档后知识库回读未完成或未命中本次写入的全部知识 ID；需记录 archiveReport.readback（queries/hits/expectedIds/verifiedIds/allExpectedHit）', 'WARNING')]
+      },
+    },
+    {
+      id: 'R6-04', level: 'BLOCKING', stages: ['archive'],
+      judge: ({ artifact, upstreams }) => {
+        const content = artifact.content as Content
+        const planned = new Set(Object.values(upstreams).map(upstream => upstream.stageId))
+        const report = asObj(content.archiveReport)
+        const entries = asArray(content.knowledgeEntries).length
+        const cases = asArray(content.caseArchive).length
+        const violations: Violation[] = []
+        if (Number(report.entries) !== entries) violations.push(v('R6-04', `archiveReport.entries=${String(report.entries)} 与 knowledgeEntries=${entries} 不一致`))
+        if (Number(report.cases) !== cases) violations.push(v('R6-04', `archiveReport.cases=${String(report.cases)} 与 caseArchive=${cases} 不一致`))
+        if (planned.size < 5) violations.push(v('R6-04', 'archive 必须能看到 receive/analyze/design/execute/report 五个上游产物'))
+        return violations
+      },
+    },
     // R6-02 archive：caseArchive 用例 id 覆盖上游 design 全部用例（版本化回流完整性）
     {
       id: 'R6-02', level: 'BLOCKING', stages: ['archive'],

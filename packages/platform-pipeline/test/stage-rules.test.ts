@@ -151,6 +151,15 @@ test('R5-06: approve with high manual ratio is BLOCKING', () => {
   assert.ok(violations.some(v => v.rule === 'R5-06'))
 })
 
+test('R6-05: archive readback without hit is WARNING', () => {
+  const upstreams = upstreamsUpTo('archive')
+  const content = contentFor('archive', upstreams)
+  const bad = { ...content, archiveReport: { ...(content.archiveReport as object), readback: { queries: 1, hits: 1, verified: true, expectedIds: ['kb-1'], verifiedIds: [], allExpectedHit: false } } }
+  const rule = rules.find(r => r.id === 'R6-05')!
+  const violations = rule.judge({ stageId: 'archive', artifact: artifact('archive', bad), upstreams })
+  assert.equal(violations[0]?.level, 'WARNING')
+})
+
 test('R6-02: unarchived designed case is BLOCKING', () => {
   const upstreams = upstreamsUpTo('archive')
   const content = contentFor('archive', upstreams)

@@ -3,6 +3,9 @@
  * @module platform-pipeline/executor/verify
  */
 
+import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 import type { ExecutionRecord } from './records.ts'
 
 /** R4-08 对账结果。 */
@@ -14,6 +17,8 @@ export interface ReconcileResult {
   readonly phantomResults: readonly string[]
   /** 记录未被任何结果引用（多余执行，可疑）。 */
   readonly unclaimedRecords: readonly number[]
+  /** 结果引用了存在但属于另一个 case 的记录。 */
+  readonly mismatchedResults: readonly string[]
 }
 
 /**
@@ -37,6 +42,7 @@ export function reconcile(
 ): ReconcileResult {
   const recordByCase = new Map(records.map(r => [r.caseId, r]))
   const recordSeqs = new Set(records.map(r => r.seq))
+  const recordBySeq = new Map(records.map(r => [r.seq, r]))
   const referenced = new Set<string>()
 
   const missingRecords: string[] = []
@@ -45,10 +51,16 @@ export function reconcile(
   }
 
   const phantomResults: string[] = []
+  const mismatchedResults: string[] = []
   for (const result of results) {
     const seq = parseRecordRef(result.recordRef)
     if (seq === undefined || !recordSeqs.has(seq)) {
       phantomResults.push(`${result.caseId}@${result.recordRef}`)
+      continue
+    }
+    const record = recordBySeq.get(seq)!
+    if (record.caseId !== result.caseId) {
+      mismatchedResults.push(`${result.caseId}@${result.recordRef}=>${record.caseId}`)
       continue
     }
     referenced.add(String(seq))
@@ -59,9 +71,10 @@ export function reconcile(
     .map(r => r.seq)
 
   return {
-    ok: missingRecords.length === 0 && phantomResults.length === 0 && unclaimedRecords.length === 0,
+    ok: missingRecords.length === 0 && phantomResults.length === 0 && mismatchedResults.length === 0 && unclaimedRecords.length === 0,
     missingRecords,
     phantomResults,
+    mismatchedResults,
     unclaimedRecords,
   }
 }
@@ -87,6 +100,36 @@ export interface EvidenceViolation {
  * - capturedAt 在记录的时间窗口内（防从旧测试偷证据）；
  * - digest/file 非空。
  */
+export function verifyEvidenceFiles(
+  entries: readonly EvidenceEntry[],
+  evidenceDir: string,
+): readonly EvidenceViolation[] {
+  const violations: EvidenceViolation[] = []
+  const root = resolve(evidenceDir)
+  for (const entry of entries) {
+    const target = resolve(root, entry.file)
+    const rel = relative(root, target)
+    if (rel.startsWith('..') || isAbsolute(rel)) {
+      violations.push({ rule: 'R4-10', detail: `evidence "${entry.id}": file escapes evidence root` })
+      continue
+    }
+    try {
+      const content = readFileSync(target)
+      if (content.length === 0) {
+        violations.push({ rule: 'R4-10', detail: `evidence "${entry.id}": file is empty` })
+        continue
+      }
+      const digest = createHash('sha256').update(content).digest('hex')
+      if (digest !== entry.digest) {
+        violations.push({ rule: 'R4-10', detail: `evidence "${entry.id}": digest mismatch (declared ${entry.digest}, recomputed ${digest})` })
+      }
+    } catch (error) {
+      violations.push({ rule: 'R4-10', detail: `evidence "${entry.id}": file cannot be read (${error instanceof Error ? error.message : String(error)})` })
+    }
+  }
+  return violations
+}
+
 export function verifyEvidence(
   entries: readonly EvidenceEntry[],
   records: readonly ExecutionRecord[],

@@ -60,7 +60,7 @@ export interface HumanGateDeps {
   /** 宿主注入的 ctx.userQuestions 实例。 */
   readonly userQuestions: UserQuestions
   /** 裁决记录回调（可选；落审计/检查点用）。 */
-  readonly onDecision?: (record: HumanGateAuditRecord) => void
+  readonly onDecision?: (record: HumanGateAuditRecord) => unknown
   /** 人工门 id（如 'A'~'G'）与阶段的映射；缺省按阶段顺序推导 A/B/C/D/E/F。 */
   readonly gateLetterByStage?: Partial<Readonly<Record<StageId, string>>>
   /** 取消信号（流水线整体取消时不再阻塞等人工）。 */
@@ -210,7 +210,7 @@ export class UiUserQuestionsHumanGate implements HumanGatePort {
         ...(this.deps.agent === undefined ? {} : { agent: this.deps.agent }),
       })
       const note = noteFrom(answer.answers[0])
-      this.deps.onDecision?.({ by: this.deps.by ?? 'system', action: 'rejected', note: `gate-failed 确认：${note}`.replace(/^gate-failed 确认：$/, 'gate-failed 已确认'), stageId, at: Date.now() })
+      await this.deps.onDecision?.({ by: this.deps.by ?? 'system', action: 'rejected', note: `gate-failed 确认：${note}`.replace(/^gate-failed 确认：$/, 'gate-failed 已确认'), stageId, at: Date.now() })
     } catch (error) {
       // 升级提示不应因无 provider / 取消而崩溃（pipeline 即将以 gate-failed 终止）
       if (error instanceof Error && 'code' in error && (error as { code?: string }).code === 'ASK_ABORTED') return
@@ -241,7 +241,7 @@ export class UiUserQuestionsHumanGate implements HumanGatePort {
       // 取消（ABORTED）不打回——视为需修改重新进入门禁；其它错误抛出
       if (code === 'ASK_ABORTED') {
         const note = '人工门等待被取消（ASK_ABORTED）'
-        this.deps.onDecision?.({ by: this.deps.by ?? 'system', action: 'changes-needed', note, stageId, at: Date.now() })
+        await this.deps.onDecision?.({ by: this.deps.by ?? 'system', action: 'changes-needed', note, stageId, at: Date.now() })
         return 'changes-needed'
       }
       throw error
@@ -250,7 +250,7 @@ export class UiUserQuestionsHumanGate implements HumanGatePort {
     const ansItem = answer.answers[0]
     const decision = chosenDecision(ansItem?.selected ?? [])
     const note = noteFrom(ansItem)
-    this.deps.onDecision?.({ by: this.deps.by ?? 'system', action: decision, note, stageId, at: Date.now() })
+    await this.deps.onDecision?.({ by: this.deps.by ?? 'system', action: decision, note, stageId, at: Date.now() })
     return decision
   }
 }

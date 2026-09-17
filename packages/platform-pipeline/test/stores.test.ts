@@ -31,19 +31,19 @@ function artifact(): StageArtifact {
   return { ...base, digest: computeArtifactDigest(base) }
 }
 
-test('FsArtifactStore persists content and read wraps it (disk = bare content)', async () => {
+test('FsArtifactStore persists complete wrapper metadata and read restores it', async () => {
   const store = new FsArtifactStore(join(dir, 'artifacts'))
   const art = artifact()
   await store.write(art)
-  // 磁盘只存 content（无 wrapper 字段）
   const raw = await readFile(join(dir, 'artifacts', 'receive.json'), 'utf8')
-  assert.deepEqual(JSON.parse(raw), art.content)
-  // read 返回包装后的 wrapper（stageId 从路径派生；digest 由 content 重算）
+  const persisted = JSON.parse(raw) as StageArtifact
+  assert.equal(persisted.pipelineId, art.pipelineId)
+  assert.equal(persisted.stageId, art.stageId)
+  assert.equal(persisted.digest, art.digest)
+  assert.deepEqual(persisted.content, art.content)
   const loaded = await store.read('receive.json')
   assert.ok(loaded !== null)
-  assert.equal(loaded.stageId, 'receive')
-  assert.deepEqual(loaded.content, art.content)
-  assert.ok(loaded.digest.length === 64)
+  assert.deepEqual(loaded, art)
 })
 
 test('FsArtifactStore read missing returns null', async () => {

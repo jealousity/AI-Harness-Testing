@@ -17,9 +17,11 @@ export interface HttpStep {
   readonly name: string
   readonly method: string
   readonly url: string
+  readonly headers?: Readonly<Record<string, string>>
   readonly body?: unknown
   readonly expectedStatus?: number
   readonly expectedContains?: string
+  readonly timeoutMs?: number
 }
 
 export interface HttpCase {
@@ -36,6 +38,7 @@ export type HttpRequestFn = (url: string, init: {
   readonly method: string
   readonly headers: Readonly<Record<string, string>>
   readonly body?: string
+  readonly signal?: AbortSignal
 }) => Promise<HttpResponse>
 
 export interface HttpExecutorOptions {
@@ -108,8 +111,9 @@ export class HttpExecutor implements Executor {
         try {
           const response = await this.request(step.url, {
             method: step.method,
-            headers: { 'content-type': 'application/json' },
+            headers: { 'content-type': 'application/json', ...(step.headers ?? {}) },
             ...(step.body === undefined ? {} : { body: JSON.stringify(step.body) }),
+            ...(step.timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(step.timeoutMs) }),
           })
           const body = await response.text()
           const ok = (step.expectedStatus === undefined || response.status === step.expectedStatus)

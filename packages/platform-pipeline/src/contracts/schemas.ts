@@ -330,6 +330,16 @@ export const STAGE_SCHEMAS: Readonly<Record<StageId, SubsetSchema>> = {
           cases: { type: 'integer' },
           skipped: { type: 'array', items: STRING },
           written: { type: 'boolean' },
+          readback: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['queries', 'hits', 'verified', 'expectedIds', 'verifiedIds', 'allExpectedHit'],
+            properties: {
+              queries: { type: 'integer' }, hits: { type: 'integer' }, verified: { type: 'boolean' },
+              expectedIds: { type: 'array', items: STRING }, verifiedIds: { type: 'array', items: STRING },
+              allExpectedHit: { type: 'boolean' },
+            },
+          },
         },
       },
     },

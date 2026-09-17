@@ -10,7 +10,7 @@ import type { ExecutionRecord } from './records.ts'
 
 export { makeRecord, hashRecord, verifyChain } from './records.ts'
 export type { ChainViolation, ExecutionRecord, ExecutionStatus } from './records.ts'
-export { reconcile, verifyEvidence } from './verify.ts'
+export { reconcile, verifyEvidence, verifyEvidenceFiles } from './verify.ts'
 export type { EvidenceEntry, EvidenceViolation, ReconcileResult } from './verify.ts'
 
 export interface ExecutorContext {
@@ -41,6 +41,10 @@ export interface ExecutorContinuation {
 
 /** 一次执行会话：记录链 + 证据 + manifest 索引。 */
 export interface ExecutionSession {
+  /** 当前执行会话所属流水线（跨项目对账时必须校验）。 */
+  readonly pipelineId?: string
+  /** 证据根目录；提供时门禁会读取文件并重算 digest。 */
+  readonly evidenceDir?: string
   /** 按 seq 升序的记录（可能多段，续跑新段）。 */
   readonly records: readonly ExecutionRecord[]
   readonly evidence: readonly EvidenceEntry[]

@@ -6,6 +6,62 @@
 
 > 契约定边界、门禁管产物、ACL 管动作、executor 保执行可信、检查点保恢复、人工门保责任、agent 只管自己那一阶段。
 
+## Web 应用（仅需 API Key）
+
+`web-app/` 是浏览器优先的可运行版本：不依赖 Electron、桌面端配置或本地模型，只需一个 OpenAI 兼容 API Key 即可启动六阶段测试辅助流水线。
+
+```bash
+cd web-app
+node server.mjs
+# 浏览器打开 http://127.0.0.1:3080
+```
+
+默认使用 DeepSeek 兼容端点；页面也支持修改 API Base URL 与模型名称。API Key 只在当前流水线运行期间驻留服务端内存，不写入浏览器存储、运行日志或阶段产物。执行阶段默认生成“待执行”计划，不会伪造被测系统的真实通过结果。
+
+Web 版默认只允许访问公网模型端点，并限制单个来源同时运行 2 个任务；如明确需要连接本机 Ollama 或内网网关，可用 `ALLOW_PRIVATE_API=1 node server.mjs` 开启内网地址。生产部署还应在反向代理前增加登录鉴权、HTTPS、持久化存储和多进程任务队列。
+
+```bash
+# 可选：修改监听地址/端口
+HOST=127.0.0.1 PORT=3080 node server.mjs
+# 可选：允许本机或内网模型端点（只建议本地开发）
+ALLOW_PRIVATE_API=1 node server.mjs
+```
+
+### 当前版本已补齐的运行保障
+
+- 输入校验：JSON Content-Type、请求体大小、API Key 长度、Base URL 协议及凭据格式
+- SSRF 防护：默认拒绝 localhost、私网、回环、链路本地和未解析为公网地址的模型端点
+- 资源保护：单来源并发上限、运行记录数量上限、完成记录 TTL 清理
+- 失败恢复：429 与 5xx 自动进行一次退避重试；服务商错误只返回截断后的错误信息
+- 浏览器安全：移除通配 CORS，增加 CSP、`X-Frame-Options`、`nosniff`、`no-store` 等响应头
+- Prompt 控制：上游产物上下文设有长度上限，避免多阶段内容无限膨胀
+
+## 原始 harness 实现状态与本轮加固
+
+本项目的核心实现位于 `packages/platform-pipeline`，Web 版只是额外的浏览器演示入口，不代表原始 harness 的全部能力。当前原始 harness 已完成以下高优先级加固：
+
+- 阶段 `fs_read` / `fs_write` 统一限制在工作区根内，拒绝 `..`、绝对路径越界和软链接逃逸
+- `executor_run` 按显式 `pipelineId` 精确选择 `design.json`，不再按 mtime 猜测；多项目共用目录时避免串读
+- 执行会话和 evidence 支持按 pipeline 隔离目录；执行器写入证据路径受到根目录约束
+- R4-08 对账新增 result.caseId 与 executor record.caseId 绑定校验
+- R4-10 可选读取证据文件并重算 digest，检查文件越界、缺失和空文件
+- artifact wrapper（pipelineId/stageId/inputs/digest/version/path）完整持久化，重启后不再依赖路径重新推导
+- pipeline 配置支持文档中的 `stages: [{ id, ... }]` 数组形式，也兼容现有对象形式
+- 门禁引擎按 `stage.rules` 选择规则；宿主装载时拒绝引用未实现的规则，避免配置与运行时静默漂移
+- review agent 默认只允许 `fs_read`，拒绝写文件、执行器、子 agent 和归档写入
+- 同一宿主进程内拒绝同一 pipeline 的并发 run/reenter
+- execute prompt 要求 `executor_run` 显式带当前 pipelineId
+
+目前仍未完成的后续项：宿主直接执行 CLI run/reenter、外部 Jira/Xray/TestLink 适配、host 侧预算计量，以及完整的跨进程 heartbeat/乐观版本检查。这些不应在文档中标记为“生产完成”。本轮已补充 CLI `validate/status` 和 R6-05 回读结果契约，`run/reenter` 仍必须通过宿主注入真人门与 stage spawner。
+
+### 知识库 P0 闭环
+
+- `kb_query`、`kb_write`、`case_query`、`case_archive` 已接入 `markdown-fs`；未配置时明确返回 `available: false`，不再用空数组伪装“查询成功但无结果”。
+- KnowledgeEntry 支持 `kind/status/confidence/sourceRefs/scope/validUntil` 扩展字段；查询结果带 `score`、`matchedBy`、`matchedTerms`，便于 analyze 阶段判断来源和可信度。
+- 知识库检索支持实体、标签和文本关键词，并按项目过滤；默认只消费 active 知识。
+- archive prompt 要求记录本次写入的 `expectedIds`，再通过 `kb_query` 回读并写入 `verifiedIds/allExpectedHit`；R6-05 会检查是否命中本次归档的全部知识 ID，而不仅仅是任意旧条目。
+- host-plugin 会根据 pipeline 配置自动解析 `stores.knowledge.path` 与 `stores.cases.path`，构造本地 Markdown 存储适配器。
+
 ## 架构决策摘要
 
 | 决策 | 内容 |
@@ -59,5 +115,5 @@
 - 设计文档：**9 份全部定稿**，开放问题全部清零
 - 决策：**24 条全部确认**（D-01~D-20 + I-1~I-4）
 - 六阶段 prompt 模板：**全部评审通过**
-- 实现：docs/09 落地顺序 1~7 步全部完成（`packages/platform-pipeline`，145 单测全绿；真实 LLM 六阶段端到端通过，含重入级联、故障注入审核 fail 回喂重跑、execute 后台可续跑恢复）
+- 实现：核心编排与执行可信基础已落地（`packages/platform-pipeline`，当前 199 项测试全绿）；仍有宿主直接执行 CLI、外部存储、预算计量和跨进程 heartbeat/版本检查等生产化工作待完成
 - I-4 独立 npm 包：`platform-pipeline-0.1.0.tgz` 已产出并验证可独立安装调用（clean-install → import → 解析 pipeline.yaml → 算 ACL）

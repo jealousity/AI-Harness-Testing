@@ -128,6 +128,16 @@ test('reconcile flags phantom results (伪造结果)', () => {
   assert.deepEqual(result.phantomResults, ['TC-001@99'])
 })
 
+test('reconcile rejects a result referencing another case record', () => {
+  const records = linkedChain(2)
+  const result = reconcile(records, ['TC-001', 'TC-002'], [
+    { caseId: 'TC-001', recordRef: '2' },
+    { caseId: 'TC-002', recordRef: '1' },
+  ])
+  assert.equal(result.ok, false)
+  assert.equal(result.mismatchedResults.length, 2)
+})
+
 test('reconcile flags unclaimed records (多余执行)', () => {
   const records = linkedChain(2)
   const result = reconcile(records, ['TC-001'], [{ caseId: 'TC-001', recordRef: '1' }])

@@ -253,9 +253,12 @@ export class MachineGateEngine {
     upstreams: Readonly<Record<string, StageArtifact>>,
     attempts: number,
     execution?: ExecutionSession,
+    ruleIds?: readonly string[],
   ): JudgeResult {
     const violations: Violation[] = []
+    const selected = ruleIds === undefined ? undefined : new Set(ruleIds)
     for (const rule of this.rules) {
+      if (selected !== undefined && !selected.has(rule.id)) continue
       if (rule.stages !== 'all' && !rule.stages.includes(stageId)) continue
       violations.push(...rule.judge({ stageId, artifact, upstreams, ...(execution === undefined ? {} : { execution }) }))
     }
@@ -266,5 +269,11 @@ export class MachineGateEngine {
   /** 规则集版本（判定留痕，docs/01 第 6 节 / D-03 独立版本化）。 */
   version(): string {
     return this.rulesetVersion
+  }
+
+  /** 配置启动校验：禁止 stage.rules 静默引用不存在的规则。 */
+  validateRuleIds(ruleIds: readonly string[]): readonly string[] {
+    const known = new Set(this.rules.map(rule => rule.id))
+    return ruleIds.filter(id => !known.has(id))
   }
 }

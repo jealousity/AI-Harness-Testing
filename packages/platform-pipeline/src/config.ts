@@ -33,6 +33,7 @@ const DEFAULT_BUDGET: Readonly<Record<StageId, StageBudget>> = {
 
 /** 各阶段默认机器门禁规则引用（docs/01：G 系列通用 + 阶段特定 R 系列）。 */
 const DEFAULT_RULES: Readonly<Record<StageId, readonly string[]>> = {
+  // 默认规则集与 stage-rules.ts 保持一致；R6-05 要求 archiveReport.readback 明确回读结果。
   receive: ['G-01', 'G-02', 'G-03', 'G-04', 'G-05', 'G-06', 'G-07', 'G-08', 'R1-01', 'R1-02', 'R1-03', 'R1-04'],
   analyze: ['G-01', 'G-02', 'G-03', 'G-04', 'G-05', 'G-06', 'G-07', 'G-08', 'R2-01', 'R2-02', 'R2-03', 'R2-04', 'R2-05'],
   design: ['G-01', 'G-02', 'G-03', 'G-04', 'G-05', 'G-06', 'G-07', 'G-08', 'R3-01', 'R3-02', 'R3-03', 'R3-04', 'R3-05', 'R3-06', 'R3-07'],
@@ -152,7 +153,16 @@ export function normalizeConfig(input: unknown): PipelineConfig {
     },
   }
 
-  const stagesRaw = asRecord(raw.stages, 'stages')
+  const stagesValue = raw.stages
+  const stagesRaw: Record<string, unknown> = Array.isArray(stagesValue)
+    ? Object.fromEntries(stagesValue.map((entry, index) => {
+      const record = asRecord(entry, `stages[${index}]`)
+      const id = asString(record.id, `stages[${index}].id`)
+      return [id, record]
+    }))
+    : asRecord(stagesValue, 'stages')
+  const unknownStageIds = Object.keys(stagesRaw).filter(id => !STAGE_ORDER.includes(id as StageId))
+  if (unknownStageIds.length > 0) fail(`stages contains unknown stage id(s): ${unknownStageIds.join(', ')}`)
   const stages = {} as Record<StageId, StageConfig>
   for (const id of STAGE_ORDER) {
     const stageRaw = stagesRaw[id] === undefined ? {} : asRecord(stagesRaw[id], `stages.${id}`)
