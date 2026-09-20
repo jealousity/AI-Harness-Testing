@@ -1,0 +1,14 @@
+{
+  "name": "harness-web-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser-first Test Platform Design harness with an OpenAI-compatible API key",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
