@@ -11,6 +11,8 @@ import { MachineGateEngine, platformGenericRules } from './gates/machine.ts'
 import { stageRules } from './gates/stage-rules.ts'
 import { pipelineContractSchemas } from './contracts/schemas.ts'
 import { STAGE_ORDER } from './types.ts'
+import { ingestKnowledgeFile } from './knowledge-import.ts'
+import { MarkdownKnowledgeStore } from './stores/markdown.ts'
 
 function argValue(args: readonly string[], flag: string): string | undefined {
   const index = args.indexOf(flag)
@@ -46,6 +48,18 @@ async function validate(configPath: string): Promise<void> {
   }
   console.log('ACL: valid（平台标准 + 项目 delta）')
   console.log(`Rules: valid (${STAGE_ORDER.reduce((sum, id) => sum + cfg.stages[id]!.rules.length, 0)} configured references)`)
+}
+
+async function importKnowledge(args: readonly string[]): Promise<void> {
+  const input = requireArg(args, '--input')
+  const storePath = requireArg(args, '--store')
+  const project = requireArg(args, '--project')
+  const result = await ingestKnowledgeFile(new MarkdownKnowledgeStore(storePath), input, {
+    project,
+    ...(argValue(args, '--source-pipeline') === undefined ? {} : { sourcePipeline: argValue(args, '--source-pipeline') }),
+    ...(argValue(args, '--version') === undefined ? {} : { version: argValue(args, '--version') }),
+  })
+  console.log(JSON.stringify({ format: result.format, sourceRef: result.sourceRef, imported: result.entries.map(entry => ({ id: entry.id, title: entry.title, status: entry.status, sourceRefs: entry.sourceRefs })) }, null, 2))
 }
 
 async function status(args: readonly string[]): Promise<void> {
@@ -89,10 +103,14 @@ async function main(): Promise<void> {
     await status(args)
     return
   }
+  if (command === 'knowledge-import') {
+    await importKnowledge(args)
+    return
+  }
   if (command === 'run' || command === 'reenter') {
     throw new Error(`${command} 需要宿主注入 spawner/human；请通过宿主的 pipeline_run 接线执行。`)
   }
-  throw new Error('用法：node src/cli.ts validate --config <pipeline.yaml> 或 status --checkpoint-root <dir> --pipeline-id <id>')
+  throw new Error('用法：node src/cli.ts validate --config <pipeline.yaml>；status --checkpoint-root <dir> --pipeline-id <id>；knowledge-import --input <doc.md|table.csv|table.tsv> --store <knowledge-dir> --project <projectId>')
 }
 
 void main().catch(error => {

@@ -43,6 +43,8 @@ export interface KnowledgeQuery {
   readonly tags?: readonly string[]
   readonly text?: string
   readonly project?: string
+  readonly service?: string
+  readonly environment?: string
   readonly status?: KnowledgeStatus
   readonly includeExpired?: boolean
   readonly limit: number
@@ -133,6 +135,8 @@ export class MarkdownKnowledgeStore {
       const meta = decodeMeta(firstLine)
       if (meta === null) continue
       if (query.project !== undefined && meta.project !== query.project) continue
+      if (query.service !== undefined && meta.scope?.services !== undefined && !meta.scope.services.includes(query.service)) continue
+      if (query.environment !== undefined && meta.scope?.environments !== undefined && !meta.scope.environments.includes(query.environment)) continue
       const status = meta.status ?? 'active'
       if ((query.status ?? 'active') !== status) continue
       if (!query.includeExpired && meta.validUntil !== undefined && meta.validUntil < new Date().toISOString().slice(0, 10)) continue

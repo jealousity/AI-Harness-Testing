@@ -98,6 +98,15 @@ test('MarkdownKnowledgeStore write→read round-trips and filters by entity/proj
   assert.equal(limit[0]?.id, 'kb-pay-1')
 })
 
+test('MarkdownKnowledgeStore applies optional service and environment scope filters', async () => {
+  const kb = new MarkdownKnowledgeStore(dir)
+  await kb.write({ ...entry1, scope: { services: ['PaymentService'], environments: ['staging'] } })
+  await kb.write({ ...entry2, id: 'kb-general', title: '通用结算', entities: ['SettlementService'] })
+  assert.equal((await kb.read({ entities: ['PaymentService'], service: 'OtherService', limit: 10 })).length, 0)
+  assert.equal((await kb.read({ entities: ['PaymentService'], environment: 'production', limit: 10 })).length, 0)
+  assert.equal((await kb.read({ entities: ['SettlementService'], service: 'OtherService', limit: 10 })).length, 1)
+})
+
 test('MarkdownKnowledgeStore defaults to active and excludes superseded entries', async () => {
   const kb = new MarkdownKnowledgeStore(dir)
   await kb.write(entry1)

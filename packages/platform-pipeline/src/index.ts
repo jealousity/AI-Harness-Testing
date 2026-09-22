@@ -24,6 +24,9 @@ export {
   type StageId,
   type StageState,
   type StoreRef,
+  type LlmConfig,
+  type LlmProviderConfig,
+  type PlatformScope,
   type StoresConfig,
   type ToolFilter,
   type Violation,
@@ -61,6 +64,32 @@ export {
 } from './checkpoint.ts'
 
 export { acquirePipelineLock, type PipelineLock } from './checkpoint-lock.ts'
+
+export {
+  LlmProviderRegistry,
+  providerRegistry,
+  type ProviderCapabilityRequirement,
+  type ResolvedLlmProvider,
+} from './provider-registry.ts'
+
+export {
+  assertScopeMatch,
+  projectDataRoot,
+  scopedPath,
+  type ScopeContext,
+} from './platform-scope.ts'
+
+export { resolvePlatformRoots, type PlatformStorageRoots } from './platform-roots.ts'
+
+export {
+  importKnowledgeFile,
+  importKnowledgeText,
+  ingestKnowledgeFile,
+  parseDelimitedKnowledge,
+  parseMarkdownKnowledge,
+  type KnowledgeImportOptions,
+  type KnowledgeImportResult,
+} from './knowledge-import.ts'
 
 export {
   assemblePrompt,

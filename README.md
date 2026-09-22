@@ -62,6 +62,15 @@ ALLOW_PRIVATE_API=1 node server.mjs
 - archive prompt 要求记录本次写入的 `expectedIds`，再通过 `kb_query` 回读并写入 `verifiedIds/allExpectedHit`；R6-05 会检查是否命中本次归档的全部知识 ID，而不仅仅是任意旧条目。
 - host-plugin 会根据 pipeline 配置自动解析 `stores.knowledge.path` 与 `stores.cases.path`，构造本地 Markdown 存储适配器。
 
+### 通用平台基础能力
+
+- `pipeline.yaml` 支持 `scope.tenantId/environment` 与 `llm.providers` 声明；API Key 只通过 `apiKeyEnv` 从宿主环境注入，不写入配置文件。
+- `LlmProviderRegistry` 负责 provider 选择、环境变量检查和 tools/structuredOutput/streaming/continuation 能力校验；平台核心不直接发起模型请求。
+- `projectDataRoot` / `scopedPath` / `resolvePlatformRoots` 为 Harness、CLI、Web 共享租户/项目目录边界，拒绝跨项目和 `..` 路径逃逸，并统一 artifacts/checkpoints/knowledge/cases 目录。
+- `parseMarkdownKnowledge` 与 `parseDelimitedKnowledge` 支持 Markdown 章节、CSV/TSV 表格导入，统一生成 `draft` 知识条目并保留 `sourceRefs`；用例库仍由 `MarkdownCaseStore` 独立管理。
+- CLI 提供 `knowledge-import --input <file> --store <knowledge-dir> --project <projectId>`，导入先落 draft，不会绕过 P1 冲突治理直接覆盖 active 知识。
+- 本轮删除过期的 `packages/platform-pipeline/platform-pipeline-0.1.0.tgz`；当前阶段以源码构建和宿主部署为准，不把旧打包产物作为交付物。
+
 ### 知识库 P1 生命周期与冲突治理
 
 - 默认只检索 `active` 条目，并自动排除已过期条目；可显式查询其他状态。
@@ -123,5 +132,5 @@ ALLOW_PRIVATE_API=1 node server.mjs
 - 设计文档：**9 份全部定稿**，开放问题全部清零
 - 决策：**24 条全部确认**（D-01~D-20 + I-1~I-4）
 - 六阶段 prompt 模板：**全部评审通过**
-- 实现：核心编排与执行可信基础已落地（`packages/platform-pipeline`，当前 199 项测试全绿）；仍有宿主直接执行 CLI、外部存储、预算计量和跨进程 heartbeat/版本检查等生产化工作待完成
-- I-4 独立 npm 包：`platform-pipeline-0.1.0.tgz` 已产出并验证可独立安装调用（clean-install → import → 解析 pipeline.yaml → 算 ACL）
+- 实现：核心编排、执行可信、知识库生命周期和通用平台基础已落地（`packages/platform-pipeline`，当前 210 项测试全绿）；仍有正式宿主启动器、外部存储、预算计量和跨进程 heartbeat/版本检查等生产化工作待完成
+- 当前阶段按源码构建和 Harness 宿主部署，不保留过期 tgz 打包产物；provider 配置、项目作用域和知识导入已具备基础实现

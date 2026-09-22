@@ -21,6 +21,32 @@ export type ProjectType = 'api-service' | 'web-ui' | 'desktop-client' | 'mixed'
 export type ScaleTier = 'S' | 'M' | 'L'
 export type ExecutionLevel = 'auto' | 'hybrid' | 'manual'
 
+/** Harness 宿主之外的模型 provider 配置；平台核心只保存声明，不直接发起模型请求。 */
+export interface LlmProviderConfig {
+  readonly type: 'openai-compatible'
+  readonly baseUrl: string
+  readonly model: string
+  readonly apiKeyEnv: string
+  readonly capabilities?: Readonly<{
+    tools?: boolean
+    structuredOutput?: boolean
+    streaming?: boolean
+    continuation?: boolean
+  }>
+}
+
+export interface LlmConfig {
+  readonly defaultProvider: string
+  readonly providers: Readonly<Record<string, LlmProviderConfig>>
+}
+
+/** 通用平台作用域；tenantId 可选，projectId 必须贯穿产物、知识和执行数据。 */
+export interface PlatformScope {
+  readonly tenantId?: string
+  readonly projectId: string
+  readonly environment?: string
+}
+
 /** 工具 ACL（docs/06 第 2 节）：allow 白名单 / deny 黑名单，deny 显式优先。 */
 export interface ToolFilter {
   readonly allow?: readonly string[]
@@ -92,6 +118,8 @@ export interface PipelineConfig {
   readonly templateVersion: string
   readonly displayName?: string
   readonly executionPolicy?: ExecutionPolicy
+  readonly llm?: LlmConfig
+  readonly scope?: Omit<PlatformScope, 'projectId'>
   readonly scaleTier: ScaleTier
   readonly releasePolicy: ReleasePolicy
   readonly stores: StoresConfig

@@ -9,6 +9,8 @@ import YAML from 'yaml'
 import {
   STAGE_ORDER,
   type HumanGateConfig,
+  type LlmConfig,
+  type LlmProviderConfig,
   type PipelineConfig,
   type ProjectType,
   type ReviewConfig,
@@ -93,6 +95,47 @@ function asBoolean(value: unknown, where: string): boolean {
   return value
 }
 
+function normalizeLlmConfig(value: unknown): LlmConfig | undefined {
+  if (value === undefined) return undefined
+  const raw = asRecord(value, 'llm')
+  const defaultProvider = asString(raw.defaultProvider, 'llm.defaultProvider')
+  const providersRaw = asRecord(raw.providers, 'llm.providers')
+  const providers: Record<string, LlmProviderConfig> = {}
+  for (const [name, candidate] of Object.entries(providersRaw)) {
+    const provider = asRecord(candidate, `llm.providers.${name}`)
+    const type = asString(provider.type, `llm.providers.${name}.type`)
+    if (type !== 'openai-compatible') fail(`llm.providers.${name}.type must be openai-compatible`)
+    const baseUrl = asString(provider.baseUrl, `llm.providers.${name}.baseUrl`).replace(/\/+$/, '')
+    let parsedUrl: URL
+    try {
+      parsedUrl = new URL(baseUrl)
+    } catch {
+      fail(`llm.providers.${name}.baseUrl must be a valid URL`)
+    }
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) fail(`llm.providers.${name}.baseUrl must use http or https`)
+    const model = asString(provider.model, `llm.providers.${name}.model`)
+    const apiKeyEnv = asString(provider.apiKeyEnv, `llm.providers.${name}.apiKeyEnv`)
+    if (!/^[A-Z][A-Z0-9_]*$/.test(apiKeyEnv)) fail(`llm.providers.${name}.apiKeyEnv must be an environment variable name`)
+    const capabilitiesRaw = provider.capabilities === undefined ? undefined : asRecord(provider.capabilities, `llm.providers.${name}.capabilities`)
+    const capabilities = capabilitiesRaw === undefined ? undefined : {
+      ...capabilitiesRaw.tools === undefined ? {} : { tools: asBoolean(capabilitiesRaw.tools, `llm.providers.${name}.capabilities.tools`) },
+      ...capabilitiesRaw.structuredOutput === undefined ? {} : { structuredOutput: asBoolean(capabilitiesRaw.structuredOutput, `llm.providers.${name}.capabilities.structuredOutput`) },
+      ...capabilitiesRaw.streaming === undefined ? {} : { streaming: asBoolean(capabilitiesRaw.streaming, `llm.providers.${name}.capabilities.streaming`) },
+      ...capabilitiesRaw.continuation === undefined ? {} : { continuation: asBoolean(capabilitiesRaw.continuation, `llm.providers.${name}.capabilities.continuation`) },
+    }
+    providers[name] = {
+      type: 'openai-compatible',
+      baseUrl,
+      model,
+      apiKeyEnv,
+      ...(capabilities === undefined ? {} : { capabilities }),
+    }
+  }
+  if (Object.keys(providers).length === 0) fail('llm.providers must contain at least one provider')
+  if (providers[defaultProvider] === undefined) fail(`llm.defaultProvider references unknown provider: ${defaultProvider}`)
+  return { defaultProvider, providers }
+}
+
 /** 展开 "G-01..G-07" / "R4-01..R4-11" 范围记号为显式列表（设计稿 shorthand，docs/02 第 2 节注释）。 */
 export function expandRuleList(rules: unknown): string[] {
   if (rules === undefined) return []
@@ -125,6 +168,12 @@ export function normalizeConfig(input: unknown): PipelineConfig {
   const projectType = asString(raw.projectType, 'projectType') as ProjectType
   if (!PROJECT_TYPES.includes(projectType)) fail(`projectType must be one of ${PROJECT_TYPES.join('/')}`)
   const templateVersion = asString(raw.templateVersion, 'templateVersion')
+  const scopeRaw = raw.scope === undefined ? undefined : asRecord(raw.scope, 'scope')
+  const scope = scopeRaw === undefined ? undefined : {
+    ...scopeRaw.tenantId === undefined ? {} : { tenantId: asString(scopeRaw.tenantId, 'scope.tenantId') },
+    ...scopeRaw.environment === undefined ? {} : { environment: asString(scopeRaw.environment, 'scope.environment') },
+  }
+  const llm = normalizeLlmConfig(raw.llm)
   const scaleTier = asString(raw.scaleTier ?? 'M', 'scaleTier') as ScaleTier
   if (!SCALE_TIERS.includes(scaleTier)) fail(`scaleTier must be one of ${SCALE_TIERS.join('/')}`)
 
@@ -206,6 +255,8 @@ export function normalizeConfig(input: unknown): PipelineConfig {
     templateVersion,
     ...raw.displayName === undefined ? {} : { displayName: asString(raw.displayName, 'displayName') },
     ...raw.executionPolicy === undefined ? {} : { executionPolicy: raw.executionPolicy as PipelineConfig['executionPolicy'] },
+    ...(llm === undefined ? {} : { llm }),
+    ...(scope === undefined ? {} : { scope }),
     scaleTier,
     releasePolicy: { maxManualClaimedRatio },
     stores,

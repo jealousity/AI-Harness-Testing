@@ -20,7 +20,6 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "prepack": "npm run build",
     "test": "node --test",
     "typecheck": "tsc --noEmit",
     "cli": "node src/cli.ts"

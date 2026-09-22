@@ -8,6 +8,20 @@ projectType: api-service            # api-service | web-ui | desktop-client | mi
 templateVersion: v1
 displayName: ACME 支付平台测试流水线
 
+# 平台作用域与模型 provider 只声明配置，API Key 通过环境变量注入，不写入文件。
+scope:
+  tenantId: demo-tenant
+  environment: staging
+llm:
+  defaultProvider: primary
+  providers:
+    primary:
+      type: openai-compatible
+      baseUrl: https://api.example.com/v1
+      model: general-model
+      apiKeyEnv: PLATFORM_LLM_API_KEY
+      capabilities: { tools: true, structuredOutput: true, streaming: true }
+
 executionPolicy:
   defaultLevel: auto                # auto | hybrid | manual
   overrides:

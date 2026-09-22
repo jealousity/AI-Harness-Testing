@@ -26,22 +26,26 @@
 | `execute/` | manual 执行会话模型（4h 窗口 / R4-11a / 失败必注） | 08/04 |
 | `prompt/` | 公共骨架 + 六阶段差异段 + 审核 prompt（必查清单） | 04/05 |
 | `plugin.ts` | cordis 插件入口：装配确定性组件，注册 `ctx.pipeline` 服务 | 09 |
+| `provider-registry.ts` | 通用 OpenAI-compatible provider 声明、环境变量密钥检查与能力选择 | 平台化 |
+| `platform-scope.ts` | tenant/project/environment 作用域和安全数据目录 | 平台化 |
+| `knowledge-import.ts` | Markdown 章节、CSV/TSV 表格导入为 draft 知识条目 | 平台化 |
 
 ## 使用
 
 ```bash
-npm install        # 依赖（yaml 运行时；@deepseek-ai/* 仅 devDeps/peerDeps）
+npm install        # 依赖（yaml 运行时；@deepseek-ai/* 由 Harness 宿主提供）
 npm test           # node --test（原生 TS，Node >= 24）
 npm run typecheck  # tsc --noEmit
 npm run cli -- validate --config ../../examples/pipeline.yaml   # 配置自检
+npm run cli -- knowledge-import --input ./docs/project.md --store ./knowledge --project demo-project
+# CSV/TSV 同样支持，导入结果默认写为 draft 知识并携带 sourceRefs
 
-# I-4 独立 npm 包部署
+# 当前阶段按源码构建和宿主部署，不生成或依赖 tgz 打包产物
 npm run build      # tsc -p tsconfig.build.json → dist/
-npm pack           # prepack 自动 build，产出 platform-pipeline-0.1.0.tgz
 
-# 任意环境安装（零 harness 运行时依赖，仅 peerDependencies 声明宿主能力）
-npm install platform-pipeline-0.1.0.tgz
-node -e "import('platform-pipeline').then(m => console.log(m.STAGE_ORDER.join('→')))"
+# 配置中的 API Key 只从环境变量注入
+export PLATFORM_LLM_API_KEY=...
+# provider 能力和项目 scope 会在 pipeline 配置装载时校验
 ```
 
 ## 宿主接线（已完成）
@@ -57,6 +61,6 @@ node -e "import('platform-pipeline').then(m => console.log(m.STAGE_ORDER.join('�
 ## 状态
 
 - 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）
-- 确定性代码层：**全部落地，145 单测全绿**
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **210 项测试全绿**
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
-- I-4 独立 npm 包：`platform-pipeline-0.1.0.tgz` 已产出并验证（干净目录 `npm install` → import → 解析真实 pipeline.yaml → 算 ACL 全部通过）
+- 当前阶段不生成 tgz 打包产物；按源码构建，由 Harness 宿主提供运行时依赖和 API Key
