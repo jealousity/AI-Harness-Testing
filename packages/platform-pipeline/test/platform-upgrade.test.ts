@@ -5,6 +5,7 @@ import { providerRegistry } from '../src/provider-registry.ts'
 import { assertScopeMatch, projectDataRoot, scopedPath } from '../src/platform-scope.ts'
 import { resolvePlatformRoots } from '../src/platform-roots.ts'
 import { parseDelimitedKnowledge, parseMarkdownKnowledge } from '../src/knowledge-import.ts'
+import { resolveHarnessHostRuntime } from '../src/harness/runtime-config.ts'
 
 const stores = {
   knowledge: { impl: 'markdown-fs', path: 'knowledge' },
@@ -69,8 +70,25 @@ test('scope rejects cross-project and unsafe path access', () => {
   assert.match(scopedPath('/data', scope, 'knowledge', 'doc.md'), /knowledge[\\/]doc\.md$/)
   assert.throws(() => scopedPath('/data', scope, '../other'), /stay inside/)
   const roots = resolvePlatformRoots('/data', { projectId: 'demo', scope: { tenantId: 'acme' }, stores })
-  assert.match(roots.artifactsRoot, /projects[\\/]demo[\\/]artifacts$/)
+  assert.match(roots.artifactsRoot, /projects[\\/]demo$/)
   assert.match(roots.knowledgeRoot ?? '', /projects[\\/]demo[\\/]knowledge$/)
+})
+
+test('Harness host runtime derives scoped roots and provider without exposing key', () => {
+  const config = baseConfig({
+    scope: { tenantId: 'acme' },
+    llm: {
+      defaultProvider: 'primary',
+      providers: {
+        primary: { type: 'openai-compatible', baseUrl: 'https://llm.example.com', model: 'm', apiKeyEnv: 'LLM_API_KEY', capabilities: { tools: true, structuredOutput: true } },
+      },
+    },
+  })
+  const runtime = resolveHarnessHostRuntime(config, { dataRoot: '/data', environment: { LLM_API_KEY: 'secret' } })
+  assert.equal(runtime.providerName, 'primary')
+  assert.match(runtime.roots.artifactsRoot, /projects[\\/]demo$/)
+  assert.match(runtime.roots.checkpointRoot, /projects[\\/]demo[\\/]checkpoints$/)
+  assert.equal(runtime.provider?.apiKey, 'secret')
 })
 
 test('Markdown 导入按章节生成 draft 知识并保留来源', () => {

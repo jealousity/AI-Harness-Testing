@@ -137,6 +137,10 @@ export {
   toToolRestriction,
   type HarnessReviewDeps,
   type HarnessSpawnerDeps,
+  resolveHarnessHostRuntime,
+  type HarnessHostRuntime,
+  type HarnessHostRuntimeInput,
+  type HarnessHostStorageInput,
 } from './harness/index.ts'
 
 export {
@@ -268,3 +272,9 @@ export {
   type PipelinePluginConfig,
   type PipelineService,
 } from './plugin.ts'
+
+export {
+  apply as harnessHostPlugin,
+  HOST_PLUGIN_BUILD,
+  type HostPluginConfig,
+} from './harness/host-plugin.ts'

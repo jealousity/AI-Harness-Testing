@@ -1,7 +1,8 @@
 /**
- * 最小宿主（4b 端到端）：独立包内组装真实 harness 栈 + 真实 DeepSeek 外接模型，
+ * 最小宿主（4b 端到端）：独立包内组装真实 Harness 栈和 OpenAI-compatible 模型，
  * 跑通 receive → analyze 最小闭环（真实 LLM 阶段 agent + 真实门禁 + 脚本人工门）。
- * 运行：DEEPSEEK_API_KEY 未设时从 ~/.dsh/.credentials.yaml 读取（桌面端已配置）。
+ * 默认保留历史 DeepSeek/Qwen/SenseNova fallback；设置 E2E_PIPELINE_CONFIG 后优先读取
+ * 外部 pipeline.yaml 的 llm.providers 配置。
  * @module platform-pipeline/e2e/minimal-host
  */
 
@@ -20,6 +21,8 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { loadPipelineConfig } from '../config.ts'
+import { providerRegistry } from '../provider-registry.ts'
+import type { PipelineConfig } from '../types.ts'
 import { FsArtifactStore, FsCheckpointPort } from '../stores/fs.ts'
 import { MachineGateEngine, platformGenericRules } from '../gates/machine.ts'
 import { stageRules } from '../gates/stage-rules.ts'
@@ -41,6 +44,9 @@ interface LlmTarget {
   readonly apiKeyEnv: string
   readonly baseURL: string
   readonly model: string
+  /** Harness 的 dsh-llm-deepseek 适配器固定注册此 route；配置 provider 名保留在 label。 */
+  readonly harnessRoute: 'deepseek-official'
+  readonly configuredProvider?: string
 }
 
 const DEEPSEEK_TARGET: LlmTarget = {
@@ -48,6 +54,7 @@ const DEEPSEEK_TARGET: LlmTarget = {
   apiKeyEnv: 'DEEPSEEK_API_KEY',
   baseURL: 'https://api.deepseek.com',
   model: 'deepseek-v4-flash',
+  harnessRoute: 'deepseek-official',
 }
 
 const QWEN_TARGET: LlmTarget = {
@@ -55,6 +62,7 @@ const QWEN_TARGET: LlmTarget = {
   apiKeyEnv: 'QWEN_TOKEN_PLAN_CN_API_KEY',
   baseURL: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
   model: 'qwen3.8-max',
+  harnessRoute: 'deepseek-official',
 }
 
 /** SenseNova 统一 token 网关（OpenAI 兼容）：实测 glm-5.2 可用且返回标准 tool_calls（deepseek-v4-flash 在该网关上不产 tool_calls，不可用于工具调用阶段）。
@@ -64,6 +72,7 @@ const SENSENOVA_TARGET: LlmTarget = {
   apiKeyEnv: 'SENSENOVA_TOKEN_KEY',
   baseURL: 'https://token.sensenova.cn/v1',
   model: 'glm-5.2',
+  harnessRoute: 'deepseek-official',
 }
 
 /** 从凭据库加载指定 key 到 env；返回是否成功。 */
@@ -102,44 +111,70 @@ async function probeEndpoint(baseURL: string, apiKey: string, model: string): Pr
   }
 }
 
-/** 选择 LLM 提供者：三段探测，优先 DeepSeek，余额/配额不足时依次切换千问、SenseNova 网关。 */
-async function selectLlmProvider(): Promise<LlmTarget> {
+/**
+ * 选择 LLM provider：优先使用 pipeline.yaml 的 llm.providers；没有配置时
+ * 保留历史 e2e 的三段 fallback，方便验证旧配置和桌面凭据。
+ */
+async function selectLlmProvider(config?: PipelineConfig): Promise<LlmTarget> {
+  if (config?.llm !== undefined) {
+    const registry = providerRegistry(config.llm, process.env)
+    const failures: string[] = []
+    for (const name of [config.llm.defaultProvider, ...registry.names().filter(value => value !== config.llm!.defaultProvider)]) {
+      try {
+        const provider = registry.resolve(name, { tools: true })
+        const target: LlmTarget = {
+          label: `配置 provider ${name}`,
+          apiKeyEnv: provider.apiKeyEnv,
+          baseURL: provider.baseUrl,
+          model: provider.model,
+          harnessRoute: 'deepseek-official',
+          configuredProvider: name,
+        }
+        if (await probeEndpoint(target.baseURL, provider.apiKey, target.model)) {
+          console.log(`[minimal-host] LLM: 使用 pipeline.yaml provider=${name} model=${target.model}`)
+          return target
+        }
+        failures.push(`${name}: endpoint probe failed`)
+      } catch (error) {
+        failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    throw new Error(`pipeline.yaml 中没有可用的 LLM provider：${failures.join('; ')}`)
+  }
+
   const deepseekOk = await loadKey(DEEPSEEK_TARGET.apiKeyEnv)
   const qwenOk = await loadKey(QWEN_TARGET.apiKeyEnv)
   const senseOk = await loadKey(SENSENOVA_TARGET.apiKeyEnv)
 
   if (!deepseekOk && !qwenOk && !senseOk) {
-    throw new Error('既无 DEEPSEEK_API_KEY 也无 QWEN_TOKEN_PLAN_CN_API_KEY 也无 SENSENOVA_TOKEN_KEY')
+    throw new Error('未配置 pipeline.yaml llm.providers，且没有 DEEPSEEK_API_KEY、QWEN_TOKEN_PLAN_CN_API_KEY 或 SENSENOVA_TOKEN_KEY')
   }
 
   if (deepseekOk) {
     const usable = await probeEndpoint(DEEPSEEK_TARGET.baseURL, process.env[DEEPSEEK_TARGET.apiKeyEnv]!, DEEPSEEK_TARGET.model)
     if (usable) {
-      console.log('[minimal-host] LLM: 使用 DeepSeek 官方（余额充足）')
+      console.log('[minimal-host] LLM: 使用历史 DeepSeek fallback')
       return DEEPSEEK_TARGET
     }
-    console.log('[minimal-host] LLM: DeepSeek 余额不足，自动切换到千问')
   }
 
   if (qwenOk) {
     const qwenUsable = await probeEndpoint(QWEN_TARGET.baseURL, process.env[QWEN_TARGET.apiKeyEnv]!, QWEN_TARGET.model)
     if (qwenUsable) {
-      console.log(`[minimal-host] LLM: 使用${QWEN_TARGET.label}`)
+      console.log(`[minimal-host] LLM: 使用历史 ${QWEN_TARGET.label}`)
       return QWEN_TARGET
     }
-    console.log(`[minimal-host] LLM: ${QWEN_TARGET.label} 配额已耗尽`)
   }
 
   if (senseOk) {
     const senseUsable = await probeEndpoint(SENSENOVA_TARGET.baseURL, process.env[SENSENOVA_TARGET.apiKeyEnv]!, SENSENOVA_TARGET.model)
     if (senseUsable) {
-      console.log(`[minimal-host] LLM: 使用${SENSENOVA_TARGET.label}`)
+      console.log(`[minimal-host] LLM: 使用历史 ${SENSENOVA_TARGET.label}`)
       return SENSENOVA_TARGET
     }
-    console.log(`[minimal-host] LLM: ${SENSENOVA_TARGET.label} 不可用`)
   }
 
-  throw new Error('所有 LLM 端点均不可用（余额/配额已耗尽），请充值或等待配额重置后再跑全流程')
+  throw new Error('所有 LLM 端点均不可用；请检查 pipeline.yaml llm.providers 或历史 fallback 凭据')
 }
 
 function textResult(text: string): ContentBlock[] {
@@ -478,12 +513,15 @@ function installLlmTrace(): void {
 
 async function main(): Promise<void> {
   installLlmTrace()
-  const target = await selectLlmProvider()
   const { baseUrl } = await startFakeApi()
   const workdir = join(process.cwd(), '.e2e-workdir')
   await rm(workdir, { recursive: true, force: true })
   await mkdir(join(workdir, 'inputs'), { recursive: true })
-  await writeFile(join(workdir, 'pipeline.yaml'), PIPELINE_YAML)
+  const configuredPipelinePath = process.env.E2E_PIPELINE_CONFIG
+  const pipelinePath = configuredPipelinePath ?? join(workdir, 'pipeline.yaml')
+  if (configuredPipelinePath === undefined) await writeFile(pipelinePath, PIPELINE_YAML)
+  const cfg = await loadPipelineConfig(pipelinePath)
+  const target = await selectLlmProvider(cfg)
   await writeFile(join(workdir, 'inputs', 'requirements.txt'), INPUT_TEXT)
 
   const ctx = new Context()
@@ -499,19 +537,20 @@ async function main(): Promise<void> {
   if (target === QWEN_TARGET) {
     pluginConfig.thinking = 'disabled'
     pluginConfig.models = [{ id: 'qwen3.8-max', name: 'Qwen3.8 Max', contextWindow: 1_000_000, maxTokens: 131_072 }]
-  }
-  if (target === SENSENOVA_TARGET) {
+  } else if (target === SENSENOVA_TARGET) {
     // SenseNova 网关：glm-5.2 非流式能正常返回 tool_calls；纯推理会全塞 reasoning_content。
     // TODO（明晚续）：流式链路直测显示 agent-loop 的 stream 只收到 reasoning block → 子 agent 判零内容 error；
     // 需确认加 tool 后 stream 是否产出 tool_calls，或改用 reasoning_effort=none。
     pluginConfig.models = [{ id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_048_576, maxTokens: 65_536 }]
+  } else if (target.configuredProvider !== undefined) {
+    pluginConfig.models = [{ id: target.model, name: target.model, contextWindow: 128_000, maxTokens: 16_384 }]
   }
   await ctx.plugin(LlmDeepSeek, pluginConfig as never)
   await ctx.plugin(SubagentRuntime)
   await ctx.plugin(Spawn, { providerName: 'spawn' })
 
   const parent = ctx.agentLoop.create(SessionId('pipeline-parent'), {
-    provider: 'deepseek-official',
+    provider: target.harnessRoute,
     model: target.model,
   })
   console.log('[minimal-host] parent agent created:', parent.id)
@@ -555,7 +594,6 @@ async function main(): Promise<void> {
       return { stageId: request.stageId, artifactPath: request.artifactPath }
     },
   }
-  const cfg = await loadPipelineConfig(join(workdir, 'pipeline.yaml'))
   const driver = new PipelineDriver({
     cfg,
     pipelineId: 'e2e-2026',
@@ -609,7 +647,7 @@ async function main(): Promise<void> {
     console.log('[minimal-host] === 探针：ctx.llm.stream 直测（agent-loop 同路径）===')
     {
       const llm = ctx.llm
-      const models = await llm.listModels('deepseek-official')
+      const models = await llm.listModels(target.harnessRoute)
       console.log(`[minimal-host] 注册模型：${models.map((m: unknown) => JSON.stringify(m).slice(0, 120)).join(' | ')}`)
       try {
         // 诊断探针：Message 需要 branded id + source（由 agent-loop 正常构造），
@@ -617,7 +655,7 @@ async function main(): Promise<void> {
         const probeMessages = [{ role: 'user', content: [{ type: 'text', text: 'Say OK in one word.' }] }] as unknown as
           Parameters<typeof llm.stream>[0]['messages']
         const stream = llm.stream({
-          provider: 'deepseek-official',
+          provider: target.harnessRoute,
           model: target.model,
           system: 'Be terse.',
           messages: probeMessages,

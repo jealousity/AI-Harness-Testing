@@ -31,7 +31,9 @@ export function resolvePlatformRoots(dataRoot: string, config: Pick<PipelineConf
     : undefined
   return {
     projectRoot,
-    artifactsRoot: resolve(projectRoot, 'artifacts'),
+    // FsArtifactStore receives the project workspace root because artifact paths
+    // already include the `artifacts/<pipelineId>/...` prefix.
+    artifactsRoot: projectRoot,
     checkpointRoot: resolve(projectRoot, 'checkpoints'),
     ...(knowledgeRoot === undefined ? {} : { knowledgeRoot }),
     ...(casesRoot === undefined ? {} : { casesRoot }),

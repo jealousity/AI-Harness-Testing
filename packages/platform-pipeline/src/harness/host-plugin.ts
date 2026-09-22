@@ -41,6 +41,7 @@ import { HarnessStageSpawner } from './stage-spawner-harness.ts'
 import { HarnessReviewRunner } from './review-runner-harness.ts'
 import { applyToolTimeoutPolicy } from './tool-timeout.ts'
 import { registerStageTools } from './stage-tools.ts'
+import { resolveHarnessHostRuntime } from './runtime-config.ts'
 import type { StageId } from '../types.ts'
 
 /** 插件名（cordis 生命周期标识）。 */
@@ -60,10 +61,12 @@ export const inject = ['agents', 'userQuestions', 'subagents', 'tools']
 export interface HostPluginConfig {
   /** pipeline.yaml 路径。 */
   readonly configPath: string
-  /** 产物根目录。 */
-  readonly artifactsRoot: string
-  /** 检查点根目录。 */
-  readonly checkpointRoot: string
+  /** 统一平台数据根；设置后按 tenant/project 自动计算 artifacts/checkpoints/knowledge/cases。 */
+  readonly dataRoot?: string
+  /** 兼容单项目宿主的显式产物根目录；未提供 dataRoot 时必填。 */
+  readonly artifactsRoot?: string
+  /** 兼容单项目宿主的显式检查点根目录；未提供 dataRoot 时必填。 */
+  readonly checkpointRoot?: string
   /**
    * receive 阶段的输入文件路径（需求原文）。缺省时 receive 无上游也无输入，
    * 只能凭空产出——真实运行必须提供。
@@ -203,21 +206,34 @@ interface Assembled {
 
 export async function apply(ctx: Context, config: HostPluginConfig): Promise<void> {
   const initialConfig = await loadPipelineConfig(config.configPath)
+  const runtime = resolveHarnessHostRuntime(initialConfig, {
+    ...(config.dataRoot === undefined ? {} : { dataRoot: config.dataRoot }),
+    ...(config.artifactsRoot === undefined ? {} : { artifactsRoot: config.artifactsRoot }),
+    ...(config.checkpointRoot === undefined ? {} : { checkpointRoot: config.checkpointRoot }),
+    ...(config.providerName === undefined ? {} : { providerName: config.providerName }),
+  })
+  const artifactsRoot = runtime.roots.artifactsRoot
+  const checkpointRoot = runtime.roots.checkpointRoot
+  const providerName = runtime.providerName ?? config.providerName
   const configDir = dirname(config.configPath)
   const resolveStorePath = (value: unknown): string | undefined => {
     if (typeof value !== 'string' || value.trim() === '') return undefined
     return isAbsolute(value) ? value : join(configDir, value)
   }
-  const knowledgeDir = initialConfig.stores.knowledge.impl === 'markdown-fs'
-    ? resolveStorePath(initialConfig.stores.knowledge.path)
-    : undefined
-  const caseDir = initialConfig.stores.cases.impl === 'markdown-fs'
-    ? resolveStorePath(initialConfig.stores.cases.path)
-    : undefined
+  const knowledgeDir = config.dataRoot !== undefined
+    ? runtime.roots.knowledgeRoot
+    : initialConfig.stores.knowledge.impl === 'markdown-fs'
+      ? resolveStorePath(initialConfig.stores.knowledge.path)
+      : undefined
+  const caseDir = config.dataRoot !== undefined
+    ? runtime.roots.casesRoot
+    : initialConfig.stores.cases.impl === 'markdown-fs'
+      ? resolveStorePath(initialConfig.stores.cases.path)
+      : undefined
   const knowledgeStore = knowledgeDir === undefined ? undefined : new MarkdownKnowledgeStore(knowledgeDir)
   const caseStore = caseDir === undefined ? undefined : new MarkdownCaseStore(caseDir)
   const toolName = config.toolName ?? 'pipeline_run'
-  const auditPath = join(config.checkpointRoot, 'human-gate-audit.jsonl')
+  const auditPath = join(checkpointRoot, 'human-gate-audit.jsonl')
   let activePipelineId: string | undefined
   const activePipelines = new Set<string>()
 
@@ -250,7 +266,7 @@ export async function apply(ctx: Context, config: HostPluginConfig): Promise<voi
       subagents,
       parent: agent,
       signal,
-      ...(config.providerName === undefined ? {} : { providerName: config.providerName }),
+      ...(providerName === undefined ? {} : { providerName: providerName }),
     })
     const review = config.enableReview === false
       ? undefined
@@ -258,19 +274,19 @@ export async function apply(ctx: Context, config: HostPluginConfig): Promise<voi
         subagents,
         parent: agent,
         signal,
-        ...(config.providerName === undefined ? {} : { providerName: config.providerName }),
+        ...(providerName === undefined ? {} : { providerName: providerName }),
         toolFilter: { allow: [...(config.reviewAllowTools ?? ['fs_read'])], deny: ['fs_write', 'subagent', 'executor_run', 'kb_write', 'case_archive'] },
       })
 
     const driver = new PipelineDriver({
       cfg,
       pipelineId,
-      root: join(config.checkpointRoot, pipelineId),
+      root: join(checkpointRoot, pipelineId),
       rulesetVersion: cfg.templateVersion,
       spawn,
       gates,
       human,
-      artifacts: new FsArtifactStore(config.artifactsRoot),
+      artifacts: new FsArtifactStore(artifactsRoot),
       checkpoint: new FsCheckpointPort(),
       ...(config.receiveInput === undefined ? {} : { receiveInput: config.receiveInput }),
       ...(config.executionSessionPath === undefined
@@ -317,7 +333,10 @@ export async function apply(ctx: Context, config: HostPluginConfig): Promise<voi
   // （parse_doc / fs_read / fs_write / kb_query / ...），而 tools.restrict() 会校验
   // 所有 filter 名必须存在。宿主不注册这些名字时，阶段子会话直接起不来：
   //   tools.restrict() names unknown global tools "parse_doc", "fs_read", ...
-  const executorDir = dirname(config.executionSessionPath ?? join(dirname(config.artifactsRoot), 'executor', 'session.json'))
+  const defaultExecutorSession = config.dataRoot === undefined
+    ? join(dirname(artifactsRoot), 'executor', 'session.json')
+    : join(runtime.roots.projectRoot, 'executor', 'session.json')
+  const executorDir = dirname(config.executionSessionPath ?? defaultExecutorSession)
   registerStageTools(ctx, {
     // 【不变式】baseDir == artifactsRoot == **阶段子会话继承的工作区根**。
     //
@@ -332,8 +351,8 @@ export async function apply(ctx: Context, config: HostPluginConfig): Promise<voi
     //     "stage ... produced no artifact"（已在真实 GUI 宿主实测到）
     //
     // 故 artifactsRoot 应配置为阶段子会话的工作区根（GUI 会话里即会话 cwd）。
-    baseDir: config.artifactsRoot,
-    artifactsRoot: config.artifactsRoot,
+    baseDir: artifactsRoot,
+    artifactsRoot: artifactsRoot,
     evidenceDir: config.evidenceDir ?? join(executorDir, 'evidence'),
     sessionPath: config.executionSessionPath ?? join(executorDir, 'session.json'),
     pipelineIdProvider: () => activePipelineId,
@@ -341,7 +360,7 @@ export async function apply(ctx: Context, config: HostPluginConfig): Promise<voi
     evidenceDirProvider: (pipelineId) => join(executorDir, pipelineId, 'evidence'),
     ...(config.targetBaseUrl === undefined ? {} : { targetBaseUrl: config.targetBaseUrl }),
     ...(config.receiveInput === undefined ? {} : { receiveInput: config.receiveInput }),
-    checkpointRoot: config.checkpointRoot,
+    checkpointRoot: checkpointRoot,
     knowledgeStore,
     caseStore,
     projectId: initialConfig.projectId,
@@ -395,7 +414,9 @@ export async function apply(ctx: Context, config: HostPluginConfig): Promise<voi
           summary: [
             `platform-pipeline 已接入本宿主（${HOST_PLUGIN_BUILD}）。`,
             `项目 ${cfg.projectId} / 模板 ${cfg.templateVersion} / 人工门渠道 = ctx.userQuestions 真弹窗（无自动批准）`,
-            `产物根 ${config.artifactsRoot}`,
+            `provider ${providerName ?? '由宿主默认路由提供'}${runtime.provider?.model === undefined ? '' : ` / model ${runtime.provider.model}`}`,
+            `项目根 ${runtime.roots.projectRoot}`,
+            `产物根 ${artifactsRoot}`,
             `需求输入 ${config.receiveInput ?? '（未配置）'}`,
             `当前活体根会话 agent ${roots.length} 个；本次调用归属 ${agent.id}`,
             '调用 pipeline_run（action 省略或 "run"）即开始，六阶段将逐个弹窗等你裁决。',
@@ -404,15 +425,15 @@ export async function apply(ctx: Context, config: HostPluginConfig): Promise<voi
       }
 
       // 阶段提示词指向 schemas/<stage>.schema.json（"以文件为准"），跑之前保证它真在磁盘上
-      const schemaFiles = await materializeContractSchemas(config.artifactsRoot)
-      console.log(`[platform-pipeline] 已落盘契约 schema ${schemaFiles.length} 份 → ${dirname(schemaFiles[0] ?? config.artifactsRoot)}`)
+      const schemaFiles = await materializeContractSchemas(artifactsRoot)
+      console.log(`[platform-pipeline] 已落盘契约 schema ${schemaFiles.length} 份 → ${dirname(schemaFiles[0] ?? artifactsRoot)}`)
 
       if (activePipelines.has(pipelineId)) throw new Error(`流水线 ${pipelineId} 已有运行中的实例，拒绝并发 run/reenter`)
       activePipelines.add(pipelineId)
       activePipelineId = pipelineId
       let lock: Awaited<ReturnType<typeof acquirePipelineLock>>
       try {
-        lock = await acquirePipelineLock(config.checkpointRoot, pipelineId)
+        lock = await acquirePipelineLock(checkpointRoot, pipelineId)
       } catch (error) {
         activePipelineId = undefined
         activePipelines.delete(pipelineId)
@@ -432,7 +453,7 @@ export async function apply(ctx: Context, config: HostPluginConfig): Promise<voi
         const outcome = await runWithDiagnostics(
           () => driver.run(),
           pipelineId,
-          config.artifactsRoot,
+          artifactsRoot,
         )
         const outcomeKind = outcome.outcome
         return {
@@ -459,7 +480,7 @@ export async function apply(ctx: Context, config: HostPluginConfig): Promise<voi
   // 落一条装载标记：宿主（GUI/桌面应用）的标准输出通常拿不到，
   // 标记文件是判断「配置热重载是否真的加载了插件」的唯一可靠证据。
   void appendFile(
-    join(config.checkpointRoot, 'plugin-loads.jsonl'),
+    join(checkpointRoot, 'plugin-loads.jsonl'),
     `${JSON.stringify({ at: Date.now(), pid: process.pid, toolName, note: 'host-plugin loaded' })}\n`,
     'utf8',
   ).catch(() => { /* 标记失败不影响装载 */ })

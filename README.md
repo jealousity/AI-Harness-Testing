@@ -66,6 +66,8 @@ ALLOW_PRIVATE_API=1 node server.mjs
 
 - `pipeline.yaml` 支持 `scope.tenantId/environment` 与 `llm.providers` 声明；API Key 只通过 `apiKeyEnv` 从宿主环境注入，不写入配置文件。
 - `LlmProviderRegistry` 负责 provider 选择、环境变量检查和 tools/structuredOutput/streaming/continuation 能力校验；平台核心不直接发起模型请求。
+- `resolveHarnessHostRuntime` 已接入 `harness/host-plugin.ts`：设置 `dataRoot` 后，Harness 宿主启动会自动选择 provider、校验 API Key/能力并计算项目存储根；显式 `artifactsRoot`/`checkpointRoot` 仍兼容旧单项目宿主。
+- `minimal-host.ts` 支持 `E2E_PIPELINE_CONFIG`，可以从外部项目 YAML 读取 `llm.providers`，将 baseUrl/model/apiKeyEnv 配置传给 Harness LLM 适配器；未指定时才使用历史 e2e fallback。
 - `projectDataRoot` / `scopedPath` / `resolvePlatformRoots` 为 Harness、CLI、Web 共享租户/项目目录边界，拒绝跨项目和 `..` 路径逃逸，并统一 artifacts/checkpoints/knowledge/cases 目录。
 - `parseMarkdownKnowledge` 与 `parseDelimitedKnowledge` 支持 Markdown 章节、CSV/TSV 表格导入，统一生成 `draft` 知识条目并保留 `sourceRefs`；用例库仍由 `MarkdownCaseStore` 独立管理。
 - CLI 提供 `knowledge-import --input <file> --store <knowledge-dir> --project <projectId>`，导入先落 draft，不会绕过 P1 冲突治理直接覆盖 active 知识。

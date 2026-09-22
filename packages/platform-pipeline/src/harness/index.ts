@@ -21,3 +21,10 @@ export {
   toolTimeoutResult,
   TOOL_TIMEOUT,
 } from './tool-timeout.ts'
+
+export {
+  resolveHarnessHostRuntime,
+  type HarnessHostRuntime,
+  type HarnessHostRuntimeInput,
+  type HarnessHostStorageInput,
+} from './runtime-config.ts'

@@ -19,7 +19,7 @@
 | `gates/` | 机器门禁引擎：JSON Schema 子集校验器 + G-01~08 规则（含 G-08 摘要锁） | 01 |
 | `driver.ts` | PipelineDriver 编排核心：恢复续跑 / 门禁重试 / 人工门 / 交叉检查 / 重入级联 | 09/03 |
 | `stage-spawner.ts` | StageSpawner 接口 + 生效 ACL 解析 + 运行上下文推导 | 09/06 |
-| `harness/` | HarnessStageSpawner：`ctx.subagents.start` + toolFilter 映射（type-only 依赖，运行时零 harness 引用）；execute 走 `startContinuable` 后台可续跑 + `listChildren` 轮询（docs/09 验证点 5，无 `prepareContinuable` 能力时降级 one-shot） | 09/06 |
+| `harness/` | HarnessStageSpawner：`ctx.subagents.start` + toolFilter 映射；`runtime-config.ts` 统一 provider 能力/API Key 校验与项目存储根；execute 走 `startContinuable` 后台可续跑 + `listChildren` 轮询 | 09/06/平台化 |
 | `executor/` | 执行可信：时序链（R4-09）/ 对账（R4-08）/ 证据锚定（R4-10）/ HttpExecutor（wire 留痕）/ env_diag 探针 | 08 |
 | `stores/` | FsArtifactStore / FsCheckpointPort / MarkdownKnowledgeStore / MarkdownCaseStore（版本化回流） | 02/07 |
 | `report/` | 报告渲染器（六段人读报告，确定性代码） | 02/12 |
@@ -50,13 +50,25 @@ export PLATFORM_LLM_API_KEY=...
 
 ## 宿主接线（已完成）
 
+通用 Harness 宿主可优先传入：
+
+```ts
+await ctx.plugin(platformPipelineHost, {
+  configPath: './pipeline.yaml',
+  dataRoot: './data',
+  providerName: 'primary',
+})
+```
+
+宿主会根据 `scope.tenantId` / `projectId` 计算项目目录，校验 `llm.providers` 声明和 API Key 环境变量，再装配 artifacts、checkpoints、knowledge、cases。旧的 `artifactsRoot` + `checkpointRoot` 显式配置仍兼容。
+
 `run`/`reenter` 需要宿主注入（`src/plugin.ts` 集成点，均标注）：
 
 - **spawner**：`HarnessStageSpawner` + 当前会话的 parent Agent（`ctx.subagents.start`，API 已核实，见 docs/09 验证点）
 - **human**：ui-user-questions 实现的人工门（A~G；D-01 二次机器判定）
 - **review**：独立审核 agent（`outputSchema` 结构化输出）
 
-最小宿主已落地（`src/e2e/minimal-host.ts`），真实外接 DeepSeek / 千问 六阶段端到端跑通（receive→analyze→design→execute→report→archive），含重入级联 + 故障注入审核 fail 回喂重跑闭环（见 `test/e2e/`）。
+最小宿主已落地（`src/e2e/minimal-host.ts`），真实外接 DeepSeek / 千问 六阶段端到端跑通（receive→analyze→design→execute→report→archive），含重入级联 + 故障注入审核 fail 回喂重跑闭环（见 `test/e2e/`）。它默认使用内置 e2e 配置；设置 `E2E_PIPELINE_CONFIG=/path/to/pipeline.yaml` 后会读取外部项目配置中的 `llm.providers`，并将 provider 的 baseUrl/model/apiKeyEnv 转换为 Harness LLM 插件配置，仍由 Harness 的 `deepseek-official` 适配路由承载 OpenAI-compatible 请求。
 
 ## 状态
 
