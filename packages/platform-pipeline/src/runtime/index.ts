@@ -3,6 +3,7 @@ export type {
   LlmClient,
   LlmMessage,
   LlmResponse,
+  LlmResponseFormat,
   LlmToolCall,
   StageRunner,
   ToolDefinition,
@@ -12,6 +13,7 @@ export type {
 } from './ports.ts'
 
 export { InMemoryToolRegistry, ToolAccessError, executeTool } from './tool-registry.ts'
+export { OpenAICompatibleClient, OpenAICompatibleError, type OpenAICompatibleClientOptions } from './openai-client.ts'
 
 export {
   CallbackHumanGate,

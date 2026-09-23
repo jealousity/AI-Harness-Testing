@@ -29,7 +29,7 @@
 | `provider-registry.ts` | 通用 OpenAI-compatible provider 声明、环境变量密钥检查与能力选择 | 平台化 |
 | `platform-scope.ts` | tenant/project/environment 作用域和安全数据目录 | 平台化 |
 | `knowledge-import.ts` | Markdown 章节、CSV/TSV 表格导入为 draft 知识条目 | 平台化 |
-| `runtime/` | 无 Harness 的 StageRunner / LlmClient / ToolRegistry / HumanGate 端口与 ScriptedStageRunner | 方案一 |
+| `runtime/` | 无 Harness 的 StageRunner / LlmClient / ToolRegistry / HumanGate 端口、ScriptedStageRunner 与 OpenAICompatibleClient | 方案一 |
 
 ## 使用
 
@@ -38,6 +38,10 @@ npm install        # 通用核心只需 yaml；Harness 适配器依赖作为开�
 npm test           # node --test（原生 TS，Node >= 24）
 npm run typecheck  # tsc --noEmit
 npm run cli -- validate --config ../../examples/pipeline.yaml   # 配置自检
+
+# 无 Harness 的 OpenAI-compatible 客户端（API Key 只从环境变量读取）
+export PLATFORM_LLM_API_KEY=...
+# OpenAICompatibleClient 支持 tools、json_schema、超时和 429/5xx 重试
 npm run cli -- knowledge-import --input ./docs/project.md --store ./knowledge --project demo-project
 # CSV/TSV 同样支持，导入结果默认写为 draft 知识并携带 sourceRefs
 
