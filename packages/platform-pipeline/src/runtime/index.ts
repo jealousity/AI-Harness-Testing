@@ -14,6 +14,7 @@ export type {
 
 export { InMemoryToolRegistry, ToolAccessError, executeTool } from './tool-registry.ts'
 export { OpenAICompatibleClient, OpenAICompatibleError, type OpenAICompatibleClientOptions } from './openai-client.ts'
+export { OpenAIStageRunner, type OpenAIStageRunnerOptions } from './openai-stage-runner.ts'
 
 export {
   CallbackHumanGate,

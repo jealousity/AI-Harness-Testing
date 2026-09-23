@@ -29,7 +29,7 @@
 | `provider-registry.ts` | 通用 OpenAI-compatible provider 声明、环境变量密钥检查与能力选择 | 平台化 |
 | `platform-scope.ts` | tenant/project/environment 作用域和安全数据目录 | 平台化 |
 | `knowledge-import.ts` | Markdown 章节、CSV/TSV 表格导入为 draft 知识条目 | 平台化 |
-| `runtime/` | 无 Harness 的 StageRunner / LlmClient / ToolRegistry / HumanGate 端口、ScriptedStageRunner 与 OpenAICompatibleClient | 方案一 |
+| `runtime/` | 无 Harness 的 StageRunner / LlmClient / ToolRegistry / HumanGate 端口、ScriptedStageRunner、OpenAICompatibleClient 与 OpenAIStageRunner | 方案一 |
 
 ## 使用
 

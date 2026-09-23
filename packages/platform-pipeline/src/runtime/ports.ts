@@ -18,6 +18,8 @@ export interface LlmMessage {
   readonly role: 'system' | 'user' | 'assistant' | 'tool'
   readonly content: string
   readonly toolCallId?: string
+  readonly toolName?: string
+  readonly toolCalls?: readonly LlmToolCall[]
 }
 
 export interface LlmToolCall {

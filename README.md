@@ -70,6 +70,7 @@ ALLOW_PRIVATE_API=1 node server.mjs
 - `minimal-host.ts` 支持 `E2E_PIPELINE_CONFIG`，可以从外部项目 YAML 读取 `llm.providers`，将 baseUrl/model/apiKeyEnv 配置传给 Harness LLM 适配器；未指定时才使用历史 e2e fallback。
 - 方案一已落地：新增无 Harness 依赖的 `runtime` 端口（StageRunner、LlmClient、ToolRegistry、HumanGate）与 `ScriptedStageRunner`，可以仅用 PipelineDriver + 文件存储完成六阶段回归；默认包入口不再导出/加载 Harness 适配层，Harness 代码通过 `platform-pipeline/harness` 与 `platform-pipeline/harness-plugin` 可选子路径使用。
 - runtime 已提供基于原生 `fetch` 的 `OpenAICompatibleClient`：API Key 可由环境变量注入，支持 tools、json_object/json_schema 结构化输出、超时、429/5xx 重试、tool calls/usage 解析和不泄露密钥的错误归一化。
+- `OpenAIStageRunner` 已把 `assemblePrompt`、Stage ACL、受限 ToolRegistry、LLM tool-call 循环和 StageArtifact 落盘串起来；因此无需 Harness 即可用 OpenAI-compatible 模型驱动单阶段，再交给现有 PipelineDriver 门禁和人工门。
 - `projectDataRoot` / `scopedPath` / `resolvePlatformRoots` 为 Harness、CLI、Web 共享租户/项目目录边界，拒绝跨项目和 `..` 路径逃逸，并统一 artifacts/checkpoints/knowledge/cases 目录。
 - `parseMarkdownKnowledge` 与 `parseDelimitedKnowledge` 支持 Markdown 章节、CSV/TSV 表格导入，统一生成 `draft` 知识条目并保留 `sourceRefs`；用例库仍由 `MarkdownCaseStore` 独立管理。
 - CLI 提供 `knowledge-import --input <file> --store <knowledge-dir> --project <projectId>`，导入先落 draft，不会绕过 P1 冲突治理直接覆盖 active 知识。

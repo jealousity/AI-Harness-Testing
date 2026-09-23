@@ -47,7 +47,7 @@ export class OpenAICompatibleClient implements LlmClient {
   async complete(request: Parameters<LlmClient['complete']>[0]): Promise<LlmResponse> {
     const model = request.model || this.defaultModel
     if (model === undefined || model.trim() === '') throw new OpenAICompatibleError('LLM model is required')
-    const signal = request.signal ?? new AbortController().signal
+    const callerSignal = request.signal ?? new AbortController().signal
     const body = {
       model,
       messages: request.messages.map(toMessage),
@@ -66,7 +66,7 @@ export class OpenAICompatibleClient implements LlmClient {
             ...this.headers,
           },
           body: JSON.stringify(body),
-          signal: combineSignals(AbortSignal.timeout(this.timeoutMs), request.signal),
+          signal: combineSignals(AbortSignal.timeout(this.timeoutMs), callerSignal),
         })
         const raw = await response.text()
         const payload = parseJson(raw)
@@ -78,7 +78,7 @@ export class OpenAICompatibleClient implements LlmClient {
             providerMessage,
           })
           if (error.retriable && attempt < this.maxRetries) {
-            await wait(backoffMs(attempt), signal)
+            await wait(backoffMs(attempt), callerSignal)
             lastError = error
             continue
           }
@@ -86,11 +86,11 @@ export class OpenAICompatibleClient implements LlmClient {
         }
         return parseResponse(payload)
       } catch (error) {
-        if (isAbortError(error, signal)) throw new OpenAICompatibleError('LLM request was cancelled or timed out', { providerMessage: 'cancelled or timed out' })
+        if (isAbortError(error, callerSignal)) throw new OpenAICompatibleError('LLM request was cancelled or timed out', { providerMessage: 'cancelled or timed out' })
         lastError = error
         if (error instanceof OpenAICompatibleError && !error.retriable) throw error
         if (attempt < this.maxRetries) {
-          await wait(backoffMs(attempt), signal)
+          await wait(backoffMs(attempt), callerSignal)
           continue
         }
       }
@@ -120,6 +120,12 @@ function toMessage(message: LlmMessage): Record<string, unknown> {
     role: message.role,
     content: message.content,
     ...(message.toolCallId === undefined ? {} : { tool_call_id: message.toolCallId }),
+    ...(message.toolName === undefined ? {} : { name: message.toolName }),
+    ...(message.toolCalls === undefined ? {} : { tool_calls: message.toolCalls.map(toolCall => ({
+      id: toolCall.id,
+      type: 'function',
+      function: { name: toolCall.name, arguments: toolCall.arguments },
+    })) }),
   }
 }
 
