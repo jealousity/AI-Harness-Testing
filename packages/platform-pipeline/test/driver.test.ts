@@ -638,3 +638,67 @@ test('产物非法 JSON 且重试耗尽：升级到人工 gateFailed，而不是
   assert.equal(outcome.stageId, 'receive')
   assert.ok(human.gateFailedCalls.includes('receive'), '重试耗尽必须走人工门 gateFailed')
 })
+
+/**
+ * 人工门等待中重启（可恢复人工门的前置条件）。
+ *
+ * 场景：进程在 `awaiting-gate` 状态退出（rejected 会保留该状态），运维裁决后重新 run。
+ * 必须**复用既有产物**直接回到门禁+人工门，而不是重新 spawn：
+ * 重新 spawn 会重复消耗模型预算，并把真人正在审核的那份产物替换成新版本。
+ */
+test('人工门等待中重启：复用既有产物，不重新 spawn、不重跑交叉检查', async () => {
+  const artifacts = new MemoryArtifacts()
+  const spawn = new MockSpawn(artifacts)
+  const human = new ScriptedHuman()
+  const review = new ScriptedReview()
+  const cp = new MemoryCheckpoint()
+  const driver = new PipelineDriver({
+    cfg: cfg(), pipelineId: 'pipe-1', root: 'artifacts/pipe-1', rulesetVersion: 'v1',
+    spawn, gates: engine(), human, artifacts, checkpoint: cp, review,
+  })
+
+  human.script = [{ stageId: 'report', decision: 'rejected' }]
+  assert.deepEqual(await driver.run(), { outcome: 'rejected', stageId: 'report' })
+  assert.equal(cp.value?.stageStates.report.status, 'awaiting-gate')
+
+  const spawnedBefore = spawn.calls.length
+  const reportReviewsBefore = review.calls.filter(id => id === 'report').length
+
+  // 裁决改为通过后重跑：应当从该门续上，而不是重做 report
+  human.script = []
+  assert.deepEqual(await driver.run(), { outcome: 'completed' })
+  assert.equal(spawn.calls.filter(c => c.stageId === 'report').length, 1, '不得重新 spawn report')
+  assert.deepEqual(
+    spawn.calls.slice(spawnedBefore).map(c => c.stageId), ['archive'],
+    '续跑只应继续推进下游，不得重做已停在门上的阶段',
+  )
+  assert.equal(
+    review.calls.filter(id => id === 'report').length, reportReviewsBefore,
+    '审核结论已随人工门任务持久化，续跑不得重复盲审',
+  )
+  assert.equal(cp.value?.stageStates.report.status, 'done')
+})
+
+test('门等待中重启但产物已丢失：回退到重新生成', async () => {
+  const artifacts = new MemoryArtifacts()
+  const spawn = new MockSpawn(artifacts)
+  const human = new ScriptedHuman()
+  const cp = new MemoryCheckpoint()
+  const driver = new PipelineDriver({
+    cfg: cfg(), pipelineId: 'pipe-1', root: 'artifacts/pipe-1', rulesetVersion: 'v1',
+    spawn, gates: engine(), human, artifacts, checkpoint: cp, review: undefined,
+  })
+
+  human.script = [{ stageId: 'report', decision: 'rejected' }]
+  assert.deepEqual(await driver.run(), { outcome: 'rejected', stageId: 'report' })
+
+  const reportPath = cp.value!.stageStates.report.artifact
+  artifacts.map.delete(reportPath)
+
+  human.script = []
+  assert.deepEqual(await driver.run(), { outcome: 'completed' })
+  assert.equal(
+    spawn.calls.filter(c => c.stageId === 'report').length, 2,
+    '产物不可读时必须回退到重新 spawn，而不是拿空产物过门禁',
+  )
+})

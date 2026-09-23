@@ -82,3 +82,22 @@ test('FileHumanGateTaskStore cancels open tasks but never overwrites a decision'
   await assert.rejects(() => store.cancel('gate-decided', 'alice'), /not cancellable/)
   assert.equal((await store.get('gate-decided'))?.status, 'approved')
 })
+
+test('FileHumanGateTaskStore consumes a decision exactly once and refuses to consume an open task', async () => {
+  const store = new FileHumanGateTaskStore(join(dir, 'gates'))
+  await store.create({
+    gateTaskId: 'gate-consume', projectId: 'demo', pipelineId: 'pipeline-1', stageId: 'analyze',
+    artifactPath: 'artifacts/pipeline-1/analyze.json', machineStatus: 'passed', machineViolations: [],
+    expiresAt: Date.now() + 10_000,
+  })
+  await assert.rejects(() => store.consume('gate-consume', 5), /not consumable/)
+
+  await store.claim('gate-consume', 'alice', 10_000)
+  await store.decide('gate-consume', 'alice', 'approved', '')
+  const consumed = await store.consume('gate-consume', 7)
+  assert.equal(consumed.consumedAt, 7)
+  assert.equal(consumed.updatedAt, 7)
+  // 重复消费是幂等的：不得把 consumedAt 推到更晚（否则审计时间线会被改写）
+  const again = await store.consume('gate-consume', 99)
+  assert.equal(again.consumedAt, 7)
+})

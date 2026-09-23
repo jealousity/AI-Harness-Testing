@@ -8,9 +8,11 @@
  *   create(pending) → 外部 actor claim/decide → 映射为 HumanDecision
  *
  * 三条硬性质：
- * 1. **可恢复**：任务先落盘再等待；进程崩溃重启后，同一 pipeline+stage+产物会重新挂上
- *    仍未决的任务继续等待，而不是重新弹一个门（也不会丢掉别人已经看到的那个门）。
- * 2. **绝不自动批准**：等待被中止（AbortSignal）、任务被外部取消、任务过期时，默认
+ * 1. **可恢复**：任务先落盘再等待。续用规则有两条——
+ *    - 未决任务：进程崩溃重启后继续等同一个门，不重复弹门；
+ *    - 已裁决但未被消费的任务：人工在流水线未运行时完成裁决，下一次 run 直接认这条结论。
+ *    裁决一旦被消费（`consumedAt`）就不再复用，因此 `changes-needed` 打回重跑会正确开新门。
+ * 2. **绝不自动批准**：等待被中止（AbortSignal / 超时）、任务被外部取消、任务过期时，默认
  *    **抛错**；只有宿主显式配置 `onAborted` / `onExpired` 才会降级为某个裁决。
  *    任何情况下都不会出现「没有人裁决却 approved」。
  * 3. **零框架依赖**：只依赖 `HumanGateTaskStore` 端口；文件实现、数据库实现均可替换。
@@ -39,16 +41,25 @@ export const DEFAULT_GATE_POLL_INTERVAL_MS = 500
 
 const DECIDED_STATUSES: readonly HumanGateTask['status'][] = ['approved', 'changes-needed', 'rejected']
 
-/** 等待被中止（信号取消，或任务被外部 cancel）。 */
-export class HumanGateAbortedError extends Error {
+const ABORT_DETAIL: Readonly<Record<'signal' | 'cancelled' | 'timeout', string>> = {
+  signal: 'waiting aborted by signal',
+  cancelled: 'gate task cancelled externally',
+  timeout: 'waiting exceeded waitTimeoutMs; task stays open for the next run',
+}
+
+/** 等待被中止（信号取消、任务被外部取消，或等待超过上限）。 */
+export class HumanGateWaitAbortedError extends Error {
   readonly gateTaskId: string
   readonly stageId: StageId
-  /** 'signal' = 等待被 AbortSignal 中止；'cancelled' = 任务被外部显式取消。 */
-  readonly reason: 'signal' | 'cancelled'
+  /**
+   * 'signal' = 等待被 AbortSignal 中止；'cancelled' = 任务被外部显式取消；
+   * 'timeout' = 等待超过 waitTimeoutMs（宿主主动让出控制权，任务仍保持未决）。
+   */
+  readonly reason: 'signal' | 'cancelled' | 'timeout'
 
-  constructor(input: { readonly gateTaskId: string; readonly stageId: StageId; readonly reason: 'signal' | 'cancelled'; readonly detail: string }) {
+  constructor(input: { readonly gateTaskId: string; readonly stageId: StageId; readonly reason: 'signal' | 'cancelled' | 'timeout'; readonly detail: string }) {
     super(`human gate ${input.stageId} aborted (${input.reason}): ${input.detail}`)
-    this.name = 'HumanGateAbortedError'
+    this.name = 'HumanGateWaitAbortedError'
     this.gateTaskId = input.gateTaskId
     this.stageId = input.stageId
     this.reason = input.reason
@@ -97,6 +108,13 @@ export interface PersistentHumanGateOptions {
   /** 轮询间隔（毫秒）；默认 500。 */
   readonly pollIntervalMs?: number
   /**
+   * 单次等待上限（毫秒）。到点仍未裁决则按 `onAborted` 处理（默认抛
+   * `HumanGateWaitAbortedError`，reason `'timeout'`），**任务保持未决**，下次调用会续上。
+   * 传 `0` = 只轮询一次就让出控制权（CLI 的「挂起等人工」模式）。
+   * 缺省不限。
+   */
+  readonly waitTimeoutMs?: number
+  /**
    * 任务创建/挂起后的回调（宿主据此通知 UI、发事件、写值班队列）。
    * 恢复既有未决任务时**不会**重复触发。
    */
@@ -125,7 +143,7 @@ export interface PersistentHumanGateOptions {
 
 type GateResolution =
   | { readonly kind: 'decided'; readonly task: HumanGateTask; readonly decision: NonNullable<HumanGateTask['decision']> }
-  | { readonly kind: 'aborted'; readonly task: HumanGateTask; readonly reason: 'signal' | 'cancelled' }
+  | { readonly kind: 'aborted'; readonly task: HumanGateTask; readonly reason: 'signal' | 'cancelled' | 'timeout' }
   | { readonly kind: 'expired'; readonly task: HumanGateTask }
   | { readonly kind: 'waiting' }
 
@@ -139,6 +157,7 @@ export class PersistentHumanGate implements HumanGatePort {
   private readonly options: PersistentHumanGateOptions
   private readonly taskTtlMs: number
   private readonly pollIntervalMs: number
+  private readonly waitTimeoutMs: number | undefined
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>
   private readonly now: () => number
   private readonly onAborted: GateDegradePolicy
@@ -152,6 +171,10 @@ export class PersistentHumanGate implements HumanGatePort {
     assertPositiveInteger(this.taskTtlMs, 'taskTtlMs')
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_GATE_POLL_INTERVAL_MS
     assertPositiveInteger(this.pollIntervalMs, 'pollIntervalMs')
+    if (options.waitTimeoutMs !== undefined && (!Number.isSafeInteger(options.waitTimeoutMs) || options.waitTimeoutMs < 0)) {
+      throw new Error('waitTimeoutMs must be a non-negative integer')
+    }
+    this.waitTimeoutMs = options.waitTimeoutMs
 
     this.options = options
     this.sleep = options.sleep ?? defaultSleep
@@ -166,6 +189,9 @@ export class PersistentHumanGate implements HumanGatePort {
 
     switch (resolution.kind) {
       case 'decided': {
+        // 先消费再返回：一条裁决只能驱动一次门。若此处之后进程崩溃、检查点尚未推进，
+        // 下一次 run 会重新开一条门再问一次——方向安全（宁可多问一次，绝不自动批准）。
+        await this.consumeTask(resolution.task)
         await this.options.onDecision?.({
           gateTaskId: resolution.task.gateTaskId,
           stageId,
@@ -177,11 +203,11 @@ export class PersistentHumanGate implements HumanGatePort {
         return resolution.decision.action
       }
       case 'aborted':
-        return this.applyAbortedPolicy(new HumanGateAbortedError({
+        return this.applyAbortedPolicy(new HumanGateWaitAbortedError({
           gateTaskId: resolution.task.gateTaskId,
           stageId,
           reason: resolution.reason,
-          detail: resolution.reason === 'signal' ? 'waiting aborted by signal' : 'gate task cancelled externally',
+          detail: ABORT_DETAIL[resolution.reason],
         }))
       case 'expired':
         return this.applyExpiredPolicy(new HumanGateExpiredError({
@@ -210,6 +236,7 @@ export class PersistentHumanGate implements HumanGatePort {
     try {
       const resolution = await this.waitForResolution(task)
       const decided = resolution.kind === 'decided' ? resolution.decision : undefined
+      if (decided !== undefined) await this.consumeTask(task)
       await this.options.onDecision?.({
         gateTaskId: task.gateTaskId,
         stageId,
@@ -234,7 +261,7 @@ export class PersistentHumanGate implements HumanGatePort {
 
   /** 续上未决任务；没有则新建。这是「可恢复」的关键：重启后不会重复弹门。 */
   private async openTask(stageId: StageId, artifact: StageArtifact, gate: JudgeResult, review?: ReviewOutcome): Promise<HumanGateTask> {
-    const resumed = await this.findOpenTask(stageId, artifact.path)
+    const resumed = await this.findResumableTask(stageId, artifact.path)
     if (resumed !== null) return resumed
 
     return this.createTask({
@@ -273,31 +300,48 @@ export class PersistentHumanGate implements HumanGatePort {
   }
 
   /**
-   * 查找本 pipeline 该阶段上仍未决的阶段门任务。
+   * 查找本 pipeline 该阶段上可续用的门任务。可续用 = 两类：
+   * - **未决**（pending/claimed 且未过期）：进程崩溃重启后继续等同一个门；
+   * - **已裁决但尚未被消费**：人工在流水线未运行时完成了裁决，下一次 run 必须认这条结论
+   *   （否则「挂起 → 裁决 → 续跑」会丢掉真人裁决，重新开一个空门）。
+   *
+   * 已消费、已过期、已取消的任务都不可续用 —— 前者防止 `changes-needed` 打回重跑空转，
+   * 后两者要求宿主显式重入而不是静默重开。
+   *
    * 要求 `machineStatus === 'passed'` 且产物路径一致：gateFailed 升级任务
    * （`failed` + 空路径）因此永远不会被 gate() 误当作阶段门。
    */
-  private async findOpenTask(stageId: StageId, artifactPath: string): Promise<HumanGateTask | null> {
+  private async findResumableTask(stageId: StageId, artifactPath: string): Promise<HumanGateTask | null> {
     const now = this.now()
     const tasks = await this.options.store.list({ pipelineId: this.options.pipelineId })
     const open = tasks.find(task => task.stageId === stageId
-      && (task.status === 'pending' || task.status === 'claimed')
       && task.machineStatus === 'passed'
       && task.artifactPath === artifactPath
-      && (task.expiresAt === undefined || task.expiresAt > now))
+      && isResumable(task, now))
     return open ?? null
+  }
+
+  /** 消费裁决，使其不能再次驱动门。 */
+  private async consumeTask(task: HumanGateTask): Promise<void> {
+    if (task.consumedAt !== undefined) return
+    await this.options.store.consume(task.gateTaskId, this.now())
   }
 
   // ── 等待与裁决 ──────────────────────────────────────────────────────────────
 
   private async waitForResolution(task: HumanGateTask): Promise<GateResolution> {
     let current = task
+    const deadline = this.waitTimeoutMs === undefined ? undefined : this.now() + this.waitTimeoutMs
     for (;;) {
       const resolution = await this.inspect(current)
       if (resolution.kind !== 'waiting') return resolution
 
       if (this.aborted()) {
         return { kind: 'aborted', task: await this.cancelTask(current, 'aborted by signal'), reason: 'signal' }
+      }
+      if (deadline !== undefined && this.now() >= deadline) {
+        // 让出控制权但**不取消任务**：裁决人仍可继续裁决，下次调用会续上等待。
+        return { kind: 'aborted', task: current, reason: 'timeout' }
       }
 
       try {
@@ -343,7 +387,7 @@ export class PersistentHumanGate implements HumanGatePort {
     return store.cancel(task.gateTaskId, 'system', note)
   }
 
-  private applyAbortedPolicy(error: HumanGateAbortedError): HumanDecision {
+  private applyAbortedPolicy(error: HumanGateWaitAbortedError): HumanDecision {
     if (this.onAborted === 'throw') throw error
     return this.onAborted
   }
@@ -367,6 +411,15 @@ function settledResolution(task: HumanGateTask): GateResolution | null {
   if (task.status === 'cancelled') return { kind: 'aborted', task, reason: 'cancelled' }
   if (task.status === 'expired') return { kind: 'expired', task }
   return null
+}
+
+/** 可续用的任务：未决且未过期，或已裁决但尚未被消费。 */
+function isResumable(task: HumanGateTask, now: number): boolean {
+  if (task.status === 'pending' || task.status === 'claimed') {
+    return task.expiresAt === undefined || task.expiresAt > now
+  }
+  if (DECIDED_STATUSES.includes(task.status)) return task.consumedAt === undefined
+  return false
 }
 
 async function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {

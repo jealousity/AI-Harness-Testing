@@ -1,6 +1,10 @@
 # 示例：ACME 支付平台测试流水线（docs/02 第 2 节 schema 草案的完整示例）
-# 用法：node packages/platform-pipeline/dist/cli.js validate --config examples/pipeline.yaml
-# 运行/重入需要宿主注入 spawner/human，通过宿主 pipeline_run 工具执行。
+# 用法：node packages/platform-pipeline/src/cli.ts validate --config examples/pipeline.yaml
+# 运行：node packages/platform-pipeline/src/cli.ts run --config examples/pipeline.yaml \
+#         --data-root <数据根> --pipeline-id <id>
+#   无 Harness 宿主由 CLI 自行装配（provider 取自下方 llm.providers，API Key 经 apiKeyEnv 注入）；
+#   遇到人工门会挂起并打印待办，用 gate-decide 裁决后再 run 一次即续跑。
+#   也可以继续通过宿主 pipeline_run 工具注入 spawner/human 执行。
 # 注："G-01..G-07" 范围记号在装载时展开（expandRuleList）。
 
 projectId: acme-pay-2026

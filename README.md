@@ -72,9 +72,14 @@ ALLOW_PRIVATE_API=1 node server.mjs
 - runtime 已提供基于原生 `fetch` 的 `OpenAICompatibleClient`：API Key 可由环境变量注入，支持 tools、json_object/json_schema 结构化输出、超时、429/5xx 重试、tool calls/usage 解析和不泄露密钥的错误归一化。
 - `OpenAIStageRunner` 已把 `assemblePrompt`、Stage ACL、受限 ToolRegistry、LLM tool-call 循环和 StageArtifact 落盘串起来；因此无需 Harness 即可用 OpenAI-compatible 模型驱动单阶段，再交给现有 PipelineDriver 门禁和人工门。
 - runtime 新增 `FileTaskStore` / `FileHumanGateTaskStore`：持久化任务状态、租约、heartbeat、过期回收和人工门 claim/decision/expiry/cancel。
-- `PersistentHumanGate` 把 driver 的阻塞式 `human.gate()` 变成**可恢复**的任务等待：先落盘 pending 任务再等待，外部 actor 通过 `claim()` + `decide()` 裁决；进程崩溃重启后，同一 pipeline+stage+产物会**续上**仍未决的门，而不是重复弹门。driver 的端口签名仍是「阻塞等裁决」，改变的是这次等待现在有持久化载体。
+- `PersistentHumanGate` 把 driver 的阻塞式 `human.gate()` 变成**可恢复**的任务等待：先落盘 pending 任务再等待，外部 actor 通过 `claim()` + `decide()` 裁决。续用规则两条——未决任务（崩溃重启后继续等同一个门）与**已裁决但未被消费**的任务（人工在流水线未运行时完成裁决，下一次 run 直接认这条结论）；裁决一旦被消费（`consumedAt`）就不再复用，因此 `changes-needed` 打回重跑会正确开新门。`waitTimeoutMs: 0` 即「只轮询一次就让出控制权」，CLI 的挂起模式依赖它。
 - 人工门的失败路径全部默认**抛错**，且降级策略在类型层排除了 `'approved'`（`GateDegradePolicy` 只有 `changes-needed` / `rejected` / `throw`）：等待被中止、任务被外部取消、任务过期都不会自动批准，宿主必须显式 opt-in 才会降级为某个裁决。
 - `gateFailed` 只落一条升级任务（`machineStatus: 'failed'` + 空产物路径），因此永远不会被 `gate()` 误当作阶段门复用；配置 `waitOnGateFailed: true` 时才阻塞等待人工确认。
+- driver 支持**在人工门上重启**：`awaiting-gate` 且产物仍可读时跳过 spawn 与重复盲审，直接复用既有产物重新过门禁并回到人工门。否则每次重启都会重复消耗模型预算，并把真人正在审核的那份产物替换成新版本（审核对象与批准对象错位）。
+- `OpenAIReviewRunner` 补齐了无 Harness 的交叉检查：`assembleReviewPrompt` → LlmClient → 只读工具循环（默认只暴露 `fs_read`）→ 结构化审核报告；findings 出现 `blocker` 时强制 `fail`（不采信模型自报的 `pass`），审核不可用一律降级 `degraded` 而不阻塞流水线。
+- `fsReadTool` / `fsWriteTool` 是阶段 prompt 要求「先写产物再结束」的落地依赖：路径相对工作区根解析并做 realpath 二次校验（拒绝绝对路径、`..` 越界和软链接逃逸），`fs_write` 只覆盖 `artifacts/<pipelineId>/`。
+- `createPlatformHost` 把上述部件按 pipeline 配置装配成可直接运行的宿主（provider 由 `LlmProviderRegistry` 选择，API Key 只从环境变量注入）；`createCheckpointHost` 只装配检查点侧能力，因此 `reenter` 一类运维操作**不需要 API Key**。
+- CLI 新增 `run` / `reenter` / `gate-list` / `gate-claim` / `gate-decide` / `gate-cancel`：`run` 遇到人工门且 `--wait-ms` 内无人裁决时打印待办并以退出码 3 结束，裁决后再执行一次 `run` 即从该门续跑（产物不重生成、审核不重跑）。
 - `projectDataRoot` / `scopedPath` / `resolvePlatformRoots` 为 Harness、CLI、Web 共享租户/项目目录边界，拒绝跨项目和 `..` 路径逃逸，并统一 artifacts/checkpoints/knowledge/cases 目录。
 - `parseMarkdownKnowledge` 与 `parseDelimitedKnowledge` 支持 Markdown 章节、CSV/TSV 表格导入，统一生成 `draft` 知识条目并保留 `sourceRefs`；用例库仍由 `MarkdownCaseStore` 独立管理。
 - CLI 提供 `knowledge-import --input <file> --store <knowledge-dir> --project <projectId>`，导入先落 draft，不会绕过 P1 冲突治理直接覆盖 active 知识。
@@ -141,6 +146,29 @@ ALLOW_PRIVATE_API=1 node server.mjs
 - 设计文档：**9 份全部定稿**，开放问题全部清零
 - 决策：**24 条全部确认**（D-01~D-20 + I-1~I-4）
 - 六阶段 prompt 模板：**全部评审通过**
-- 实现：核心编排、执行可信、知识库生命周期和通用平台基础已落地（`packages/platform-pipeline`，当前 236 项测试全绿）；方案一已提供无 Harness 的通用 runtime 端口、ScriptedStageRunner、OpenAI-compatible runner 与可恢复人工门；仍有正式非 Harness 六阶段 CLI/Web 入口、真实审核 Agent、外部存储、预算计量和跨进程 heartbeat/版本检查等生产化工作待完成
+- 实现：核心编排、执行可信、知识库生命周期和通用平台基础已落地（`packages/platform-pipeline`，当前 263 项测试全绿）；方案一已提供无 Harness 的通用 runtime 端口、OpenAI-compatible 阶段/审核 runner、可恢复人工门和 CLI 运行通道；仍有 Web 入口、`kb_query`/`case_query`/`executor_run` 等知识库与执行器工具的无 Harness 接线、跨进程文件锁、外部存储、预算计量等生产化工作待完成
 - 当前阶段按源码构建和 Harness 宿主部署，不保留过期 tgz 打包产物；provider 配置、项目作用域和知识导入已具备基础实现
 - 测试与构建需要 Node ≥ 24（`src/harness/tool-timeout.ts` 使用了 `using` 显式资源管理语法）；用更低版本运行 `node --test` 会在加载该文件时报 `SyntaxError: Unexpected identifier`，属于环境问题而非代码缺陷
+
+## 无 Harness 运行通道（CLI）
+
+```bash
+cd packages/platform-pipeline
+export PLATFORM_LLM_API_KEY=...          # 对应 pipeline.yaml 里 llm.providers.*.apiKeyEnv
+
+# 跑到第一个人工门就交还控制权（退出码 3），不阻塞终端
+node src/cli.ts run --config ../../examples/pipeline.yaml --data-root /tmp/platform-data --pipeline-id demo-1
+
+# 查看待裁决的门（含机器门禁违规、交叉检查 findings、产物路径）
+node src/cli.ts gate-list --config ../../examples/pipeline.yaml --data-root /tmp/platform-data
+
+# 裁决，然后再跑一次 run 即从该门续跑
+node src/cli.ts gate-decide --config ../../examples/pipeline.yaml --data-root /tmp/platform-data \
+  --task <gateTaskId> --actor alice --action approved --note "通过"
+
+# 回退重入（只动检查点，不需要 API Key）
+node src/cli.ts reenter --config ../../examples/pipeline.yaml --data-root /tmp/platform-data \
+  --pipeline-id demo-1 --stage design --by alice --reason "需求变更"
+```
+
+`--wait-ms <n>` 可改为阻塞等待 n 毫秒（0 或省略 = 立即挂起）。`gate-list` 默认只读，加 `--sweep` 才会把过期任务落盘为 `expired`。

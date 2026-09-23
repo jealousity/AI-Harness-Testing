@@ -39,10 +39,27 @@ export {
 export {
   DEFAULT_GATE_POLL_INTERVAL_MS,
   DEFAULT_GATE_TASK_TTL_MS,
-  HumanGateAbortedError,
+  HumanGateWaitAbortedError,
   HumanGateExpiredError,
   PersistentHumanGate,
   type GateDegradePolicy,
   type PersistentGateAuditRecord,
   type PersistentHumanGateOptions,
 } from './persistent-human-gate.ts'
+
+export { FsToolPathError, fsReadTool, fsWriteTool, type FsReadToolOptions, type FsWriteToolOptions } from './fs-tools.ts'
+
+export { DEFAULT_REVIEW_TOOLS, OpenAIReviewRunner, type OpenAIReviewRunnerOptions } from './openai-review-runner.ts'
+
+export {
+  DEFAULT_RULESET_VERSION,
+  buildGateEngine,
+  createCheckpointHost,
+  createPlatformHost,
+  gateTaskStoreDir,
+  taskStoreDir,
+  type CheckpointHost,
+  type CheckpointHostOptions,
+  type PlatformHost,
+  type PlatformHostOptions,
+} from './platform-host.ts'

@@ -111,8 +111,15 @@ export class PipelineDriver {
       const runCtx = stageRunContext(stageId, cp)
       const inputPaths = this.inputPathsOf(stageId, cp)
       const inputDigests = await this.inputDigestsOf(stageId, cp)
+
+      // 人工门等待中重启（docs/03 第 8 节）：产物已在盘上、审核结论已随人工门任务持久化，
+      // 因此**不重新 spawn**，直接复用既有产物重新过门禁并回到人工门。否则每次重启都会
+      // 重复消耗模型预算、并把已被真人审核过的产物覆盖成新版本（审核对象与批准对象错位）。
+      const parked = await this.resumableAtGate(state)
       let spawned: SpawnedRun
-      if (state.childSessionId !== undefined && this.options.spawn.waitContinuable !== undefined
+      if (parked) {
+        spawned = { stageId, artifactPath: state.artifact }
+      } else if (state.childSessionId !== undefined && this.options.spawn.waitContinuable !== undefined
           && !this.isReSpawnState(state.status)) {
         // 恢复续跑（docs/09 验证点 5）：复用既有后台 child，不重复 spawn。
         await this.options.spawn.waitContinuable(state.childSessionId, this.options.signal)
@@ -205,8 +212,10 @@ export class PipelineDriver {
       }
 
       // 2. 交叉检查（analyze/design/execute/report 开启；docs/03 第 7 节）
+      //    恢复等待中的门时不重复审核：上次的 verdict/findings 已随人工门任务持久化，
+      //    重复审核既浪费一次盲审预算，也可能让「真人正在看的那份结论」被新结论替换。
       let review: ReviewOutcome | undefined
-      if (this.options.cfg.stages[stageId]!.review.enabled && this.options.review !== undefined) {
+      if (!parked && this.options.cfg.stages[stageId]!.review.enabled && this.options.review !== undefined) {
         review = await this.options.review.run(stageId, artifact, gate)
         if (review.verdict === 'fail') {
           const retried = state.failures.filter(f => f.kind === 'review-fail').length
@@ -381,5 +390,18 @@ export class PipelineDriver {
   /** 需要重新 spawn（而非复用既有 child）的状态：门禁回喂 / 人工重入 = 全新生命周期。 */
   private isReSpawnState(status: StageState['status']): boolean {
     return status === 'needs-fix' || status === 'needs-reentry'
+  }
+
+  /**
+   * 阶段停在人工门等待中且产物仍可读 → 可以跳过 spawn 直接回到门禁+人工门。
+   * 产物被删除或损坏时返回 false，回退到正常的重新生成路径。
+   */
+  private async resumableAtGate(state: StageState): Promise<boolean> {
+    if (state.status !== 'awaiting-gate') return false
+    try {
+      return await this.options.artifacts.read(state.artifact) !== null
+    } catch {
+      return false
+    }
   }
 }

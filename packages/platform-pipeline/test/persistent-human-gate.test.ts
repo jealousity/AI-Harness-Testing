@@ -12,7 +12,7 @@ import {
   type HumanGateTaskStore,
 } from '../src/runtime/persistence.ts'
 import {
-  HumanGateAbortedError,
+  HumanGateWaitAbortedError,
   HumanGateExpiredError,
   PersistentHumanGate,
   type PersistentGateAuditRecord,
@@ -144,8 +144,9 @@ test('PersistentHumanGate resumes an open task after a restart instead of openin
   assert.equal(tasks[0]?.decision?.by, 'bob')
 })
 
-test('PersistentHumanGate opens a fresh gate when the previous one was already decided', async () => {
+test('PersistentHumanGate reuses a decided-but-unconsumed gate exactly once', async () => {
   const store = new FileHumanGateTaskStore(storeDir())
+  // 人工在流水线未运行时完成了裁决：这条结论必须被下一次 run 认领，而不是被丢弃。
   await store.create({
     gateTaskId: 'gate-old',
     projectId: 'demo',
@@ -164,17 +165,28 @@ test('PersistentHumanGate opens a fresh gate when the previous one was already d
     store,
     projectId: 'demo',
     pipelineId: 'p1',
+    waitTimeoutMs: 0,
     onPending: (task) => { opened.push(task) },
-    sleep: async () => {
-      const open = openTask(await store.list({ pipelineId: 'p1' }))
-      await store.claim(open.gateTaskId, 'bob', 60_000)
-      await store.decide(open.gateTaskId, 'bob', 'approved', '')
-    },
+    sleep: noSleep,
   })
 
-  assert.equal(await gate.gate('analyze', artifact(), passedGate()), 'approved')
-  assert.equal(opened.length, 1, 'a decided gate must not be reused')
-  assert.notEqual(opened[0]?.gateTaskId, 'gate-old')
+  assert.equal(await gate.gate('analyze', artifact(), passedGate()), 'changes-needed')
+  assert.equal(opened.length, 0, '续用既有裁决时不应新建门')
+  const tasks = await store.list({ pipelineId: 'p1' })
+  assert.equal(tasks.length, 1)
+  assert.equal(tasks[0]?.consumedAt !== undefined, true, '裁决被消费后才允许下一轮开门')
+
+  // 打回重跑后再次开门：旧裁决已消费，必须新建一条门（否则会反复命中旧裁决而空转）
+  const next = new PersistentHumanGate({
+    store,
+    projectId: 'demo',
+    pipelineId: 'p1',
+    waitTimeoutMs: 0,
+    onPending: (task) => { opened.push(task) },
+    sleep: noSleep,
+  })
+  await assert.rejects(() => next.gate('analyze', artifact(), passedGate()), HumanGateWaitAbortedError)
+  assert.equal(opened.length, 1)
   assert.equal((await store.list({ pipelineId: 'p1' })).length, 2)
 })
 
@@ -227,7 +239,7 @@ test('PersistentHumanGate aborts on signal and cancels the open task', async () 
   })
 
   await assert.rejects(() => gate.gate('analyze', artifact(), passedGate()), (error: unknown) => {
-    assert.ok(error instanceof HumanGateAbortedError)
+    assert.ok(error instanceof HumanGateWaitAbortedError)
     assert.equal(error.reason, 'signal')
     assert.equal(error.stageId, 'analyze')
     return true
@@ -267,6 +279,7 @@ test('PersistentHumanGate still aborts when the store cannot cancel', async () =
     claim: (id, actor, ttlMs) => inner.claim(id, actor, ttlMs),
     decide: (id, actor, action, note) => inner.decide(id, actor, action, note),
     expire: now => inner.expire(now),
+    consume: (id, at) => inner.consume(id, at),
   }
   const controller = new AbortController()
   const gate = new PersistentHumanGate({
@@ -278,7 +291,7 @@ test('PersistentHumanGate still aborts when the store cannot cancel', async () =
     onPending: () => { controller.abort() },
   })
 
-  await assert.rejects(() => gate.gate('analyze', artifact(), passedGate()), HumanGateAbortedError)
+  await assert.rejects(() => gate.gate('analyze', artifact(), passedGate()), HumanGateWaitAbortedError)
   const tasks = await inner.list({ pipelineId: 'p1' })
   assert.equal(tasks[0]?.status, 'pending', 'without cancel support the task is left for expiry sweep')
 })
@@ -367,4 +380,61 @@ test('PersistentHumanGate rejects invalid options', () => {
   assert.throws(() => new PersistentHumanGate({ store, projectId: 'demo', pipelineId: '' }), /pipelineId/)
   assert.throws(() => new PersistentHumanGate({ store, projectId: 'demo', pipelineId: 'p1', taskTtlMs: 0 }), /taskTtlMs/)
   assert.throws(() => new PersistentHumanGate({ store, projectId: 'demo', pipelineId: 'p1', pollIntervalMs: -1 }), /pollIntervalMs/)
+  assert.throws(() => new PersistentHumanGate({ store, projectId: 'demo', pipelineId: 'p1', waitTimeoutMs: -1 }), /waitTimeoutMs/)
+})
+
+/**
+ * CLI 的「挂起等人工」模式：waitTimeoutMs=0 只轮询一次就让出控制权。
+ * 关键性质：**任务保持未决**（不取消、不过期），裁决人仍可继续裁决。
+ */
+test('PersistentHumanGate hands control back on wait timeout without cancelling the task', async () => {
+  const store = new FileHumanGateTaskStore(storeDir())
+  const gate = new PersistentHumanGate({
+    store, projectId: 'demo', pipelineId: 'p1', waitTimeoutMs: 0, sleep: noSleep,
+  })
+
+  await assert.rejects(() => gate.gate('analyze', artifact(), passedGate()), (error: unknown) => {
+    assert.ok(error instanceof HumanGateWaitAbortedError)
+    assert.equal(error.reason, 'timeout')
+    return true
+  })
+
+  const tasks = await store.list({ pipelineId: 'p1' })
+  assert.equal(tasks.length, 1)
+  assert.equal(tasks[0]?.status, 'pending', '让出控制权不等于取消：裁决人仍可裁决')
+})
+
+test('PersistentHumanGate resumes the same task after a wait timeout and honours the decision', async () => {
+  const store = new FileHumanGateTaskStore(storeDir())
+  const parked = new PersistentHumanGate({
+    store, projectId: 'demo', pipelineId: 'p1', waitTimeoutMs: 0, sleep: noSleep,
+  })
+  await assert.rejects(() => parked.gate('analyze', artifact(), passedGate()), HumanGateWaitAbortedError)
+  const taskId = (await store.list({ pipelineId: 'p1' }))[0]!.gateTaskId
+
+  await store.claim(taskId, 'alice', 60_000)
+  await store.decide(taskId, 'alice', 'approved', '通过')
+
+  // 第二次调用（等价于运维裁决后再执行一次 run）：续上同一条任务并返回裁决
+  const resumed = new PersistentHumanGate({
+    store, projectId: 'demo', pipelineId: 'p1', waitTimeoutMs: 0, sleep: noSleep,
+    onPending: () => { throw new Error('续跑不应新建人工门任务') },
+  })
+  assert.equal(await resumed.gate('analyze', artifact(), passedGate()), 'approved')
+  assert.equal((await store.list({ pipelineId: 'p1' })).length, 1)
+})
+
+test('PersistentHumanGate returns a decision already present on the first poll (no waiting)', async () => {
+  const store = new FileHumanGateTaskStore(storeDir())
+  await store.create({
+    gateTaskId: 'gate-ready', projectId: 'demo', pipelineId: 'p1', stageId: 'analyze',
+    artifactPath: 'artifacts/p1/analyze.json', machineStatus: 'passed', machineViolations: [],
+    status: 'approved', decision: { by: 'alice', action: 'approved', note: '', at: 1 },
+    expiresAt: Date.now() + 60_000,
+  })
+  const gate = new PersistentHumanGate({
+    store, projectId: 'demo', pipelineId: 'p1', waitTimeoutMs: 0,
+    sleep: () => { throw new Error('已有裁决时不应进入等待') },
+  })
+  assert.equal(await gate.gate('analyze', artifact(), passedGate()), 'approved')
 })

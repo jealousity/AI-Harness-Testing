@@ -45,6 +45,12 @@ export interface HumanGateTask {
   readonly machineViolations: readonly { rule: string; level: 'BLOCKING' | 'WARNING'; detail: string }[]
   readonly review?: Readonly<{ verdict: string; findings: readonly string[] }>
   readonly decision?: Readonly<{ by: string; action: 'approved' | 'changes-needed' | 'rejected'; note: string; at: number }>
+  /**
+   * 裁决被编排器消费的时间。
+   * 一条裁决只能驱动一次门：消费后同一阶段再开门必须新建任务，
+   * 否则 `changes-needed` 打回重跑时会反复命中同一条旧裁决而空转。
+   */
+  readonly consumedAt?: number
   /** 显式取消记录（外部撤回 / 流水线中止）；仅 status='cancelled' 时存在。 */
   readonly cancellation?: Readonly<{ by: string; note: string; at: number }>
 }
@@ -67,6 +73,11 @@ export interface HumanGateTaskStore {
   claim(gateTaskId: string, actor: string, ttlMs: number): Promise<HumanGateTask>
   decide(gateTaskId: string, actor: string, action: 'approved' | 'changes-needed' | 'rejected', note: string): Promise<HumanGateTask>
   expire(now?: number): Promise<readonly HumanGateTask[]>
+  /**
+   * 标记裁决已被消费。**必选**：编排器靠它区分「这条裁决还没用」和「这条裁决已经驱动过一次门」，
+   * 缺了它 `changes-needed` 打回重跑会反复命中同一条旧裁决。
+   */
+  consume(gateTaskId: string, at?: number): Promise<HumanGateTask>
   /**
    * 可选：显式取消未决任务（外部撤回 / 流水线中止）。
    * 已裁决（approved/changes-needed/rejected）或已终态的任务不可取消——取消不能覆盖真人裁决。
@@ -178,6 +189,15 @@ export class FileHumanGateTaskStore implements HumanGateTaskStore {
     const expired: HumanGateTask[] = []
     for (const task of candidates) expired.push(await this.save({ ...task, status: 'expired', updatedAt: now, lease: undefined }))
     return expired
+  }
+
+  async consume(gateTaskId: string, at = Date.now()): Promise<HumanGateTask> {
+    const current = await requireValue(this.get(gateTaskId), `human gate task not found: ${gateTaskId}`)
+    if (current.consumedAt !== undefined) return current
+    if (!['approved', 'changes-needed', 'rejected'].includes(current.status)) {
+      throw new Error(`human gate task is not consumable: ${current.status}`)
+    }
+    return this.save({ ...current, consumedAt: at, updatedAt: at })
   }
 
   async cancel(gateTaskId: string, actor: string, note = ''): Promise<HumanGateTask> {
