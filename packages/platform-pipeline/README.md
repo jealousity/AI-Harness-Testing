@@ -29,11 +29,12 @@
 | `provider-registry.ts` | 通用 OpenAI-compatible provider 声明、环境变量密钥检查与能力选择 | 平台化 |
 | `platform-scope.ts` | tenant/project/environment 作用域和安全数据目录 | 平台化 |
 | `knowledge-import.ts` | Markdown 章节、CSV/TSV 表格导入为 draft 知识条目 | 平台化 |
+| `runtime/` | 无 Harness 的 StageRunner / LlmClient / ToolRegistry / HumanGate 端口与 ScriptedStageRunner | 方案一 |
 
 ## 使用
 
 ```bash
-npm install        # 依赖（yaml 运行时；@deepseek-ai/* 由 Harness 宿主提供）
+npm install        # 通用核心只需 yaml；Harness 适配器依赖作为开发依赖保留
 npm test           # node --test（原生 TS，Node >= 24）
 npm run typecheck  # tsc --noEmit
 npm run cli -- validate --config ../../examples/pipeline.yaml   # 配置自检
@@ -73,6 +74,6 @@ await ctx.plugin(platformPipelineHost, {
 ## 状态
 
 - 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）
-- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **210 项测试全绿**
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **213 项测试全绿**
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
-- 当前阶段不生成 tgz 打包产物；按源码构建，由 Harness 宿主提供运行时依赖和 API Key
+- 当前阶段不生成 tgz 打包产物；通用核心默认入口不加载 Harness 适配层，Harness 宿主代码通过 `platform-pipeline/harness` 与 `platform-pipeline/harness-plugin` 可选子路径使用。

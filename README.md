@@ -68,6 +68,7 @@ ALLOW_PRIVATE_API=1 node server.mjs
 - `LlmProviderRegistry` 负责 provider 选择、环境变量检查和 tools/structuredOutput/streaming/continuation 能力校验；平台核心不直接发起模型请求。
 - `resolveHarnessHostRuntime` 已接入 `harness/host-plugin.ts`：设置 `dataRoot` 后，Harness 宿主启动会自动选择 provider、校验 API Key/能力并计算项目存储根；显式 `artifactsRoot`/`checkpointRoot` 仍兼容旧单项目宿主。
 - `minimal-host.ts` 支持 `E2E_PIPELINE_CONFIG`，可以从外部项目 YAML 读取 `llm.providers`，将 baseUrl/model/apiKeyEnv 配置传给 Harness LLM 适配器；未指定时才使用历史 e2e fallback。
+- 方案一已落地：新增无 Harness 依赖的 `runtime` 端口（StageRunner、LlmClient、ToolRegistry、HumanGate）与 `ScriptedStageRunner`，可以仅用 PipelineDriver + 文件存储完成六阶段回归；默认包入口不再导出/加载 Harness 适配层，Harness 代码通过 `platform-pipeline/harness` 与 `platform-pipeline/harness-plugin` 可选子路径使用。
 - `projectDataRoot` / `scopedPath` / `resolvePlatformRoots` 为 Harness、CLI、Web 共享租户/项目目录边界，拒绝跨项目和 `..` 路径逃逸，并统一 artifacts/checkpoints/knowledge/cases 目录。
 - `parseMarkdownKnowledge` 与 `parseDelimitedKnowledge` 支持 Markdown 章节、CSV/TSV 表格导入，统一生成 `draft` 知识条目并保留 `sourceRefs`；用例库仍由 `MarkdownCaseStore` 独立管理。
 - CLI 提供 `knowledge-import --input <file> --store <knowledge-dir> --project <projectId>`，导入先落 draft，不会绕过 P1 冲突治理直接覆盖 active 知识。
@@ -134,5 +135,5 @@ ALLOW_PRIVATE_API=1 node server.mjs
 - 设计文档：**9 份全部定稿**，开放问题全部清零
 - 决策：**24 条全部确认**（D-01~D-20 + I-1~I-4）
 - 六阶段 prompt 模板：**全部评审通过**
-- 实现：核心编排、执行可信、知识库生命周期和通用平台基础已落地（`packages/platform-pipeline`，当前 210 项测试全绿）；仍有正式宿主启动器、外部存储、预算计量和跨进程 heartbeat/版本检查等生产化工作待完成
+- 实现：核心编排、执行可信、知识库生命周期和通用平台基础已落地（`packages/platform-pipeline`，当前 213 项测试全绿）；方案一已提供无 Harness 的通用 runtime 端口和 ScriptedStageRunner；仍有正式非 Harness LLM/Agent runner、外部存储、预算计量和跨进程 heartbeat/版本检查等生产化工作待完成
 - 当前阶段按源码构建和 Harness 宿主部署，不保留过期 tgz 打包产物；provider 配置、项目作用域和知识导入已具备基础实现

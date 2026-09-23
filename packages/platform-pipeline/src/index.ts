@@ -130,20 +130,6 @@ export {
 export type { InputLocks, StageArtifact } from './types.ts'
 
 export {
-  HarnessReviewRunner,
-  HarnessStageSpawner,
-  REVIEW_OUTPUT_SCHEMA,
-  toContentBlocks,
-  toToolRestriction,
-  type HarnessReviewDeps,
-  type HarnessSpawnerDeps,
-  resolveHarnessHostRuntime,
-  type HarnessHostRuntime,
-  type HarnessHostRuntimeInput,
-  type HarnessHostStorageInput,
-} from './harness/index.ts'
-
-export {
   PipelineDriver,
   type ArtifactStore,
   type CheckpointPort,
@@ -274,7 +260,21 @@ export {
 } from './plugin.ts'
 
 export {
-  apply as harnessHostPlugin,
-  HOST_PLUGIN_BUILD,
-  type HostPluginConfig,
-} from './harness/host-plugin.ts'
+  CallbackHumanGate,
+  CallbackReviewRunner,
+  InMemoryToolRegistry,
+  ScriptedStageRunner,
+  ToolAccessError,
+  executeTool,
+  type HumanDecisionFactory,
+  type LlmClient,
+  type LlmMessage,
+  type LlmResponse,
+  type LlmToolCall,
+  type ScriptedContentFactory,
+  type StageRunner,
+  type ToolDefinition,
+  type ToolExecutionContext,
+  type ToolFilter as RuntimeToolFilter,
+  type ToolRegistry,
+} from './runtime/index.ts'
