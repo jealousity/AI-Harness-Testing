@@ -45,6 +45,8 @@ export interface HumanGateTask {
   readonly machineViolations: readonly { rule: string; level: 'BLOCKING' | 'WARNING'; detail: string }[]
   readonly review?: Readonly<{ verdict: string; findings: readonly string[] }>
   readonly decision?: Readonly<{ by: string; action: 'approved' | 'changes-needed' | 'rejected'; note: string; at: number }>
+  /** 显式取消记录（外部撤回 / 流水线中止）；仅 status='cancelled' 时存在。 */
+  readonly cancellation?: Readonly<{ by: string; note: string; at: number }>
 }
 
 export interface TaskStore {
@@ -65,6 +67,11 @@ export interface HumanGateTaskStore {
   claim(gateTaskId: string, actor: string, ttlMs: number): Promise<HumanGateTask>
   decide(gateTaskId: string, actor: string, action: 'approved' | 'changes-needed' | 'rejected', note: string): Promise<HumanGateTask>
   expire(now?: number): Promise<readonly HumanGateTask[]>
+  /**
+   * 可选：显式取消未决任务（外部撤回 / 流水线中止）。
+   * 已裁决（approved/changes-needed/rejected）或已终态的任务不可取消——取消不能覆盖真人裁决。
+   */
+  cancel?(gateTaskId: string, actor: string, note?: string): Promise<HumanGateTask>
 }
 
 export class FileTaskStore implements TaskStore {
@@ -171,6 +178,15 @@ export class FileHumanGateTaskStore implements HumanGateTaskStore {
     const expired: HumanGateTask[] = []
     for (const task of candidates) expired.push(await this.save({ ...task, status: 'expired', updatedAt: now, lease: undefined }))
     return expired
+  }
+
+  async cancel(gateTaskId: string, actor: string, note = ''): Promise<HumanGateTask> {
+    if (actor.trim() === '') throw new Error('cancellation actor must not be empty')
+    const current = await requireValue(this.get(gateTaskId), `human gate task not found: ${gateTaskId}`)
+    if (!['pending', 'claimed'].includes(current.status)) throw new Error(`human gate task is not cancellable: ${current.status}`)
+    const { lease: _lease, ...withoutLease } = current
+    const now = Date.now()
+    return this.save({ ...withoutLease, status: 'cancelled', cancellation: { by: actor, note, at: now }, updatedAt: now, lease: undefined })
   }
 
   private path(gateTaskId: string): string { return join(this.dir, `${safeId(gateTaskId)}.json`) }

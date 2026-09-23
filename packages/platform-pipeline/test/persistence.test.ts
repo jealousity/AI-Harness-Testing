@@ -59,3 +59,26 @@ test('FileHumanGateTaskStore expires pending tasks and rejects expired decisions
   assert.equal(expired[0]?.status, 'expired')
   await assert.rejects(() => store.claim('gate-expired', 'alice', 1000), /not claimable/)
 })
+
+test('FileHumanGateTaskStore cancels open tasks but never overwrites a decision', async () => {
+  const store = new FileHumanGateTaskStore(join(dir, 'gates'))
+  await store.create({
+    gateTaskId: 'gate-cancel', projectId: 'demo', pipelineId: 'pipeline-1', stageId: 'design', artifactPath: 'artifacts/pipeline-1/design.json',
+    machineStatus: 'passed', machineViolations: [], expiresAt: Date.now() + 10_000,
+  })
+  const cancelled = await store.cancel('gate-cancel', 'alice', '需求撤回')
+  assert.equal(cancelled.status, 'cancelled')
+  assert.equal(cancelled.cancellation?.by, 'alice')
+  assert.equal(cancelled.cancellation?.note, '需求撤回')
+  assert.equal(cancelled.lease, undefined)
+  await assert.rejects(() => store.cancel('gate-cancel', 'alice'), /not cancellable/)
+  await assert.rejects(() => store.cancel('gate-cancel', '  '), /actor must not be empty/)
+
+  await store.create({
+    gateTaskId: 'gate-decided', projectId: 'demo', pipelineId: 'pipeline-1', stageId: 'design', artifactPath: 'artifacts/pipeline-1/design.json',
+    machineStatus: 'passed', machineViolations: [], status: 'approved',
+    decision: { by: 'bob', action: 'approved', note: '', at: Date.now() },
+  })
+  await assert.rejects(() => store.cancel('gate-decided', 'alice'), /not cancellable/)
+  assert.equal((await store.get('gate-decided'))?.status, 'approved')
+})

@@ -35,3 +35,14 @@ export {
   type HumanDecisionFactory,
   type ScriptedContentFactory,
 } from './scripted-runtime.ts'
+
+export {
+  DEFAULT_GATE_POLL_INTERVAL_MS,
+  DEFAULT_GATE_TASK_TTL_MS,
+  HumanGateAbortedError,
+  HumanGateExpiredError,
+  PersistentHumanGate,
+  type GateDegradePolicy,
+  type PersistentGateAuditRecord,
+  type PersistentHumanGateOptions,
+} from './persistent-human-gate.ts'
