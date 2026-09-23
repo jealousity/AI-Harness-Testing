@@ -23,6 +23,24 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve as resolvePath } from 'node:path'
 
 import { artifactPath, loadCheckpoint } from '../checkpoint.ts'
+import {
+  DEFAULT_DOCUMENT_LIMITS,
+  DOCUMENT_DIAGNOSTIC_CODES,
+  SUPPORTED_DOCUMENT_FORMATS,
+  diagnostic,
+  defaultParserRegistry,
+  isSupportedDocumentFormat,
+  projectKnowledge,
+  type DocumentDiagnostic,
+  type DocumentLimits,
+  type DocumentParserRegistry,
+  type ParsedDocumentLimits,
+  type ParsedSection,
+  type ParsedTable,
+  type ParseStatus,
+  type ContentConfidence,
+  type SupportedDocumentFormat,
+} from '../documents/index.ts'
 import { runDiag, type DiagProbe, type DiagSpec } from '../executor/env-diag.ts'
 import { HttpExecutor, type HttpCase, type HttpRequestFn, type HttpStep } from '../executor/http.ts'
 import type { ExecutionSession } from '../executor/executor.ts'
@@ -37,10 +55,10 @@ import {
 import { WorkspaceScope } from './fs-tools.ts'
 import type { ToolDefinition } from './ports.ts'
 
-/** 单次工具调用可读文档上限（超出显式标记截断，不静默丢内容）。 */
-const DEFAULT_MAX_DOCUMENT_BYTES = 512 * 1024
-/** 表格工具最多返回的数据行数（含表头）。 */
-const DEFAULT_MAX_TABLE_ROWS = 2000
+/** `parse_doc` 默认单文档字节上限（与 documents 模块的 `maxFileBytes` 默认值同源）。 */
+const DEFAULT_MAX_DOCUMENT_BYTES = DEFAULT_DOCUMENT_LIMITS.maxFileBytes
+/** `parse_doc` 生成 draft 知识条目时的默认条目上限。 */
+const DEFAULT_MAX_DRAFT_ENTRIES = 200
 const DEFAULT_KB_LIMIT = 8
 const MAX_KB_LIMIT = 50
 
@@ -73,8 +91,16 @@ export interface PlatformToolContext {
   readonly env?: Readonly<Record<string, string | undefined>>
   /** 注入 HTTP 传输（测试用本地服务器；默认 globalThis.fetch）。 */
   readonly request?: HttpRequestFn
+  /** `parse_doc` 单文档字节上限；缺省 = `DEFAULT_DOCUMENT_LIMITS.maxFileBytes`。 */
   readonly maxDocumentBytes?: number
+  /** `parse_doc` 表格行数上限；缺省 = `DEFAULT_DOCUMENT_LIMITS.maxTableRows`。 */
   readonly maxTableRows?: number
+  /**
+   * 注入解析器注册表（测试与"替换解析实现"用）。
+   * 缺省用 `defaultParserRegistry()`——CLI / Web / Harness 必须共用同一份内置注册表
+   * （docs/10 §5.6.11 第 9 条），因此这里只在显式注入时才偏离默认。
+   */
+  readonly documentRegistry?: DocumentParserRegistry
 }
 
 /** 执行会话落盘路径约定（`executor_run` 与 `ExecutionLoader` 共用）。 */
@@ -118,13 +144,11 @@ export async function loadExecutionSession(
 
 /** 构造平台标准工具集（顺序即 ACL 目录顺序）。 */
 export function buildPlatformTools(ctx: PlatformToolContext): readonly ToolDefinition[] {
-  const maxDocBytes = ctx.maxDocumentBytes ?? DEFAULT_MAX_DOCUMENT_BYTES
-  const maxTableRows = ctx.maxTableRows ?? DEFAULT_MAX_TABLE_ROWS
   const knowledge = ctx.knowledgeRoot === undefined ? undefined : new MarkdownKnowledgeStore(ctx.knowledgeRoot)
   const cases = ctx.casesRoot === undefined ? undefined : new MarkdownCaseStore(ctx.casesRoot)
 
   return [
-    parseDocTool(ctx, maxDocBytes, maxTableRows),
+    parseDocTool(ctx),
     kbQueryTool(ctx, knowledge),
     kbWriteTool(ctx, knowledge),
     caseQueryTool(ctx, cases),
@@ -138,122 +162,259 @@ export function buildPlatformTools(ctx: PlatformToolContext): readonly ToolDefin
 
 // ── parse_doc ────────────────────────────────────────────────────────────────
 
-/** 文本族扩展名（按原文返回）与表格族（结构化解析）。二进制文档显式不支持。 */
-const TEXT_EXTENSIONS = new Set(['.md', '.markdown', '.mdx', '.txt', '.log', '.rst', '.adoc', '.yaml', '.yml'])
-const TABLE_EXTENSIONS: Readonly<Record<string, string>> = { '.csv': ',', '.tsv': '\t', '.tab': '\t' }
-/** 已知但当前不支持的二进制格式：显式报错，避免模型把二进制当文本读成乱码。 */
-const KNOWN_BINARY_EXTENSIONS = new Set(['.xlsx', '.xls', '.docx', '.doc', '.pptx', '.ppt', '.pdf', '.zip', '.png', '.jpg', '.jpeg'])
-
+/** `parse_doc` 入参（docs/10 §5.6.6）。字段全是 `unknown`，逐个显式校验。 */
 interface ParseDocArgs {
   readonly path?: unknown
+  readonly formatHint?: unknown
+  readonly includeTables?: unknown
+  readonly includeMetadata?: unknown
+  readonly sheetNames?: unknown
+  readonly includeHiddenSheets?: unknown
+  readonly pageRange?: unknown
+  readonly projectKnowledge?: unknown
 }
 
-interface ParseDocResult {
-  readonly path: string
-  readonly format: 'text' | 'table' | 'json' | 'unsupported'
-  readonly text?: string
-  readonly rows?: readonly (readonly string[])[]
-  readonly truncated?: boolean
+/**
+ * `parse_doc` 返回结构（docs/10 §5.6.6）。
+ *
+ * **`available` 与 `status` 是两件事**：
+ * - `available: false` = 本次调用没有得到可信的文档结果（路径越界 / 文件不存在 / 读取失败）；
+ * - `available: true` = 注册表完成了工作，结果质量由 `status` 说明。因此
+ *   `available: true` **不等于** "解析成功"：`unsupported` / `parse-failed` 同样是
+ *   `available: true`，只是没有任何可用内容。
+ *
+ * 这层区分是必须的：模型看到 `available: true` 才不会把"宿主没有这个能力"误读成
+ * "文档里没有这段内容"（与 `kb_query` 的 `available: false` 同一条原则）。
+ */
+export interface ParseDocToolResult {
+  readonly available: boolean
+  readonly status: ParseStatus
+  readonly format: SupportedDocumentFormat | 'unknown'
+  readonly fileName: string
+  readonly sha256?: string
+  readonly confidence?: ContentConfidence
+  readonly pageCount?: number
+  readonly sheetNames?: readonly string[]
+  readonly metadata?: Readonly<Record<string, string | number | boolean | null>>
+  readonly sections: readonly ParsedSection[]
+  readonly tables: readonly ParsedTable[]
+  readonly plainText: string
+  /** 全部 section/table 的位置引用，便于模型直接引用来源（docs/10 §10 P0-A1）。 */
+  readonly sourceRefs: readonly string[]
+  readonly diagnostics: readonly DocumentDiagnostic[]
+  readonly limits?: ParsedDocumentLimits
+  /** `projectKnowledge: true` 时生成的 **draft** 候选条目；永不写入知识库。 */
+  readonly draftEntries?: readonly KnowledgeEntry[]
+  readonly draftWarnings?: readonly string[]
   readonly error?: string
 }
 
-function parseDocTool(ctx: PlatformToolContext, maxBytes: number, maxRows: number): ToolDefinition<ParseDocArgs, ParseDocResult> {
-  const scope = new WorkspaceScope(ctx.projectRoot)
+/** 共享解析入口的参数：CLI/Web（本模块）与 Harness 侧 `stage-tools` 都用它。 */
+export interface ParseDocumentToolOptions {
+  /** 工作区根（绝对路径）；路径包含性校验的唯一基准。 */
+  readonly projectRoot: string
+  readonly signal: AbortSignal
+  /** 当前项目 id；只有它存在时才允许生成 draft（知识条目必须绑定项目）。 */
+  readonly projectId?: string
+  /** 当前流水线 id；写入 draft 的 `sourcePipeline`，使其可直接提交 `kb_write`。 */
+  readonly pipelineId?: string
+  readonly limits?: Partial<DocumentLimits>
+  readonly registry?: DocumentParserRegistry
+  readonly maxDraftEntries?: number
+}
+
+/**
+ * 按 docs/10 §5.6.3 的职责边界解析工作区文档：
+ * 校验参数与路径 → 调注册表 → 序列化为 tool result →（可选）投影 draft。
+ *
+ * **不处理任何格式细节**（OOXML / PDF / Excel 全在 `documents/` 里），因此换解析库
+ * 不会改动工具契约。本函数也**不为入参错误抛异常**：路径越界与读取失败一律返回
+ * `available: false` + 结构化诊断（docs/10 §5.6.6「错误响应必须结构化」）。
+ */
+export async function parseWorkspaceDocument(
+  args: unknown,
+  options: ParseDocumentToolOptions,
+): Promise<ParseDocToolResult> {
+  const raw = (args ?? {}) as Record<string, unknown>
+  const requested = typeof raw.path === 'string' ? raw.path.trim() : ''
+  const label = normalizeRelativePath(requested)
+
+  const scope = new WorkspaceScope(options.projectRoot)
+  let target: string
+  try {
+    target = await scope.existingFile(requested)
+  } catch (error) {
+    return unavailableResult(label, errorMessage(error))
+  }
+
+  let bytes: Uint8Array
+  try {
+    bytes = new Uint8Array(await readFile(target))
+  } catch (error) {
+    return unavailableResult(label, `读取文档失败：${errorMessage(error)}`)
+  }
+
+  const includeTables = raw.includeTables !== false
+  const includeMetadata = raw.includeMetadata !== false
+  const formatHint = isSupportedDocumentFormat(raw.formatHint) ? raw.formatHint : undefined
+  const sheetNames = stringArray(raw.sheetNames)
+  const pageRange = pageRangeOf(raw.pageRange)
+
+  const registry = options.registry ?? defaultParserRegistry()
+  const doc = await registry.parse({
+    path: label,
+    absolutePath: target,
+    bytes,
+    ...(formatHint === undefined ? {} : { formatHint }),
+    includeTables,
+    includeMetadata,
+    // 原始字节永不回给模型（docs/10 §5.6.8「默认不向模型发送原始二进制」）。
+    includeRawSource: false,
+    ...(sheetNames.length === 0 ? {} : { sheetNames }),
+    includeHiddenSheets: raw.includeHiddenSheets === true,
+    ...(pageRange === undefined ? {} : { pageRange }),
+    ...(options.limits === undefined ? {} : { limits: options.limits }),
+    signal: options.signal,
+  })
+
+  const diagnostics: DocumentDiagnostic[] = [...doc.diagnostics]
+  let draftEntries: readonly KnowledgeEntry[] | undefined
+  let draftWarnings: readonly string[] | undefined
+
+  if (raw.projectKnowledge === true) {
+    const project = options.projectId?.trim() ?? ''
+    if (project === '') {
+      diagnostics.push(diagnostic(
+        DOCUMENT_DIAGNOSTIC_CODES.parserFailed,
+        'warning',
+        '宿主未配置 projectId，无法生成 draft 知识条目；本次只返回解析结构。',
+        label,
+      ))
+    } else {
+      const projection = projectKnowledge(doc, {
+        project,
+        ...(options.pipelineId === undefined ? {} : { sourcePipeline: options.pipelineId }),
+        maxEntries: options.maxDraftEntries ?? DEFAULT_MAX_DRAFT_ENTRIES,
+      })
+      draftEntries = projection.entries
+      draftWarnings = projection.warnings
+    }
+  }
+
+  return {
+    available: true,
+    status: doc.status,
+    format: doc.format,
+    fileName: doc.fileName,
+    sha256: doc.sha256,
+    confidence: doc.confidence,
+    ...(doc.pageCount === undefined ? {} : { pageCount: doc.pageCount }),
+    ...(doc.sheetNames === undefined ? {} : { sheetNames: doc.sheetNames }),
+    ...(includeMetadata ? { metadata: doc.metadata } : {}),
+    sections: doc.sections,
+    tables: includeTables ? doc.tables : [],
+    plainText: doc.plainText,
+    sourceRefs: uniqueRefs(doc.sections, includeTables ? doc.tables : []),
+    diagnostics,
+    limits: doc.limits,
+    ...(draftEntries === undefined ? {} : { draftEntries }),
+    ...(draftWarnings === undefined ? {} : { draftWarnings }),
+  }
+}
+
+/** 无法得到可信结果时的结构化失败（`available: false`，绝不伪装成 `parsed`）。 */
+function unavailableResult(path: string, message: string): ParseDocToolResult {
+  return {
+    available: false,
+    status: 'parse-failed',
+    format: 'unknown',
+    fileName: path.split('/').pop() ?? path,
+    sections: [],
+    tables: [],
+    plainText: '',
+    sourceRefs: [],
+    diagnostics: [diagnostic(DOCUMENT_DIAGNOSTIC_CODES.parserFailed, 'error', message, path)],
+    error: message,
+  }
+}
+
+function parseDocTool(ctx: PlatformToolContext): ToolDefinition<ParseDocArgs, ParseDocToolResult> {
+  const limits: Partial<DocumentLimits> = {
+    maxFileBytes: ctx.maxDocumentBytes ?? DEFAULT_MAX_DOCUMENT_BYTES,
+    maxTableRows: ctx.maxTableRows ?? DEFAULT_DOCUMENT_LIMITS.maxTableRows,
+  }
   return {
     name: 'parse_doc',
     description:
-      '解析工作区内的项目文档并返回可用文本。支持 md/markdown/txt/log/yaml 等文本族、'
-      + 'csv/tsv 表格（结构化 rows）与 json；xlsx/docx/pdf 等二进制格式当前不支持，会显式报错。',
+      '解析工作区内的项目文档并返回**结构化**结果：sections（标题层级/段落/页码）、tables（表头与数据行）、'
+      + 'plainText（供检索）、diagnostics（结构化诊断）与 limits（截断情况）。'
+      + `支持 ${SUPPORTED_DOCUMENT_FORMATS.join(' / ')}；`
+      + '.doc/.xls 老二进制格式与未安装解析器的格式会返回 status=unsupported 并说明缺失能力，'
+      + '绝不会把二进制当文本读出乱码。sourceRefs 可直接用于引用来源位置。'
+      + 'projectKnowledge=true 时额外返回 draft 候选知识条目（仅 draft；active 写入需走人工门）。',
     parameters: {
       type: 'object',
       additionalProperties: false,
       required: ['path'],
-      properties: { path: { type: 'string', description: '相对工作区根的文档路径' } },
+      properties: {
+        path: { type: 'string', description: '相对工作区根的文档路径' },
+        formatHint: { type: 'string', enum: [...SUPPORTED_DOCUMENT_FORMATS], description: '格式提示；与 magic bytes 冲突时以文件内容为准' },
+        includeTables: { type: 'boolean', description: '是否返回结构化表格，默认 true' },
+        includeMetadata: { type: 'boolean', description: '是否返回文档元数据，默认 true' },
+        sheetNames: { type: 'array', items: { type: 'string' }, description: '只读取指定 sheet（Excel）' },
+        includeHiddenSheets: { type: 'boolean', description: '是否读取隐藏 sheet（Excel），默认 false' },
+        pageRange: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { from: { type: 'integer' }, to: { type: 'integer' } },
+          description: '只读取指定页码范围（PDF）',
+        },
+        projectKnowledge: { type: 'boolean', description: '是否生成 draft 候选知识条目，默认 false' },
+      },
     },
     async execute(args, context) {
       assertNotAborted(context.signal)
-      const label = typeof args?.path === 'string' ? args.path : ''
-      const target = await scope.existingFile(args?.path)
-      const extension = extensionOf(target)
-      if (KNOWN_BINARY_EXTENSIONS.has(extension)) {
-        return {
-          path: label,
-          format: 'unsupported',
-          error: `不支持解析 ${extension} 二进制文档：请先转换为 markdown / csv / txt 后再导入（当前宿主不内置 Office/PDF 解析器）。`,
-        }
-      }
-      const raw = await readFile(target, 'utf8')
-      const text = stripBom(raw)
-      const truncated = Buffer.byteLength(text, 'utf8') > maxBytes
-      const body = truncated ? text.slice(0, maxBytes) : text
-      const delimiter = TABLE_EXTENSIONS[extension]
-      if (delimiter !== undefined) {
-        const table = parseDelimited(body, delimiter, maxRows)
-        return {
-          path: label,
-          format: 'table',
-          rows: table.rows,
-          ...(truncated || table.truncated ? { truncated: true } : {}),
-        }
-      }
-      if (extension === '.json') {
-        try {
-          return { path: label, format: 'json', text: JSON.stringify(JSON.parse(body), null, 2) }
-        } catch (error) {
-          // 非法 JSON 不当成"解析成功"：退回原文并显式说明，避免模型基于半截结构推理。
-          return {
-            path: label,
-            format: 'text',
-            text: body,
-            error: `文件不是合法 JSON（${errorMessage(error)}），已按原文返回。`,
-          }
-        }
-      }
-      if (TEXT_EXTENSIONS.has(extension) || extension === '') {
-        return { path: label, format: 'text', text: body, ...(truncated ? { truncated: true } : {}) }
-      }
-      return {
-        path: label,
-        format: 'unsupported',
-        error: `不支持解析 ${extension} 文档：当前支持 ${[...TEXT_EXTENSIONS, ...Object.keys(TABLE_EXTENSIONS), '.json'].join(' / ')}。`,
-      }
+      return await parseWorkspaceDocument(args, {
+        projectRoot: ctx.projectRoot,
+        signal: context.signal,
+        ...(ctx.projectId === undefined ? {} : { projectId: ctx.projectId }),
+        pipelineId: ctx.pipelineId,
+        limits,
+        ...(ctx.documentRegistry === undefined ? {} : { registry: ctx.documentRegistry }),
+      })
     },
   }
 }
 
-/** RFC4180 风格分隔符解析：支持引号包裹、双引号转义与 CRLF。 */
-function parseDelimited(text: string, delimiter: string, maxRows: number): { rows: string[][]; truncated: boolean } {
-  const rows: string[][] = []
-  let row: string[] = []
-  let field = ''
-  let quoted = false
-  let truncated = false
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index]!
-    if (quoted) {
-      if (char !== '"') { field += char; continue }
-      if (text[index + 1] === '"') { field += '"'; index += 1; continue }
-      quoted = false
-      continue
-    }
-    if (char === '"') { quoted = true; continue }
-    if (char === delimiter) { row.push(field); field = ''; continue }
-    if (char === '\r') continue
-    if (char === '\n') {
-      row.push(field)
-      rows.push(row)
-      row = []
-      field = ''
-      if (rows.length >= maxRows) { truncated = true; break }
-      continue
-    }
-    field += char
-  }
-  if (!truncated && (field !== '' || row.length > 0)) {
-    row.push(field)
-    rows.push(row)
-  }
-  return { rows, truncated }
+/** section/table 的 sourceRef 去重（保持首次出现顺序）。 */
+function uniqueRefs(sections: readonly ParsedSection[], tables: readonly ParsedTable[]): string[] {
+  return [...new Set([...sections.map(section => section.sourceRef), ...tables.map(table => table.sourceRef)])]
+}
+
+/**
+ * 归一化模型传入的相对路径，用作 sourceRef 前缀。
+ *
+ * 只做纯文本归一（反斜杠→斜杠、去 `./`、折叠 `//`、去尾 `/`）：**不**参与实际路径
+ * 解析——真实路径由 `WorkspaceScope` 的 realpath 包含性校验决定，两者职责不重叠。
+ */
+function normalizeRelativePath(path: string): string {
+  return path.replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/{2,}/g, '/').replace(/\/+$/, '')
+}
+
+/** 页码区间入参校验：只接受正整数，非法值直接忽略（不猜测模型意图）。 */
+function pageRangeOf(value: unknown): { from?: number; to?: number } | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const raw = value as Record<string, unknown>
+  const from = positiveInteger(raw.from)
+  const to = positiveInteger(raw.to)
+  if (from === undefined && to === undefined) return undefined
+  return { ...(from === undefined ? {} : { from }), ...(to === undefined ? {} : { to }) }
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+  const truncated = Math.trunc(value)
+  return truncated >= 1 ? truncated : undefined
 }
 
 // ── 知识库 / 用例库 ───────────────────────────────────────────────────────────
@@ -703,16 +864,6 @@ function gateCheckTool(ctx: PlatformToolContext): ToolDefinition<GateCheckArgs, 
 /** 证据目录作用域（每次新建：目录可能尚未创建，realpath 需先 mkdir）。 */
 function evidenceScope(evidenceDir: string): WorkspaceScope {
   return new WorkspaceScope(resolvePath(evidenceDir))
-}
-
-function extensionOf(path: string): string {
-  const base = path.slice(path.lastIndexOf('/') + 1)
-  const dot = base.lastIndexOf('.')
-  return dot <= 0 ? '' : base.slice(dot).toLowerCase()
-}
-
-function stripBom(text: string): string {
-  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text
 }
 
 function stringArray(value: unknown): string[] {

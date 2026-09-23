@@ -28,6 +28,11 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SubagentRuntime } from '@deepseek-ai/dsh-subagent'
+// 仅用于激活模块增强：`ctx.userQuestions` 由 dsh-user-questions 对 cordis `Context`
+// 的 declaration merging 提供。此前这行不存在，类型是靠 `src/e2e/minimal-host.ts`
+// 顺带 import 了同一个包才"碰巧"可用的——把 e2e 从构建里排除后立刻编译失败。
+// 依赖必须由使用者自己声明，不能依赖测试宿主捎带。
+import type {} from '@deepseek-ai/dsh-user-questions'
 import { loadPipelineConfig } from '../config.ts'
 import { acquirePipelineLock } from '../checkpoint-lock.ts'
 import { FsArtifactStore, FsCheckpointPort } from '../stores/fs.ts'

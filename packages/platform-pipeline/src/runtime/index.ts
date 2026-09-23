@@ -61,6 +61,9 @@ export {
   executorEvidenceDir,
   executorSessionPath,
   loadExecutionSession,
+  parseWorkspaceDocument,
+  type ParseDocToolResult,
+  type ParseDocumentToolOptions,
   type PlatformToolContext,
 } from './platform-tools.ts'
 

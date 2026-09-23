@@ -8,5 +8,6 @@
     "sourceMap": false,
     "rewriteRelativeImportExtensions": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["src/e2e"]
 }

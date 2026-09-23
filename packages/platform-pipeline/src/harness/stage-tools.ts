@@ -17,6 +17,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { mkdir, readdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { HttpExecutor, type HttpCase, type HttpStep } from '../executor/http.ts'
+import { parseWorkspaceDocument } from '../runtime/platform-tools.ts'
 import { KnowledgeConflictError, MarkdownCaseStore, MarkdownKnowledgeStore, type KnowledgeEntry, type VersionedCase } from '../stores/markdown.ts'
 import { loadCheckpoint } from '../checkpoint.ts'
 
@@ -211,15 +212,39 @@ export function registerStageTools(ctx: Context, deps: StageToolsDeps): void {
 
   register('parse_doc', () => defineTool({
     name: 'parse_doc',
-    description: 'Parse a document file (text/markdown; ppt/word not supported) and return its text.',
-    parameters: { path: { type: 'string', required: true, description: 'document path' } },
+    description:
+      'Parse a project document into structured sections/tables/plainText with diagnostics and sourceRefs. '
+      + 'Supported: markdown / csv / tsv / text / yaml / json. '
+      + '.doc/.xls and any format without an installed parser return status=unsupported with a reason '
+      + 'instead of being read as text (docs/10 §5.6.1).',
+    parameters: {
+      path: { type: 'string', required: true, description: 'document path' },
+      formatHint: { type: 'string', description: 'format hint; file content wins on conflict' },
+      includeTables: { type: 'boolean', description: 'return structured tables (default true)' },
+      includeMetadata: { type: 'boolean', description: 'return document metadata (default true)' },
+      sheetNames: { type: 'array', items: { type: 'string' }, description: 'read only these sheets (Excel)' },
+      includeHiddenSheets: { type: 'boolean', description: 'read hidden sheets (Excel, default false)' },
+      pageRange: { type: 'json', description: 'read only this page range (PDF): { from, to }' },
+      projectKnowledge: { type: 'boolean', description: 'also return draft knowledge entries (default false)' },
+    },
     output: {
-      schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string' } } },
-      render: (_args, value) => textResult(value.text ?? ''),
+      // 解析结果是**变长结构**（sections/tables/diagnostics/limits 随文档而变），
+      // 因此显式声明 additionalProperties: true，而不是把字段抄一遍后与 documents/
+      // 的契约各自漂移。真正的字段契约由 ParseDocToolResult 保证。
+      schema: { type: 'object', additionalProperties: true },
+      render: (_args, value) => textResult(JSON.stringify(value)),
     },
     timeoutMs,
-    async execute(args) {
-      return { text: unwrapArtifactText(await readFile(await resolve(args.path!), 'utf8')) }
+    async execute(args, exec) {
+      // 与 CLI / Web 共用同一 ParserRegistry 与同一序列化逻辑（docs/10 §5.6.11 第 9 条）：
+      // 这里不再自己 readFile + 按扩展名分支，否则同一份文档在 Harness 入口会得到不同结果。
+      const pipelineId = deps.pipelineIdProvider?.()
+      return await parseWorkspaceDocument(args, {
+        projectRoot: deps.baseDir,
+        signal: exec.signal,
+        ...(deps.projectId === undefined ? {} : { projectId: deps.projectId }),
+        ...(pipelineId === undefined ? {} : { pipelineId }),
+      }) as never
     },
   }))
 

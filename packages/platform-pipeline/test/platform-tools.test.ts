@@ -11,6 +11,7 @@ import {
   executorEvidenceDir,
   executorSessionPath,
   loadExecutionSession,
+  type ParseDocToolResult,
   type PlatformToolContext,
 } from '../src/runtime/platform-tools.ts'
 import type { ToolDefinition } from '../src/runtime/ports.ts'
@@ -72,55 +73,148 @@ test('every platform tool declares a JSON schema and a description', () => {
 
 // ── parse_doc ────────────────────────────────────────────────────────────────
 
-test('parse_doc returns markdown and text documents as-is', async () => {
+/**
+ * `parse_doc` 的返回结构由 `documents/` 的 `ParsedDocument` 契约决定
+ * （docs/10 §5.6.4 / §5.6.6）。这里只用类型断言读字段，不重复声明结构——
+ * 结构一旦漂移，`ParseDocToolResult` 会先编译失败。
+ */
+type Parsed = ParseDocToolResult
+
+async function parse(args: Record<string, unknown>, context = baseContext()): Promise<Parsed> {
+  return await tool(context, 'parse_doc').execute(args, ctx) as Parsed
+}
+
+test('parse_doc 把 markdown 解析为带 heading sourceRef 的 sections，而不是只给一段纯文本', async () => {
   await writeFile(join(dir, 'kb.md'), '# 标题\n\n正文\n', 'utf8')
-  const result = await tool(baseContext(), 'parse_doc').execute({ path: 'kb.md' }, ctx) as { format: string; text: string }
-  assert.equal(result.format, 'text')
-  assert.match(result.text, /# 标题/)
+  const result = await parse({ path: 'kb.md' })
+
+  assert.equal(result.available, true)
+  assert.equal(result.status, 'parsed')
+  assert.equal(result.format, 'markdown')
+  assert.equal(result.confidence, 'structure-preserved')
+  assert.equal(result.fileName, 'kb.md')
+  assert.match(result.sha256 ?? '', /^[0-9a-f]{64}$/)
+
+  assert.equal(result.sections.length, 1)
+  assert.equal(result.sections[0]!.title, '标题')
+  assert.equal(result.sections[0]!.level, 1)
+  assert.match(result.sections[0]!.text, /正文/)
+  assert.equal(result.sections[0]!.sourceRef, 'kb.md#heading=1')
+  assert.deepEqual([...result.sourceRefs], ['kb.md#heading=1'])
 })
 
-test('parse_doc structures csv and tsv into rows (quotes, embedded delimiters, CRLF)', async () => {
+test('parse_doc 把 markdown 表格转成带行级 rowRefs 的 tables', async () => {
+  await writeFile(join(dir, 'spec.md'), '# 接口\n\n| 字段 | 必填 |\n| --- | --- |\n| token | 是 |\n', 'utf8')
+  const result = await parse({ path: 'spec.md' })
+
+  assert.equal(result.tables.length, 1)
+  const table = result.tables[0]!
+  assert.deepEqual([...table.headers], ['字段', '必填'])
+  assert.deepEqual(table.rows.map(row => [...row]), [['token', '是']])
+  assert.equal(table.sourceRef, 'spec.md#heading=1,table=1')
+  // 行级 ref 是知识投影把「表格行」追溯到原始位置的唯一依据（docs/10 §5.6.7）。
+  assert.deepEqual([...(table.rowRefs ?? [])], ['spec.md#heading=1,table=1,row=1'])
+})
+
+test('parse_doc 结构化 csv/tsv：引号、内嵌分隔符、CRLF 与行级 sourceRef', async () => {
   await writeFile(join(dir, 'cases.csv'), 'id,title,expect\r\nc1,"登录, 成功",200\r\nc2,"含""引号""",404\r\n', 'utf8')
-  const csv = await tool(baseContext(), 'parse_doc').execute({ path: 'cases.csv' }, ctx) as { format: string; rows: string[][] }
-  assert.equal(csv.format, 'table')
-  assert.deepEqual(csv.rows, [['id', 'title', 'expect'], ['c1', '登录, 成功', '200'], ['c2', '含"引号"', '404']])
+  const csv = await parse({ path: 'cases.csv' })
+
+  assert.equal(csv.status, 'parsed')
+  assert.equal(csv.format, 'csv')
+  const table = csv.tables[0]!
+  assert.deepEqual([...table.headers], ['id', 'title', 'expect'])
+  assert.deepEqual(table.rows.map(row => [...row]), [['c1', '登录, 成功', '200'], ['c2', '含"引号"', '404']])
+  assert.equal(table.sourceRef, 'cases.csv#table=1')
+  assert.deepEqual([...(table.rowRefs ?? [])], ['cases.csv#table=1,row=1', 'cases.csv#table=1,row=2'])
 
   await writeFile(join(dir, 'cases.tsv'), 'id\ttitle\nc1\t登录\n', 'utf8')
-  const tsv = await tool(baseContext(), 'parse_doc').execute({ path: 'cases.tsv' }, ctx) as { format: string; rows: string[][] }
-  assert.deepEqual(tsv.rows, [['id', 'title'], ['c1', '登录']])
+  const tsv = await parse({ path: 'cases.tsv' })
+  assert.equal(tsv.format, 'tsv')
+  assert.deepEqual(tsv.tables[0]!.rows.map(row => [...row]), [['c1', '登录']])
 })
 
-test('parse_doc normalizes valid JSON and flags invalid JSON without pretending success', async () => {
+test('parse_doc 对 json：合法时规范化，非法时降为 partial 而不是假装解析成功', async () => {
   await writeFile(join(dir, 'ok.json'), '{"b":1,"a":2}', 'utf8')
-  const ok = await tool(baseContext(), 'parse_doc').execute({ path: 'ok.json' }, ctx) as { format: string; text: string }
+  const ok = await parse({ path: 'ok.json' })
+  assert.equal(ok.status, 'parsed')
   assert.equal(ok.format, 'json')
-  assert.equal(ok.text, '{\n  "b": 1,\n  "a": 2\n}')
+  assert.equal(ok.plainText, '{\n  "b": 1,\n  "a": 2\n}')
+  assert.equal(ok.metadata?.valid, true)
 
   await writeFile(join(dir, 'broken.json'), '{"a":', 'utf8')
-  const broken = await tool(baseContext(), 'parse_doc').execute({ path: 'broken.json' }, ctx) as { format: string; error?: string }
-  assert.equal(broken.format, 'text')
-  assert.match(broken.error ?? '', /不是合法 JSON/)
+  const broken = await parse({ path: 'broken.json' })
+  assert.equal(broken.status, 'partial')
+  assert.equal(broken.metadata?.valid, false)
+  assert.ok(broken.diagnostics.some(item => item.code === 'STRUCTURED_PARSE_FAILED'))
 })
 
-test('parse_doc refuses binary formats explicitly instead of returning mojibake', async () => {
-  await writeFile(join(dir, 'spec.xlsx'), 'PK\u0003\u0004binary', 'utf8')
-  const result = await tool(baseContext(), 'parse_doc').execute({ path: 'spec.xlsx' }, ctx) as { format: string; error?: string }
-  assert.equal(result.format, 'unsupported')
-  assert.match(result.error ?? '', /不支持解析 \.xlsx/)
+test('parse_doc 对没有解析器的格式返回 unsupported，绝不按文本读出乱码', async () => {
+  // 真正的 OOXML/ZIP 头（PK\x03\x04）与 OLE2 头（D0CF11E0…），扩展名与内容一致。
+  await writeFile(join(dir, 'spec.xlsx'), Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00]))
+  const xlsx = await parse({ path: 'spec.xlsx' })
+  assert.equal(xlsx.available, true)
+  assert.equal(xlsx.status, 'unsupported')
+  // 关键：ZIP 容器必须由扩展名消歧，不能因为共享 ZIP 签名就报成 docx。
+  assert.equal(xlsx.format, 'xlsx')
+  assert.equal(xlsx.plainText, '')
+  assert.ok(xlsx.diagnostics.some(item => item.code === 'FORMAT_NOT_SUPPORTED' && item.severity === 'error'))
+
+  await writeFile(join(dir, 'old.doc'), Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0x00, 0x00]))
+  const doc = await parse({ path: 'old.doc' })
+  assert.equal(doc.status, 'unsupported')
+  assert.equal(doc.format, 'doc')
+  // docs/10 §5.6.5 B：.doc 必须明确 unsupported 并提示转换为 .docx。
+  assert.match(doc.diagnostics.map(item => item.message).join(' '), /转换为 \.docx/)
 })
 
-test('parse_doc honours the same workspace path boundary as fs_read', async () => {
-  const entry = tool(baseContext(), 'parse_doc')
-  await assert.rejects(() => entry.execute({ path: '../outside.md' }, ctx), /escapes the workspace root/)
-  await assert.rejects(() => entry.execute({ path: '/etc/hosts' }, ctx), /must be relative/)
+test('parse_doc 的路径越界与文件缺失返回结构化失败，而不是抛出或返回空结果', async () => {
+  const escaped = await parse({ path: '../outside.md' })
+  assert.equal(escaped.available, false)
+  assert.equal(escaped.status, 'parse-failed')
+  assert.equal(escaped.plainText, '')
+  assert.match(escaped.error ?? '', /escapes the workspace root/)
+
+  const absolute = await parse({ path: '/etc/hosts' })
+  assert.equal(absolute.available, false)
+  assert.match(absolute.error ?? '', /must be relative/)
+
+  const missing = await parse({ path: 'nope.md' })
+  assert.equal(missing.available, false)
+  assert.match(missing.error ?? '', /does not exist/)
 })
 
-test('parse_doc marks truncation instead of silently dropping content', async () => {
+test('parse_doc 超出字节上限时返回 limit-exceeded，不返回被截断的假内容', async () => {
   await writeFile(join(dir, 'big.txt'), 'x'.repeat(2048), 'utf8')
-  const result = await tool(baseContext({ maxDocumentBytes: 128 }), 'parse_doc')
-    .execute({ path: 'big.txt' }, ctx) as { truncated?: boolean; text: string }
-  assert.equal(result.truncated, true)
-  assert.equal(result.text.length, 128)
+  const result = await parse({ path: 'big.txt' }, baseContext({ maxDocumentBytes: 128 }))
+  assert.equal(result.available, true)
+  assert.equal(result.status, 'limit-exceeded')
+  assert.equal(result.plainText, '')
+  assert.ok(result.diagnostics.some(item => item.code === 'LIMIT_EXCEEDED'))
+})
+
+test('parse_doc 不回传原始字节，且 projectKnowledge 只产出 draft、绝不写知识库', async () => {
+  await writeFile(join(dir, 'req.md'), '# 需求\n\n同一手机号 60s 内只能发一次验证码。\n', 'utf8')
+  const context = baseContext({ knowledgeRoot: join(dir, 'kb') })
+
+  const plain = await parse({ path: 'req.md' }, context) as Parsed & { rawSource?: string }
+  // docs/10 §5.6.8：默认不向模型发送原始二进制/原文副本。
+  assert.equal(plain.rawSource, undefined)
+  assert.equal(plain.draftEntries, undefined)
+
+  const projected = await parse({ path: 'req.md', projectKnowledge: true }, context)
+  assert.equal(projected.draftEntries?.length, 1)
+  const draft = projected.draftEntries![0]!
+  // docs/10 §5.6.7：解析只能产出 draft，且不得直接是 verified/reviewed。
+  assert.equal(draft.status, 'draft')
+  assert.equal(draft.confidence, 'unverified')
+  assert.equal(draft.project, 'proj-a')
+  assert.equal(draft.sourcePipeline, PIPELINE)
+  assert.deepEqual([...(draft.sourceRefs ?? [])], ['req.md#heading=1'])
+
+  // active 写入必须仍走 kb_write + 人工门：解析本身不得落盘任何知识条目。
+  const kbFiles = await readdir(join(dir, 'kb')).catch(() => [] as string[])
+  assert.deepEqual(kbFiles, [])
 })
 
 // ── 知识库 ────────────────────────────────────────────────────────────────────

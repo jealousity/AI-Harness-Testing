@@ -6,6 +6,7 @@
   "description": "测试辅助平台六阶段流水线插件包（独立 npm 包部署 I-4：配置解析 / 检查点 / ACL / 机器门禁 / 执行可信 / 重入与交叉检查）",
   "files": [
     "dist",
+    "!dist/e2e",
     "README.md"
   ],
   "main": "./dist/index.js",
@@ -13,6 +14,7 @@
   "exports": {
     ".": "./dist/index.js",
     "./runtime": "./dist/runtime/index.js",
+    "./documents": "./dist/documents/index.js",
     "./web": "./dist/web/index.js",
     "./harness": "./dist/harness/index.js",
     "./harness-plugin": "./dist/harness/host-plugin.js",
@@ -23,13 +25,31 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "test": "node --test",
     "typecheck": "tsc --noEmit",
     "cli": "node src/cli.ts"
   },
   "dependencies": {
     "yaml": "^2.6.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-agent": "*",
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-subagent": "*",
+    "@deepseek-ai/dsh-timeout": "*",
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/dsh-user-questions": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": { "optional": true },
+    "@deepseek-ai/dsh-agent": { "optional": true },
+    "@deepseek-ai/dsh-llm": { "optional": true },
+    "@deepseek-ai/dsh-subagent": { "optional": true },
+    "@deepseek-ai/dsh-timeout": { "optional": true },
+    "@deepseek-ai/dsh-tools": { "optional": true },
+    "@deepseek-ai/dsh-user-questions": { "optional": true }
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
