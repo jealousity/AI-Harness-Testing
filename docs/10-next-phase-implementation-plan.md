@@ -326,6 +326,436 @@ POST /api/pipelines/:pipelineId/reenter
 
 ---
 
+## 5.6 文档解析与知识库导入专项（P0，必须独立验收）
+
+### 5.6.1 强制目标
+
+知识库和 receive/analyze 阶段的文档工具必须支持以下格式：
+
+| 类型 | 扩展名 | 必须支持的内容 |
+|---|---|---|
+| PDF | `.pdf` | 页面文本、页码、文档元数据；尽可能保留段落顺序；扫描件 OCR 作为可选能力，不能把 OCR 结果伪装成高置信度原文 |
+| Word | `.docx`、`.doc` | 标题层级、段落、列表、表格、页眉/页脚（若可提取）、文档元数据；`.doc` 老格式要明确支持范围或在上传时明确拒绝 |
+| Excel | `.xlsx`、`.xls` | 工作表名、表头、数据行、单元格值、合并单元格的可解释表示；空行和隐藏 sheet 的处理策略必须固定；公式优先读取计算后的值，同时保留公式信息（若库支持） |
+| Markdown | `.md`、`.markdown`、`.mdx` | 标题层级、段落、列表、代码块、表格、引用、链接、原始 Markdown；不能只取纯文本而丢掉标题和表格语义 |
+| 文本/表格 | `.txt`、`.csv`、`.tsv`、`.yaml`、`.yml`、`.json` | 原文或结构化数据；编码、分隔符、引号、换行和 JSON 合法性要显式处理 |
+
+这不是“尽量支持”。上述 PDF、Word、Excel、Markdown 是平台知识库导入的**硬性格式要求**。如果某一种格式在当前运行环境无法安全解析，工具必须返回结构化的 `unsupported`/`parse-failed`，并说明缺失能力，绝不能把二进制内容当 UTF-8 文本读取后继续生成知识条目。
+
+### 5.6.2 当前缺口
+
+当前 `runtime/platform-tools.ts` 的 `parse_doc` 只覆盖文本族、CSV/TSV 和 JSON，PDF/Word/Excel 当前会显式返回 unsupported。这是正确的安全降级，但不是目标完成状态。
+
+后续实现必须将 `parse_doc` 从“单函数按扩展名分支”升级为**解析器注册表 + 统一中间表示**，不要把 PDF、Word、Excel 的库调用继续堆在一个超长工具函数里。
+
+### 5.6.3 推荐模块边界
+
+建议新增以下结构；名称可以调整，但职责必须保持独立：
+
+```text
+packages/platform-pipeline/src/documents/
+  document-types.ts          # 输入、输出、中间表示、诊断、置信度
+  document-parser.ts         # ParserRegistry / DocumentParser 接口
+  document-detect.ts         # 扩展名、MIME、magic bytes、编码检测
+  markdown-parser.ts         # Markdown AST/章节/表格解析
+  pdf-parser.ts              # PDF 文本和页码提取
+  word-parser.ts             # DOCX OOXML 提取；DOC 老格式单独策略
+  excel-parser.ts            # XLSX/XLS 工作簿和表格提取
+  delimited-parser.ts        # CSV/TSV
+  text-parser.ts             # TXT/YAML/JSON 等文本族
+  document-limits.ts         # 文件大小、页数、sheet 数、单元格数、文本长度限制
+  document-sanitize.ts       # 路径、宏、外链、嵌入对象和敏感字段处理
+  knowledge-projection.ts    # ParsedDocument → draft KnowledgeEntry
+```
+
+`runtime/platform-tools.ts` 只负责：
+
+1. 校验调用参数和 workspace 路径；
+2. 调用 `ParserRegistry`；
+3. 将统一中间表示序列化为 tool result；
+4. 可选地调用 `knowledge-projection` 生成 draft；
+5. 不直接处理 OOXML、PDF 二进制或 Excel 工作簿细节。
+
+### 5.6.4 统一解析接口
+
+建议定义如下接口：
+
+```ts
+export type SupportedDocumentFormat =
+  | 'pdf' | 'docx' | 'doc' | 'xlsx' | 'xls'
+  | 'markdown' | 'text' | 'csv' | 'tsv' | 'yaml' | 'json'
+
+export type ParseStatus = 'parsed' | 'partial' | 'unsupported' | 'parse-failed' | 'limit-exceeded'
+export type ContentConfidence = 'exact-text' | 'structure-preserved' | 'layout-approximate' | 'ocr-derived'
+
+export interface DocumentParseRequest {
+  readonly path: string
+  readonly formatHint?: SupportedDocumentFormat
+  readonly includeTables?: boolean
+  readonly includeMetadata?: boolean
+  readonly includeRawSource?: boolean
+  readonly sheetNames?: readonly string[]
+  readonly pageRange?: Readonly<{ from?: number; to?: number }>
+}
+
+export interface DocumentDiagnostic {
+  readonly code: string
+  readonly severity: 'info' | 'warning' | 'error'
+  readonly message: string
+  readonly location?: string
+}
+
+export interface ParsedSection {
+  readonly id: string
+  readonly title?: string
+  readonly level?: number
+  readonly order: number
+  readonly text: string
+  readonly page?: number
+  readonly sheet?: string
+  readonly sourceRef: string
+}
+
+export interface ParsedTable {
+  readonly id: string
+  readonly title?: string
+  readonly headers: readonly string[]
+  readonly rows: readonly (readonly string[])[]
+  readonly page?: number
+  readonly sheet?: string
+  readonly sourceRef: string
+  readonly truncated?: boolean
+}
+
+export interface ParsedDocument {
+  readonly status: ParseStatus
+  readonly format: SupportedDocumentFormat | 'unknown'
+  readonly fileName: string
+  readonly mediaType?: string
+  readonly sha256: string
+  readonly pageCount?: number
+  readonly sheetNames?: readonly string[]
+  readonly sections: readonly ParsedSection[]
+  readonly tables: readonly ParsedTable[]
+  readonly metadata: Readonly<Record<string, string | number | boolean | null>>
+  readonly plainText: string
+  readonly rawSource?: string
+  readonly diagnostics: readonly DocumentDiagnostic[]
+  readonly confidence: ContentConfidence
+  readonly limits: Readonly<{
+    truncated: boolean
+    pagesRead?: number
+    sheetsRead?: number
+    rowsRead?: number
+    bytesRead?: number
+  }>
+}
+
+export interface DocumentParser {
+  readonly format: SupportedDocumentFormat
+  readonly mediaTypes: readonly string[]
+  canParse(input: Readonly<{ path: string; mediaType?: string; magicBytes?: Uint8Array }>): boolean
+  parse(request: DocumentParseRequest, signal: AbortSignal): Promise<ParsedDocument>
+}
+```
+
+实现细节要求：
+
+- `sha256` 在解析前基于原始文件计算，作为 source identity；
+- `sourceRef` 必须包含文件相对路径及位置信息，例如 `requirements.pdf#page=3`、`cases.xlsx#sheet=登录用例!A1:D20`、`spec.md#heading=2.1`；
+- `plainText` 供 LLM 检索，`sections`/`tables` 供结构化知识生成，不能只保留其中一种；
+- `status=partial` 时必须有 diagnostics 和 limits，不能只返回截断文本；
+- 每个解析器都要接受 `AbortSignal`，大 PDF/Excel 解析被取消时及时释放资源；
+- 解析器不得写原文件，也不得执行文档中的宏、脚本、外链或嵌入对象。
+
+### 5.6.5 解析器实现细节
+
+#### A. PDF
+
+推荐使用成熟的纯 Node/JavaScript PDF 文本提取库，具体依赖由实现模型结合 Node ≥24、许可证和维护状态确认；不能手写 PDF 二进制解析器。
+
+必须实现：
+
+- 文件 magic bytes 校验（`%PDF-`）；扩展名不可信时以内容检测为准；
+- 页数限制和总字节限制；
+- 每页文本提取，并保留 `#page=N` sourceRef；
+- 处理文本顺序异常时返回 warning；
+- 文档没有可提取文本时返回 `partial` 或 `parse-failed`；
+- 扫描 PDF 不得自动声称已完成解析；若接入 OCR，结果 confidence 必须为 `ocr-derived`，每页标记 OCR 来源；
+- 拒绝执行 PDF 中的 JavaScript、表单动作、外部链接和嵌入附件；
+- PDF 密码保护时返回明确错误码 `DOCUMENT_ENCRYPTED`；
+- 大文件、异常对象和解析超时必须由统一 limit/timeout 处理。
+
+表格提取是增强能力，不得把 PDF 中布局不稳定的文本硬拼成“准确表格”。提取失败时保留页文本和 warning，不生成结构化表格假象。
+
+#### B. Word
+
+`.docx` 本质是 OOXML 压缩包，必须使用成熟解析库或安全的 XML 解包流程，不得直接把 zip 内容交给模型。
+
+必须实现：
+
+- 标题、段落、列表顺序保留；
+- 表格转 `ParsedTable`，表格来源包含章节或文档位置；
+- 合并单元格要么展开并记录 `merged` 诊断，要么保留明确的合并信息，不能静默复制造成事实重复；
+- 页眉/页脚、脚注、尾注的策略固定并写入 diagnostics；
+- 图片、文本框、SmartArt、嵌入对象默认不当作已解析文本；
+- DOCX 中的外部链接、宏、嵌入 OLE 不执行；
+- `.doc` 老二进制格式必须二选一：接入明确安全的解析适配器，或返回 `unsupported` 并提示转换为 `.docx`，不能猜测解析；
+- 解压文件数量、单文件大小、总展开大小设置上限，防 zip bomb；
+- XML 实体、路径穿越和外部实体解析必须禁用。
+
+#### C. Excel
+
+`.xlsx`/`.xls` 不能按普通文本处理。必须以 workbook → sheet → range/table 的中间结构输出。
+
+必须实现：
+
+- 工作簿名称和 sheet 名；
+- 默认只读取可见 sheet，提供显式参数读取隐藏 sheet；若配置不允许读取隐藏 sheet，返回 warning；
+- 每个 sheet 的有效区域、表头推断、行列数量；
+- 单元格值按显示值和原始类型区分（字符串、数字、日期、布尔、错误、空值）；
+- 公式默认读取缓存计算值，同时可保留公式文本；没有缓存值时标记 `FORMULA_VALUE_UNAVAILABLE`，不得自行计算并伪装成 Excel 结果；
+- 合并单元格、筛选、冻结窗格和表格名称作为 metadata 或 diagnostics；
+- 空行策略固定：表格内部空行保留，尾部空行裁剪；
+- 每个 sheet 设置最大行数、列数、单元格数和总展开内存限制；
+- `.xls` 老格式必须有专门适配器，否则明确 unsupported；
+- 不执行宏、外部链接、Power Query、数据连接和嵌入对象；
+- sourceRef 细化到 `file.xlsx#sheet=Sheet1!A1:D20`。
+
+建议工具调用支持：
+
+```json
+{
+  "path": "requirements.xlsx",
+  "sheetNames": ["接口需求", "验收标准"],
+  "includeTables": true
+}
+```
+
+模型不能通过参数读取 workspace 外的 sheet 文件，也不能绕过文件大小和单元格上限。
+
+#### D. Markdown
+
+Markdown 不能简单 `stripMarkdown` 后只返回一段文本，因为标题、表格和代码块本身是知识结构。
+
+必须实现：
+
+- 标题层级转换为 `ParsedSection.level`；
+- 段落和列表保留顺序；
+- Markdown 表格转 `ParsedTable`；
+- fenced code block 原样保留，但代码内容默认不执行；
+- blockquote、链接、图片引用保留为文本或 metadata；
+- front matter 单独解析为 metadata，非法 front matter 返回 warning；
+- sourceRef 至少包含 heading 路径或行号；
+- `.mdx` 中 JSX/组件标签不执行，按文本或 unsupported block 处理；
+- 超过文本长度限制时返回 `partial` 和行/字符范围。
+
+### 5.6.6 `parse_doc` 工具契约
+
+`parse_doc` 应扩展为：
+
+```json
+{
+  "path": "docs/requirements.pdf",
+  "formatHint": "pdf",
+  "includeTables": true,
+  "includeMetadata": true,
+  "pageRange": { "from": 1, "to": 20 }
+}
+```
+
+返回不能只使用当前的 `{ format, text, rows }` 简化结构，建议返回：
+
+```json
+{
+  "available": true,
+  "status": "parsed",
+  "format": "pdf",
+  "fileName": "requirements.pdf",
+  "sha256": "...",
+  "confidence": "structure-preserved",
+  "sections": [
+    {
+      "id": "section-1",
+      "title": "登录需求",
+      "level": 1,
+      "order": 0,
+      "text": "...",
+      "page": 2,
+      "sourceRef": "requirements.pdf#page=2"
+    }
+  ],
+  "tables": [],
+  "plainText": "...",
+  "diagnostics": [],
+  "limits": {
+    "truncated": false,
+    "pagesRead": 20,
+    "bytesRead": 123456
+  }
+}
+```
+
+错误响应必须结构化：
+
+```json
+{
+  "available": true,
+  "status": "unsupported",
+  "format": "doc",
+  "diagnostics": [
+    {
+      "code": "FORMAT_NOT_SUPPORTED",
+      "severity": "error",
+      "message": "当前运行环境没有安全的 .doc 解析器，请先转换为 .docx"
+    }
+  ]
+}
+```
+
+下列情况禁止返回 `available=true, status=parsed`：
+
+- 文件不存在；
+- 路径越界或软链接逃逸；
+- magic bytes 与声明格式明显冲突；
+- 加密 PDF 未提供解密能力；
+- Office 文件是宏/嵌入对象而不是可安全提取的正文；
+- 解析器超时或达到限制后没有标记 `partial`/`limit-exceeded`；
+- 文档内容为空且没有说明原因。
+
+### 5.6.7 从文档到知识条目的投影
+
+解析和知识写入必须分两步，不能“上传文档后直接让模型写 active 知识”：
+
+```text
+原始文件
+  → DocumentParser
+  → ParsedDocument
+  → LLM/规则抽取候选事实
+  → KnowledgeEntry(status=draft)
+  → machine validation
+  → 人工门/审批
+  → kb_write
+  → kb_query 回读
+```
+
+`KnowledgeEntry.sourceRefs` 必须引用 `ParsedDocument` 的位置：
+
+- PDF：`requirements.pdf#page=3`；
+- Word：`spec.docx#table=2,row=4` 或章节路径；
+- Excel：`cases.xlsx#sheet=接口!A2:F20`；
+- Markdown：`guide.md#heading=3.2` 或行号范围。
+
+抽取时的硬约束：
+
+- 不允许模型凭空补齐文档没有的业务事实；
+- 表格行必须能追溯到原始 sheet/表格位置；
+- OCR/布局推断结果默认低置信度，不能直接生成 `verified`；
+- `active` 知识仍必须经过现有冲突治理和人工门；
+- 同一文档重复导入应由 `sha256 + sourceRef + entryId/version` 幂等，不重复制造知识条目；
+- 文档更新后，旧条目是否 supersede 必须有明确策略，不能按文件名覆盖。
+
+### 5.6.8 文档存储与上传安全
+
+文档解析的输入文件不能任意落在项目 workspace 里。建议增加：
+
+```text
+<dataRoot>/tenants/<tenantId>/projects/<projectId>/inputs/<inputId>/original
+<dataRoot>/tenants/<tenantId>/projects/<projectId>/inputs/<inputId>/manifest.json
+<dataRoot>/tenants/<tenantId>/projects/<projectId>/inputs/<inputId>/parsed.json
+```
+
+`manifest.json` 至少记录：
+
+- inputId、tenantId、projectId、pipelineId；
+- 原始文件名和安全化后的存储名；
+- MIME、扩展名、文件大小、sha256；
+- 上传 actor、上传时间；
+- parser name/version；
+- parse status、confidence、diagnostics 摘要；
+- 是否生成 draft 知识条目。
+
+安全要求：
+
+- 上传文件名不能决定实际存储路径；
+- 所有解压目录必须在临时隔离目录并做总大小限制；
+- 解析完成后临时目录必须清理，清理失败要记录；
+- 禁止执行 Office 宏、PDF JavaScript、外部实体、外链下载和嵌入程序；
+- 默认不向模型发送原始二进制，只发送 ParsedDocument 的受限结构；
+- 只把必要的页、sheet、章节发送给模型，避免将整份大文档无上限放入 prompt；
+- 文档可能包含密码、token、身份证号等敏感信息，日志只能记录摘要和 hash，不记录全文。
+
+### 5.6.9 依赖与许可证决策
+
+实现模型选择解析库时必须先做小型 ADR，不允许“看到能 import 就直接安装”。ADR 至少写明：
+
+- Node ≥24 兼容性；
+- PDF/DOCX/XLSX/DOC/XLS 各自采用的库；
+- 是否支持纯 JavaScript，是否依赖系统二进制；
+- 许可证是否允许当前项目分发和商用；
+- 是否支持流式/分页/大文件限制；
+- 安全历史和维护状态；
+- 是否会执行宏、外链或 XML 外部实体；
+- 失败时如何降级到 `unsupported`；
+- 是否需要单独的 worker/沙箱进程。
+
+建议优先选择维护稳定、可限制资源、不会执行文档内容的库；不要为了支持 `.doc`/`.xls` 直接引入需要系统 LibreOffice 的黑盒转换，除非部署环境、隔离和许可证已经确认。
+
+### 5.6.10 文档解析测试矩阵
+
+必须新增 fixture 和测试，不能只测扩展名：
+
+#### 正常样本
+
+- 含中文和英文标题的 Markdown；
+- 含嵌套列表、引用、代码块和表格的 Markdown；
+- 多页可复制文本 PDF；
+- 没有文本层的扫描 PDF；
+- 含标题、列表、表格和合并单元格的 DOCX；
+- 含多个 sheet、日期、公式、隐藏 sheet、合并单元格的 XLSX；
+- CSV/TSV 含引号、换行、中文、空列和 CRLF。
+
+#### 异常样本
+
+- 损坏 PDF/ZIP/OOXML；
+- 加密 PDF；
+- `.doc`/`.xls` 在未配置适配器时明确 unsupported；
+- PDF 超页、Excel 超行、文档超字节限制；
+- zip bomb 或极高压缩比 Office 文件；
+- 外部实体、外部链接、宏和嵌入对象；
+- 非 UTF-8 文本；
+- magic bytes 与扩展名不一致；
+- 软链接、`..`、绝对路径和路径编码绕过；
+- 解析中 AbortSignal；
+- 同一文件重复导入和文件内容变更后的重新导入。
+
+#### 知识投影样本
+
+- PDF 页码 sourceRef 能回读；
+- Word 表格行 sourceRef 能回读；
+- Excel sheet/range sourceRef 能回读；
+- Markdown heading sourceRef 能回读；
+- OCR/partial 结果不能被赋予 `verified`；
+- 冲突条目仍走现有 `KnowledgeConflictError`；
+- active 写入仍需人工门，不能被 `parse_doc` 绕过。
+
+### 5.6.11 文档解析专项验收标准
+
+只有满足以下条件，才能认为“知识库支持 PDF/Word/Excel/Markdown”：
+
+1. 四类格式都有实际 fixture 和成功解析测试；
+2. 每类格式都有损坏、超限、路径越界和不支持能力测试；
+3. 解析结果同时保留可检索纯文本和可追溯结构；
+4. 所有知识条目带可定位 `sourceRefs`；
+5. 解析失败不会生成 active 知识；
+6. OCR/布局推断结果有 confidence 标记；
+7. 不执行宏、脚本、外链或嵌入对象；
+8. 大文件和恶意压缩文件有资源上限；
+9. CLI、Web、Harness 入口共用同一 ParserRegistry；
+10. 解析器替换不会修改 `PipelineDriver` 和机器门禁规则。
+
+---
+
 # 6. M2：并发安全与幂等
 
 ## 6.1 目标
@@ -585,6 +1015,19 @@ NODE_OPTIONS="--max-old-space-size=6144" ./node_modules/.bin/tsc -p tsconfig.bui
 - [ ] 用 ScriptedStageRunner 写 service contract tests。
 - [ ] 明确 actor/tenant/project/pipeline scope 类型。
 
+### P0-A1：文档解析与知识库导入
+
+- [ ] 新增 `documents/` 解析器注册表和 `ParsedDocument` 统一中间表示。
+- [ ] 实现 PDF、DOCX/可选 DOC、XLSX/可选 XLS、Markdown、CSV/TSV、TXT/YAML/JSON 解析器。
+- [ ] PDF 保留页码，Word 保留章节/表格，Excel 保留 sheet/range，Markdown 保留 heading/table/code block。
+- [ ] 所有解析器实现文件大小、页数、sheet 数、行数、字符数、解压大小和超时限制。
+- [ ] 禁止宏、PDF JavaScript、外链下载、XML 外部实体、OLE/嵌入对象和任意代码执行。
+- [ ] `.doc`/`.xls` 如果没有安全解析器必须返回 `unsupported`，不能按文本读取或假装支持。
+- [ ] `parse_doc` 返回 `status`、`confidence`、`sections`、`tables`、`plainText`、`diagnostics`、`limits` 和 `sourceRefs`。
+- [ ] 文档解析只生成 `draft` 知识条目；active 写入仍走机器校验、人工门、冲突治理和回读验证。
+- [ ] 增加正常、损坏、加密、超限、恶意压缩、路径越界、AbortSignal、重复导入和 sourceRef 回读测试。
+- [ ] 写 ADR 记录解析库、Node 兼容性、许可证、沙箱方式、失败降级和 `.doc`/`.xls` 支持策略。
+
 ### P0-B：M1 Web 接入
 
 - [ ] 把 Web API Key 输入改为服务端 provider 配置；浏览器不再上传 key。
@@ -651,4 +1094,4 @@ NODE_OPTIONS="--max-old-space-size=6144" ./node_modules/.bin/tsc -p tsconfig.bui
 
 本规划全部落地的标志不是“Web 页面能显示六个阶段”，而是：
 
-> 同一个租户/项目下，CLI、Web、Harness 三种入口都能调用同一个 PipelineDriver；流水线状态、产物、执行证据、人工裁决、知识归档、预算和审计均来自持久化事实；进程重启、并发运行、模型不可用、工具越权、执行器缺失和存储损坏时都能进入明确的失败/等待/恢复状态，绝不静默批准或伪造成功。
+> 同一个租户/项目下，CLI、Web、Harness 三种入口都能调用同一个 PipelineDriver；流水线状态、产物、执行证据、人工裁决、知识归档、预算和审计均来自持久化事实；文档解析统一支持 PDF、Word、Excel、Markdown 等格式，并能把每条知识追溯到页码、章节、sheet/range 或 heading；进程重启、并发运行、模型不可用、工具越权、执行器缺失和存储损坏时都能进入明确的失败/等待/恢复状态，绝不静默批准或伪造成功。
