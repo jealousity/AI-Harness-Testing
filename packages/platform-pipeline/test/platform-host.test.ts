@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 
 import { normalizeConfig } from '../src/config.ts'
@@ -10,10 +10,12 @@ import type { PipelineConfig } from '../src/types.ts'
 import {
   DEFAULT_RULESET_VERSION,
   createCheckpointHost,
+  createExecutionLoader,
   createPlatformHost,
   gateTaskStoreDir,
   taskStoreDir,
 } from '../src/runtime/platform-host.ts'
+import { executorEvidenceDir, executorSessionPath } from '../src/runtime/platform-tools.ts'
 import { HumanGateWaitAbortedError } from '../src/runtime/persistent-human-gate.ts'
 
 let dir: string
@@ -91,8 +93,6 @@ test('createPlatformHost derives project storage roots and gate/task directories
 
 test('createPlatformHost exposes fs_read workspace-wide but fs_write only inside the pipeline artifacts dir', async () => {
   const host = createPlatformHost(hostOptions(baseConfig()))
-  assert.deepEqual(host.tools.list().map(tool => tool.name).sort(), ['fs_read', 'fs_write'])
-
   const signal = new AbortController().signal
   const ctx = { signal, pipelineId: 'pipe-1' }
   const read = host.tools.get('fs_read')!
@@ -102,6 +102,48 @@ test('createPlatformHost exposes fs_read workspace-wide but fs_write only inside
   assert.equal(await read.execute({ path: 'artifacts/pipe-1/receive.json' }, ctx), '{"ok":true}')
   await assert.rejects(() => write.execute({ path: 'artifacts/other/receive.json', content: 'x' }, ctx), /outside the writable scope/)
   await assert.rejects(() => write.execute({ path: 'checkpoints/x.json', content: 'x' }, ctx), /outside the writable scope/)
+})
+
+test('createPlatformHost registers every tool the stage ACLs can address', () => {
+  const host = createPlatformHost(hostOptions(baseConfig()))
+  const names = host.tools.list().map(tool => tool.name).sort()
+  assert.deepEqual(names, [
+    'case_archive', 'case_query', 'env_diag', 'executor_run',
+    'fs_read', 'fs_write', 'gate_check', 'kb_query', 'kb_write',
+    'parse_doc', 'req_pull',
+  ])
+  // analyze 阶段 ACL 允许 kb_query/case_query：没有实现就等于"能跑但拿不到工具"
+  assert.ok(host.tools.get('kb_query') !== undefined)
+  assert.ok(host.tools.get('executor_run') !== undefined)
+})
+
+test('createPlatformHost refuses a stage that allows approval-gated writes without a blocking human gate', () => {
+  const config = baseConfig({
+    stages: Object.fromEntries(STAGE_ORDER.map(id => [id, {
+      rules: [],
+      review: { enabled: false },
+      // archive 允许 kb_write / case_archive（requiresApproval）却没有任何阻塞人工门
+      ...(id === 'archive' ? { gate: {} } : {}),
+    }])),
+  })
+  assert.throws(() => createPlatformHost(hostOptions(config)), /需审批工具缺少阻塞人工门：archive:kb_write, archive:case_archive/)
+})
+
+test('the execution loader only serves the execute stage and stays undefined until a session exists', async () => {
+  const host = createPlatformHost(hostOptions(baseConfig()))
+  const loader = createExecutionLoader(host.roots.projectRoot, 'pipe-1')
+
+  assert.equal(await loader.load('design', 'pipe-1'), undefined, '非 execute 阶段不加载执行数据')
+  assert.equal(await loader.load('execute', 'pipe-1'), undefined, '未执行时必须是 undefined（而非空会话）')
+
+  const sessionPath = executorSessionPath(host.roots.projectRoot, 'pipe-1')
+  await mkdir(dirname(sessionPath), { recursive: true })
+  await writeFile(sessionPath, JSON.stringify({ pipelineId: 'pipe-1', records: [], evidence: [] }), 'utf8')
+
+  const loaded = await loader.load('execute', 'pipe-1')
+  assert.equal(loaded?.pipelineId, 'pipe-1')
+  assert.deepEqual(loaded?.records, [])
+  assert.equal(loaded?.evidenceDir, executorEvidenceDir(host.roots.projectRoot, 'pipe-1'))
 })
 
 test('createPlatformHost refuses to let extra tools shadow the built-in fs boundary', () => {
@@ -196,4 +238,61 @@ test('no-Harness host parks at every human gate and resumes without regenerating
   const gateTasks = await lastHost!.gateTasks.list({ pipelineId: 'pipe-1' })
   assert.equal(gateTasks.length, STAGE_ORDER.length)
   assert.equal(gateTasks.every(task => task.consumedAt !== undefined), true)
+})
+
+/**
+ * 跑到流水线自行停下（返回结果）或跑完：遇人工门一律批准。
+ * 每次重试都是新宿主（等价于 CLI 每次 `run` 都是新进程）。
+ */
+async function driveWithApprovals(
+  config: PipelineConfig,
+  extra: Record<string, unknown> = {},
+): Promise<{ outcome: { outcome: string; stageId?: string }; host: ReturnType<typeof createPlatformHost> }> {
+  for (let round = 0; round <= STAGE_ORDER.length + 1; round += 1) {
+    const host = createPlatformHost(hostOptions(config, { gateWaitTimeoutMs: 0, fetchImpl: stubFetch({ calls: 0 }), ...extra }))
+    try {
+      const outcome = await host.driver.run() as { outcome: string; stageId?: string }
+      return { outcome, host }
+    } catch (error) {
+      if (!(error instanceof HumanGateWaitAbortedError)) throw error
+      const open = await host.gateTasks.list({ pipelineId: 'pipe-1', status: 'pending' })
+      assert.equal(open.length, 1, '挂起时必须恰好有一条待裁决的门')
+      await host.gateTasks.claim(open[0]!.gateTaskId, 'alice', 60_000)
+      await host.gateTasks.decide(open[0]!.gateTaskId, 'alice', 'approved', '通过')
+    }
+  }
+  throw new Error('流水线在阶段预算内没有停下')
+}
+
+/** 只把 execute 阶段的规则换成给定集合，其余阶段不设规则，隔离出"执行可信"这一条链路。 */
+function configWithExecuteRules(rules: readonly string[]): PipelineConfig {
+  return baseConfig({
+    stages: Object.fromEntries(STAGE_ORDER.map(id => [id, {
+      rules: id === 'execute' ? [...rules] : [],
+      review: { enabled: false },
+    }])),
+  })
+}
+
+test('the execute stage is blocked when the executor produced no session', async () => {
+  const { outcome, host } = await driveWithApprovals(configWithExecuteRules(['R4-08', 'R4-09', 'R4-10']))
+
+  assert.deepEqual(outcome, { outcome: 'gate-failed', stageId: 'execute' })
+  const raw = await readFile(join(host.roots.projectRoot, 'checkpoints', 'pipe-1', 'checkpoint.json'), 'utf8')
+  const checkpoint = JSON.parse(raw) as { stageStates: Record<string, { gate: { machine: { violations: Array<{ rule: string; detail: string }> } } }> }
+  const violations = checkpoint.stageStates.execute!.gate.machine.violations
+  // 执行会话缺失必须被判"未提供执行数据"，而不是默默放行一份没有执行证据的产物
+  assert.match(JSON.stringify(violations), /executor execution data not provided/)
+  assert.ok(violations.some(violation => violation.rule === 'R4-08'))
+})
+
+test('the execute stage passes once a real executor session is on disk', async () => {
+  const probe = createPlatformHost(hostOptions(baseConfig()))
+  const sessionPath = executorSessionPath(probe.roots.projectRoot, 'pipe-1')
+  await mkdir(dirname(sessionPath), { recursive: true })
+  // 空链是合法链：stub 模型产出的 design/execute 产物都没有用例与结果，对账自然为空集。
+  await writeFile(sessionPath, JSON.stringify({ pipelineId: 'pipe-1', records: [], evidence: [] }), 'utf8')
+
+  const { outcome } = await driveWithApprovals(configWithExecuteRules(['R4-08', 'R4-09', 'R4-10']))
+  assert.deepEqual(outcome, { outcome: 'completed' })
 })

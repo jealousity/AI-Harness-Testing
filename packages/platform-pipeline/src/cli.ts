@@ -145,6 +145,11 @@ async function openHost(args: readonly string[], hooks: {
   const rulesetVersion = argValue(args, '--ruleset-version')
   const maxGateRetries = optionalInteger(args, '--max-gate-retries')
   const receiveInput = argValue(args, '--input')
+  // execute 阶段的 executor_run 需要真实被测服务基址；缺省时该工具拒绝执行（不伪造记录）。
+  const targetBaseUrl = argValue(args, '--target-base-url')
+  // env_diag 的固定探针白名单：只允许探测显式声明的环境变量，模型不能自行指定目标。
+  const diagCredentials = (argValue(args, '--diag-credential') ?? '')
+    .split(',').map(value => value.trim()).filter(value => value !== '')
   return createPlatformHost({
     config: cfg,
     dataRoot: requireArg(args, '--data-root'),
@@ -155,6 +160,10 @@ async function openHost(args: readonly string[], hooks: {
     ...(rulesetVersion === undefined ? {} : { rulesetVersion }),
     ...(maxGateRetries === undefined ? {} : { maxGateRetries }),
     ...(receiveInput === undefined ? {} : { receiveInput }),
+    ...(targetBaseUrl === undefined ? {} : { targetBaseUrl }),
+    ...(diagCredentials.length === 0
+      ? {}
+      : { diagProbes: diagCredentials.map(target => ({ kind: 'credentials' as const, target })) }),
   })
 }
 
@@ -282,7 +291,7 @@ async function gateCancel(args: readonly string[]): Promise<void> {
 const USAGE = [
   '用法：',
   '  node src/cli.ts validate --config <pipeline.yaml>',
-  '  node src/cli.ts run --config <pipeline.yaml> --data-root <dir> --pipeline-id <id> [--input <file>] [--wait-ms <n>] [--provider <name>]',
+  '  node src/cli.ts run --config <pipeline.yaml> --data-root <dir> --pipeline-id <id> [--input <file>] [--wait-ms <n>] [--provider <name>] [--target-base-url <url>] [--diag-credential <ENV_VAR,...>]',
   '  node src/cli.ts status --config <pipeline.yaml> --data-root <dir> --pipeline-id <id>',
   '  node src/cli.ts status --checkpoint-root <dir> --pipeline-id <id>',
   '  node src/cli.ts reenter --config <pipeline.yaml> --data-root <dir> --pipeline-id <id> --stage <id> --by <actor> --reason <text>',

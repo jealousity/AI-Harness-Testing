@@ -79,6 +79,10 @@ ALLOW_PRIVATE_API=1 node server.mjs
 - `OpenAIReviewRunner` 补齐了无 Harness 的交叉检查：`assembleReviewPrompt` → LlmClient → 只读工具循环（默认只暴露 `fs_read`）→ 结构化审核报告；findings 出现 `blocker` 时强制 `fail`（不采信模型自报的 `pass`），审核不可用一律降级 `degraded` 而不阻塞流水线。
 - `fsReadTool` / `fsWriteTool` 是阶段 prompt 要求「先写产物再结束」的落地依赖：路径相对工作区根解析并做 realpath 二次校验（拒绝绝对路径、`..` 越界和软链接逃逸），`fs_write` 只覆盖 `artifacts/<pipelineId>/`。
 - `createPlatformHost` 把上述部件按 pipeline 配置装配成可直接运行的宿主（provider 由 `LlmProviderRegistry` 选择，API Key 只从环境变量注入）；`createCheckpointHost` 只装配检查点侧能力，因此 `reenter` 一类运维操作**不需要 API Key**。
+- `buildPlatformTools` 补齐了平台 ACL 声明但宿主原先缺失的工具实现，使各阶段的 `allow` 真正可达（此前 analyze/execute/archive 拿到的工具集是空的）：`parse_doc`（md/txt/yaml 文本族、csv/tsv 结构化表格、json 归一化；xlsx/docx/pdf 等二进制显式报错而非返回乱码）、`kb_query`/`kb_write`、`case_query`/`case_archive`、`executor_run`、`env_diag`、`req_pull`、`gate_check`。全部建立在无框架依赖的 `stores/markdown.ts`、`executor/*`、`checkpoint.ts` 之上，Harness 宿主同样可复用。
+- 工具实现遵循三条硬约束：**不伪装**（store 未配置返回 `available: false` 并附 `hint`，绝不返回空结果让模型误判"库里没有"；未配置 `targetBaseUrl` 时 `executor_run` 直接报错，不产出伪造的执行记录）、**不越权**（路径统一走 `WorkspaceScope` 的 realpath 包含性校验；证据落盘前剥离绝对路径前缀再校验，用例 id 里带 `../` 会被拒绝）、**不串流水线**（模型传入的 `pipelineId` 与宿主不一致即拒绝）。`kb_write`/`case_archive` 的 `project`/`sourcePipeline` 身份字段由宿主强制，不接受模型改写。
+- `createExecutionLoader` 把 executor 的执行会话接进 driver：`execute` 阶段的门禁（R4-08/09/10）据此对账执行记录、时序链与证据指纹。会话缺失 = 尚未真实执行，门禁判定"未提供执行数据"并拦截，而不是放行一份没有执行证据的产物。
+- `validateApprovalCoverage` 在启动时校验「需审批工具 ↔ 阻塞人工门」：阶段允许了 `kb_write`/`case_archive`（`requiresApproval`）却没有阻塞人工门 = 配置错误，立即失败；归档写库的批次审批由该阶段的人工门承担（docs/06 第 7 节）。
 - CLI 新增 `run` / `reenter` / `gate-list` / `gate-claim` / `gate-decide` / `gate-cancel`：`run` 遇到人工门且 `--wait-ms` 内无人裁决时打印待办并以退出码 3 结束，裁决后再执行一次 `run` 即从该门续跑（产物不重生成、审核不重跑）。
 - `projectDataRoot` / `scopedPath` / `resolvePlatformRoots` 为 Harness、CLI、Web 共享租户/项目目录边界，拒绝跨项目和 `..` 路径逃逸，并统一 artifacts/checkpoints/knowledge/cases 目录。
 - `parseMarkdownKnowledge` 与 `parseDelimitedKnowledge` 支持 Markdown 章节、CSV/TSV 表格导入，统一生成 `draft` 知识条目并保留 `sourceRefs`；用例库仍由 `MarkdownCaseStore` 独立管理。
@@ -146,9 +150,10 @@ ALLOW_PRIVATE_API=1 node server.mjs
 - 设计文档：**9 份全部定稿**，开放问题全部清零
 - 决策：**24 条全部确认**（D-01~D-20 + I-1~I-4）
 - 六阶段 prompt 模板：**全部评审通过**
-- 实现：核心编排、执行可信、知识库生命周期和通用平台基础已落地（`packages/platform-pipeline`，当前 263 项测试全绿）；方案一已提供无 Harness 的通用 runtime 端口、OpenAI-compatible 阶段/审核 runner、可恢复人工门和 CLI 运行通道；仍有 Web 入口、`kb_query`/`case_query`/`executor_run` 等知识库与执行器工具的无 Harness 接线、跨进程文件锁、外部存储、预算计量等生产化工作待完成
+- 实现：核心编排、执行可信、知识库生命周期和通用平台基础已落地（`packages/platform-pipeline`，当前 295 项测试全绿）；方案一已提供无 Harness 的通用 runtime 端口、OpenAI-compatible 阶段/审核 runner、可恢复人工门、CLI 运行通道，以及覆盖平台 ACL 全部工具名的通用工具集与执行会话对账接线；仍有 Web 入口、跨进程文件锁、外部存储、预算计量等生产化工作待完成
 - 当前阶段按源码构建和 Harness 宿主部署，不保留过期 tgz 打包产物；provider 配置、项目作用域和知识导入已具备基础实现
 - 测试与构建需要 Node ≥ 24（`src/harness/tool-timeout.ts` 使用了 `using` 显式资源管理语法）；用更低版本运行 `node --test` 会在加载该文件时报 `SyntaxError: Unexpected identifier`，属于环境问题而非代码缺陷
+- 本机默认堆上限下 `tsc --noEmit` 可能被系统 OOM 杀掉（退出码 137，无任何输出）；用 `NODE_OPTIONS=--max-old-space-size=6144 tsc --noEmit` 即可通过，同样是环境问题
 
 ## 无 Harness 运行通道（CLI）
 

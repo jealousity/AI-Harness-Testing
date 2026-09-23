@@ -92,8 +92,11 @@ export function fsWriteTool(options: FsWriteToolOptions): ToolDefinition<{ path?
 /**
  * 工作区路径作用域：解析 root 的真实路径（消解 /tmp → /private/tmp 一类软链接），
  * 之后所有候选路径都在真实根下解析并做包含性校验。
+ *
+ * 导出给宿主其他工具（parse_doc / executor_run 的会话与证据落盘）复用同一套边界，
+ * 避免各处各写一份 realpath 校验而出现口径漂移。
  */
-class WorkspaceScope {
+export class WorkspaceScope {
   private readonly rawRoot: string
   private cached: string | undefined
 

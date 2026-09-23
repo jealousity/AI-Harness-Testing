@@ -11,10 +11,18 @@ import { STAGE_ORDER, type Checkpoint, type StageId, type StageState } from './t
 
 export const CHECKPOINT_FILE = 'checkpoint.json'
 
+/**
+ * 产物相对路径约定（检查点初始化与宿主工具共用，避免两处拼路径漂移）：
+ * `artifacts/<pipelineId>/<stageId>.json`，相对平台项目根（= FsArtifactStore 的 baseDir）。
+ */
+export function artifactPath(pipelineId: string, stageId: StageId): string {
+  return `artifacts/${pipelineId}/${stageId}.json`
+}
+
 function initialState(stageId: StageId, pipelineId: string): StageState {
   return {
     status: 'idle',
-    artifact: `artifacts/${pipelineId}/${stageId}.json`,
+    artifact: artifactPath(pipelineId, stageId),
     digest: '',
     inputs: {},
     history: [],

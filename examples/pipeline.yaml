@@ -1,9 +1,13 @@
 # 示例：ACME 支付平台测试流水线（docs/02 第 2 节 schema 草案的完整示例）
 # 用法：node packages/platform-pipeline/src/cli.ts validate --config examples/pipeline.yaml
 # 运行：node packages/platform-pipeline/src/cli.ts run --config examples/pipeline.yaml \
-#         --data-root <数据根> --pipeline-id <id>
+#         --data-root <数据根> --pipeline-id <id> \
+#         --target-base-url https://staging.acme-pay.example.com \
+#         --diag-credential ACME_API_TOKEN
 #   无 Harness 宿主由 CLI 自行装配（provider 取自下方 llm.providers，API Key 经 apiKeyEnv 注入）；
 #   遇到人工门会挂起并打印待办，用 gate-decide 裁决后再 run 一次即续跑。
+#   --target-base-url 供 execute 阶段的 executor_run 真实发请求（缺省时该工具拒绝执行，不伪造记录）；
+#   --diag-credential 是 env_diag 的探针白名单（只探测显式声明的环境变量，模型不能自行指定目标）。
 #   也可以继续通过宿主 pipeline_run 工具注入 spawner/human 执行。
 # 注："G-01..G-07" 范围记号在装载时展开（expandRuleList）。
 

@@ -47,7 +47,22 @@ export {
   type PersistentHumanGateOptions,
 } from './persistent-human-gate.ts'
 
-export { FsToolPathError, fsReadTool, fsWriteTool, type FsReadToolOptions, type FsWriteToolOptions } from './fs-tools.ts'
+export {
+  FsToolPathError,
+  WorkspaceScope,
+  fsReadTool,
+  fsWriteTool,
+  type FsReadToolOptions,
+  type FsWriteToolOptions,
+} from './fs-tools.ts'
+
+export {
+  buildPlatformTools,
+  executorEvidenceDir,
+  executorSessionPath,
+  loadExecutionSession,
+  type PlatformToolContext,
+} from './platform-tools.ts'
 
 export { DEFAULT_REVIEW_TOOLS, OpenAIReviewRunner, type OpenAIReviewRunnerOptions } from './openai-review-runner.ts'
 
@@ -55,9 +70,11 @@ export {
   DEFAULT_RULESET_VERSION,
   buildGateEngine,
   createCheckpointHost,
+  createExecutionLoader,
   createPlatformHost,
   gateTaskStoreDir,
   taskStoreDir,
+  validateApprovalCoverage,
   type CheckpointHost,
   type CheckpointHostOptions,
   type PlatformHost,
