@@ -15,6 +15,18 @@ export type {
 export { InMemoryToolRegistry, ToolAccessError, executeTool } from './tool-registry.ts'
 export { OpenAICompatibleClient, OpenAICompatibleError, type OpenAICompatibleClientOptions } from './openai-client.ts'
 export { OpenAIStageRunner, type OpenAIStageRunnerOptions } from './openai-stage-runner.ts'
+export {
+  FileHumanGateTaskStore,
+  FileTaskStore,
+  newTaskId,
+  type HumanGateTask,
+  type HumanGateTaskStatus,
+  type HumanGateTaskStore,
+  type Lease,
+  type TaskRecord,
+  type TaskStatus,
+  type TaskStore,
+} from './persistence.ts'
 
 export {
   CallbackHumanGate,
