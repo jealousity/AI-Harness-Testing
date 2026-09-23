@@ -30,6 +30,7 @@
 | `platform-scope.ts` | tenant/project/environment 作用域和安全数据目录 | 平台化 |
 | `knowledge-import.ts` | Markdown 章节、CSV/TSV 表格导入为 draft 知识条目 | 平台化 |
 | `runtime/` | 无 Harness 的 StageRunner / LlmClient / ToolRegistry / HumanGate 端口、ScriptedStageRunner、OpenAICompatibleClient、OpenAIStageRunner、TaskStore 与 HumanGateTaskStore | 方案一 |
+| `web/` | 无 HTTP 框架依赖的 `PipelineRunService`：作用域/身份校验、配置装载与缓存、宿主装配、检查点与人工门驱动的 create/get/run/reenter/gate-*；Web 状态与阶段视图（12 字段）全部由持久化事实重建 | 10 §4/§5 |
 
 ## 使用
 
@@ -77,8 +78,9 @@ await ctx.plugin(platformPipelineHost, {
 
 ## 状态
 
-- 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）
-- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **213 项测试全绿**
+- 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **325 项测试全绿**
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
+- Web 运行服务（M0 契约层）：`platform-pipeline/web` 提供无 HTTP 框架依赖的 `PipelineRunService`，覆盖 create/get/run/reenter 与人工门 list/claim/decide/cancel；Web 状态与阶段视图全部由检查点、产物与人工门任务重建，服务层不复制阶段逻辑。HTTP 路由接入见 docs/10 §5（M1）。
 - 当前阶段不生成 tgz 打包产物；通用核心默认入口不加载 Harness 适配层，Harness 宿主代码通过 `platform-pipeline/harness` 与 `platform-pipeline/harness-plugin` 可选子路径使用。
 - `FileTaskStore` / `FileHumanGateTaskStore` 通过原子 JSON 文件记录任务状态、worker lease、heartbeat 和人工门决策；适合作为单机/单数据根实现，分布式部署仍需数据库或队列后端。

@@ -13,6 +13,7 @@
   "exports": {
     ".": "./dist/index.js",
     "./runtime": "./dist/runtime/index.js",
+    "./web": "./dist/web/index.js",
     "./harness": "./dist/harness/index.js",
     "./harness-plugin": "./dist/harness/host-plugin.js",
     "./*.js": "./dist/*.js",
