@@ -149,23 +149,78 @@ test('parse_doc 对 json：合法时规范化，非法时降为 partial 而不�
   assert.ok(broken.diagnostics.some(item => item.code === 'STRUCTURED_PARSE_FAILED'))
 })
 
-test('parse_doc 对没有解析器的格式返回 unsupported，绝不按文本读出乱码', async () => {
-  // 真正的 OOXML/ZIP 头（PK\x03\x04）与 OLE2 头（D0CF11E0…），扩展名与内容一致。
+test('parse_doc 对 ZIP 签名与扩展名冲突的容器按扩展名消歧，损坏时不返回假内容', async () => {
+  // 截断的 ZIP：签名在、结构不在。关键断言是 format 必须是 xlsx——ZIP 签名同时属于
+  // docx 与 xlsx，只能由扩展名消歧（documents/document-detect.ts 的 resolveContainerFormat）。
+  // 判错格式会把工作簿路由到 Word 解析器。
   await writeFile(join(dir, 'spec.xlsx'), Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00]))
   const xlsx = await parse({ path: 'spec.xlsx' })
   assert.equal(xlsx.available, true)
-  assert.equal(xlsx.status, 'unsupported')
-  // 关键：ZIP 容器必须由扩展名消歧，不能因为共享 ZIP 签名就报成 docx。
+  assert.equal(xlsx.status, 'parse-failed')
   assert.equal(xlsx.format, 'xlsx')
   assert.equal(xlsx.plainText, '')
-  assert.ok(xlsx.diagnostics.some(item => item.code === 'FORMAT_NOT_SUPPORTED' && item.severity === 'error'))
+  assert.deepEqual([...xlsx.sections], [])
+  assert.ok(xlsx.diagnostics.some(item => item.code === 'STRUCTURED_PARSE_FAILED' && item.severity === 'error'))
+})
 
-  await writeFile(join(dir, 'old.doc'), Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0x00, 0x00]))
+test('parse_doc 对未配置适配器的老格式返回 unsupported，并给出定向转换提示', async () => {
+  const ole2 = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0x00, 0x00])
+
+  await writeFile(join(dir, 'old.doc'), ole2)
   const doc = await parse({ path: 'old.doc' })
+  assert.equal(doc.available, true)
   assert.equal(doc.status, 'unsupported')
   assert.equal(doc.format, 'doc')
+  assert.equal(doc.plainText, '')
+  assert.ok(doc.diagnostics.some(item => item.code === 'FORMAT_NOT_SUPPORTED' && item.severity === 'error'))
   // docs/10 §5.6.5 B：.doc 必须明确 unsupported 并提示转换为 .docx。
   assert.match(doc.diagnostics.map(item => item.message).join(' '), /转换为 \.docx/)
+
+  await writeFile(join(dir, 'old.xls'), ole2)
+  const xls = await parse({ path: 'old.xls' })
+  assert.equal(xls.status, 'unsupported')
+  assert.equal(xls.format, 'xls')
+  // OLE2 是 .doc/.xls 共享容器：判错会把提示引到错误的转换目标。
+  assert.match(xls.diagnostics.map(item => item.message).join(' '), /转换为 \.xlsx/)
+})
+
+test('parse_doc 对四类必支持格式都能成功解析并给出可定位的 sourceRef', async () => {
+  // docs/10 §5.6.11 第 1、4 条：四类格式都有实际 fixture 与成功解析测试，
+  // 且所有知识条目带可定位 sourceRefs。
+  const { buildDocx, buildPdf, buildXlsx } = await import('./document-fixtures.ts')
+
+  await writeFile(join(dir, 'req.pdf'), buildPdf({ pages: [{ lines: ['PDF requirement'] }] }))
+  await writeFile(join(dir, 'spec.docx'), buildDocx({
+    body: [{ kind: 'heading', level: 1, text: 'Word 需求' }, { kind: 'paragraph', text: '正文。' }],
+  }))
+  await writeFile(join(dir, 'cases.xlsx'), buildXlsx({
+    sheets: [{ name: '接口', rows: [['用例ID', '接口'], ['TC-1', '/api/login']] }],
+  }))
+  await writeFile(join(dir, 'kb.md'), '# Markdown 需求\n\n正文。\n', 'utf8')
+
+  const expected: readonly (readonly [string, string])[] = [
+    ['req.pdf', 'req.pdf#page=1'],
+    ['spec.docx', 'spec.docx#heading=1'],
+    // XLSX 的表级 sourceRef 覆盖整片已用区域；行级位置在 tables[].rowRefs 上（见下）。
+    ['cases.xlsx', 'cases.xlsx#sheet=接口!A1:B2'],
+    ['kb.md', 'kb.md#heading=1'],
+  ]
+
+  for (const [path, ref] of expected) {
+    const result = await parse({ path })
+    assert.equal(result.available, true, `${path} 应当可用`)
+    assert.equal(result.status, 'parsed', `${path} 应当解析成功`)
+    assert.equal(result.plainText.trim() === '', false, `${path} 应当有可检索正文`)
+    // sourceRefs 是知识投影能回读原文的唯一依据。
+    assert.ok(result.sourceRefs.includes(ref), `${path} 缺少 sourceRef ${ref}，实际 ${result.sourceRefs.join(', ')}`)
+    assert.match(result.sha256 ?? '', /^[0-9a-f]{64}$/)
+  }
+
+  // 表格行必须能追溯到原始位置（§5.6.7），行级 ref 挂在 rowRefs 上。
+  const xlsx = await parse({ path: 'cases.xlsx' })
+  assert.deepEqual(xlsx.tables[0]!.rowRefs, ['cases.xlsx#sheet=接口!A2:B2'])
+  const docx = await parse({ path: 'spec.docx' })
+  assert.deepEqual([...docx.sections.map(section => section.sourceRef)], ['spec.docx#heading=1'])
 })
 
 test('parse_doc 的路径越界与文件缺失返回结构化失败，而不是抛出或返回空结果', async () => {

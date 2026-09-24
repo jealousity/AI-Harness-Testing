@@ -2,7 +2,7 @@
 
 测试辅助平台六阶段流水线插件包（设计文档见仓库根 `docs/`，实现骨架见 `docs/09-implementation-skeleton.md`）。
 
-六阶段：需求接收 → 需求分析 → 测试设计 → 测试执行 → 测试报告 → 产物归档。核心运行时**不依赖任何 Harness 包**（仅 `yaml`），DeepSeek Harness 作为可选适配层通过 `platform-pipeline/harness` 子路径接入；**独立 npm 包**部署（I-4：任何人任何平台可部署）。
+六阶段：需求接收 → 需求分析 → 测试设计 → 测试执行 → 测试报告 → 产物归档。核心运行时**不依赖任何 Harness 包**（仅 `yaml` + 文档解析用的 `fflate`/`pdfjs-dist`），DeepSeek Harness 作为可选适配层通过 `platform-pipeline/harness` 子路径接入；**独立 npm 包**部署（I-4：任何人任何平台可部署）。
 
 ## 架构一句话
 
@@ -29,7 +29,8 @@
 | `provider-registry.ts` | 通用 OpenAI-compatible provider 声明、环境变量密钥检查与能力选择 | 平台化 |
 | `platform-scope.ts` | tenant/project/environment 作用域和安全数据目录 | 平台化 |
 | `knowledge-import.ts` | Markdown 章节、CSV/TSV 表格导入为 draft 知识条目 | 平台化 |
-| `documents/` | 文档解析注册表与统一中间表示：格式检测（magic bytes 优先）/ 限额与超时 / 解压与路径安全 / Markdown·CSV·TSV·TXT·YAML·JSON 解析器 / `ParsedDocument` → draft 知识投影。CLI、Web、Harness 三入口共用 `defaultParserRegistry()` | 10 §5.6 |
+| `documents/` | 文档解析注册表与统一中间表示：格式检测（magic bytes 优先）/ 限额与超时 / 安全解包（白名单 + 逐块硬上限 + 路径穿越即拒绝）/ **PDF**（`pdfjs-dist`，按页 `#page=N`，不产出表格）/ **DOCX**（标题三级判据、列表、表格、合并单元格不复制内容、页眉页脚不并入正文、宏与嵌入对象不解压）/ **XLSX**（两趟解包、日期/布尔/错误/公式按缓存值、隐藏 sheet 默认不读、`#sheet=接口!A2:F20`）/ Markdown·CSV·TSV·TXT·YAML·JSON 解析器 / `ParsedDocument` → draft 知识投影。CLI、Web、Harness 三入口共用 `defaultParserRegistry()` | 10 §5.6 |
+| `documents/xml.ts` + `documents/zip-reader.ts` | OOXML 的唯一 XML 与 ZIP 入口：自研分词器不做实体扩展（XXE 与实体爆炸**构造上不可能**）；白名单解包使不读的字节不可能造成危害；不信任 ZIP 声明值，按逐块实际字节执行硬上限 | 10 §5.6.5 / ADR-0001 |
 | `runtime/` | 无 Harness 的 StageRunner / LlmClient / ToolRegistry / HumanGate 端口、ScriptedStageRunner、OpenAICompatibleClient、OpenAIStageRunner、TaskStore 与 HumanGateTaskStore、平台标准工具集（`parse_doc`/`kb_*`/`case_*`/`executor_run`/`env_diag`/`req_pull`/`gate_check`） | 方案一 |
 | `web/` | 无 HTTP 框架依赖的 `PipelineRunService`：作用域/身份校验、配置装载与缓存、宿主装配、检查点与人工门驱动的 create/get/run/reenter/gate-*；Web 状态与阶段视图（12 字段）全部由持久化事实重建 | 10 §4/§5 |
 
@@ -61,8 +62,10 @@ export PLATFORM_LLM_API_KEY=...
 
 | 层 | 运行时依赖 | 说明 |
 |---|---|---|
-| 核心（`.`、`/runtime`、`/documents`、`/web`） | 仅 `yaml` | 不引用任何 `@deepseek-ai/*`；根入口的公开类型面也不含 cordis 类型 |
+| 核心（`.`、`/runtime`、`/documents`、`/web`） | `yaml` + `fflate` + `pdfjs-dist` | 不引用任何 `@deepseek-ai/*`；根入口的公开类型面也不含 cordis 类型 |
 | Harness 适配层（`/harness`、`/harness-plugin`） | `@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-timeout` + 类型级 cordis/dsh-agent/dsh-llm/dsh-subagent/dsh-user-questions | 声明为 **optional peerDependencies**，harness-free 消费者不会被强制安装 |
+
+两个文档解析依赖的许可证与体积已按 docs/10 §5.6.9 记录在 `docs/adr/0001-document-parsing-libraries.md`：`fflate`（MIT，零依赖）与 `pdfjs-dist`（Apache-2.0，零依赖，解压约 33 MiB 且**懒加载**——只有真的解析 PDF 时才 `import()`，markdown/csv 路径不受影响）。
 
 因此：`import 'platform-pipeline'`、`platform-pipeline/runtime`、`platform-pipeline/documents`、`platform-pipeline/web` 在任何环境都可直接使用；只有 `platform-pipeline/harness` 与 `platform-pipeline/harness-plugin` 需要宿主自行安装上表的 Harness 包。这四条不变量由 `test/harness-isolation.test.ts` 持续守卫（核心零引用、peer 声明与实际引用一致、`src/e2e` 不进发布物）。
 
@@ -90,12 +93,15 @@ await ctx.plugin(platformPipelineHost, {
 
 ## 状态
 
-- 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）
-- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **330 项测试全绿**
+- 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）+ 1 份 ADR（docs/adr/0001 文档解析库选型）
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **447 项测试全绿**
   - 注：在受限沙箱里跑全量 `node --test` 时，`test/fs-tools.test.ts` 的清理步骤可能被宿主 `safe-delete` 批量删除守卫拦下（按「每轮删除次数 > 阈值」判定，与代码无关）。单独运行该文件即通过。
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
 - Web 运行服务（M0 契约层）：`platform-pipeline/web` 提供无 HTTP 框架依赖的 `PipelineRunService`，覆盖 create/get/run/reenter 与人工门 list/claim/decide/cancel；Web 状态与阶段视图全部由检查点、产物与人工门任务重建，服务层不复制阶段逻辑。HTTP 路由接入见 docs/10 §5（M1）。
-- 文档解析（P0-A1 进行中）：`documents/` 已提供注册表 + 统一中间表示 + 文本族解析器；`parse_doc` 已改为走注册表，返回 `status`/`confidence`/`sections`/`tables`/`plainText`/`sourceRefs`/`diagnostics`/`limits`，并按 §5.6.8 不回传原始字节。PDF/DOCX/XLSX 解析器待实现，当前显式返回 `unsupported`。
+- **文档解析（P0-A1 完成）**：`documents/` 已提供注册表 + 统一中间表示 + **PDF/DOCX/XLSX/Markdown 四类必支持格式** + 文本族与分隔符表格解析器；`parse_doc` 走注册表，返回 `status`/`confidence`/`sections`/`tables`/`plainText`/`sourceRefs`/`diagnostics`/`limits`，并按 §5.6.8 不回传原始字节。`.doc`/`.xls` 按 ADR-0001 §9 显式 `unsupported` 并给出定向转换提示。
+  - `sourceRef` 四级可追溯：`requirements.pdf#page=3`、`spec.docx#heading=1.1,table=1,row=2`、`cases.xlsx#sheet=接口!A2:F20`、`cases.csv#table=1,row=2`。
+  - 不伪装：无文本层 → `partial` + `NO_TEXT_LAYER`；无缓存公式值 → `FORMULA_VALUE_UNAVAILABLE` 且**绝不自行计算**；无解析器 → `unsupported`；二进制族 magic 不匹配 → **绝不退回按文本读**。
+  - 安全：OOXML 走白名单解包（不读的字节不可能造成危害）+ 逐块实际字节硬上限（不信任 ZIP 声明值）+ 路径穿越即拒绝 + 全内存不落盘；自研 XML 分词器不做实体扩展，XXE 与实体爆炸**构造上不可能**；宏/嵌入对象/ActiveX/外链在解包阶段出局。
 - Harness 解耦由 `test/harness-isolation.test.ts` 守卫：核心源码零 `@deepseek-ai/*` 引用、适配层依赖全部声明为 optional peer、`src/e2e` 不进构建产物。
 - 当前阶段不生成 tgz 打包产物；通用核心默认入口不加载 Harness 适配层，Harness 宿主代码通过 `platform-pipeline/harness` 与 `platform-pipeline/harness-plugin` 可选子路径使用。
 - `FileTaskStore` / `FileHumanGateTaskStore` 通过原子 JSON 文件记录任务状态、worker lease、heartbeat 和人工门决策；适合作为单机/单数据根实现，分布式部署仍需数据库或队列后端。

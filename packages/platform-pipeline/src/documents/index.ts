@@ -15,8 +15,11 @@
 
 import { DocumentParserRegistry } from './document-parser.ts'
 import { DelimitedParser } from './delimited-parser.ts'
+import { DocxParser } from './docx-parser.ts'
 import { MarkdownParser } from './markdown-parser.ts'
+import { PdfParser } from './pdf-parser.ts'
 import { JsonParser, PlainTextParser, YamlParser } from './text-parser.ts'
+import { XlsxParser } from './xlsx-parser.ts'
 
 export * from './document-types.ts'
 export * from './document-detect.ts'
@@ -24,16 +27,24 @@ export * from './document-limits.ts'
 export * from './document-parser.ts'
 export * from './document-sanitize.ts'
 export * from './knowledge-projection.ts'
+export * from './xml.ts'
+export * from './zip-reader.ts'
 export { DelimitedParser, parseDelimitedRows } from './delimited-parser.ts'
 export { MarkdownParser } from './markdown-parser.ts'
 export { JsonParser, PlainTextParser, YamlParser } from './text-parser.ts'
+export { PdfParser, PdfjsTextExtractor } from './pdf-parser.ts'
+export { DocxParser } from './docx-parser.ts'
+export { XlsxParser } from './xlsx-parser.ts'
 
 /**
  * 内置解析器注册表。
  *
- * 当前覆盖文本族（text/yaml/json）、Markdown 与分隔符表格（csv/tsv）。
- * `pdf`/`docx`/`xlsx` 尚未注册，`doc`/`xls` 按 docs/10 §5.6.5 B/C 的决策
- * **不提供适配器**——注册表找不到解析器时统一返回 `unsupported`，绝不退回按文本读。
+ * 覆盖四类必须支持的格式（PDF / Word / Excel / Markdown）+ 文本族（text/yaml/json）
+ * 与分隔符表格（csv/tsv），即 docs/10 §5.6.11 第 1 条的"四类格式都有实际 fixture
+ * 和成功解析测试"。
+ *
+ * `doc`/`xls` 按 docs/10 §5.6.5 B/C 的决策**不提供适配器**（ADR-0001 §9）——注册表
+ * 找不到解析器时统一返回 `unsupported` 并给出定向转换提示，绝不退回按文本读。
  *
  * 注意：`text` 格式同时服务 `.txt/.log/.rst/.adoc` 与无扩展名文件，因此
  * `PlainTextParser.canParse` 是唯一会接受"扩展名未知"的解析器；注册表只在
@@ -41,6 +52,9 @@ export { JsonParser, PlainTextParser, YamlParser } from './text-parser.ts'
  */
 export function defaultParserRegistry(): DocumentParserRegistry {
   return new DocumentParserRegistry([
+    new PdfParser(),
+    new DocxParser(),
+    new XlsxParser(),
     new MarkdownParser(),
     new DelimitedParser('csv'),
     new DelimitedParser('tsv'),

@@ -101,19 +101,39 @@ export function classifyDangerousPart(entryName: string): DangerousPart | undefi
   return DANGEROUS_PARTS.find(part => part.pattern.test(entryName))
 }
 
-/** 为一批被跳过的危险部件生成诊断（按类别聚合，避免几十条重复警告）。 */
+/** 危险部件类别的中文标签（聚合诊断用）。 */
+const DANGEROUS_KIND_LABELS: Readonly<Record<DangerousPartKind, string>> = {
+  macro: '宏',
+  'ole-object': 'OLE 嵌入对象',
+  embedded: '嵌入文件',
+  activex: 'ActiveX 控件',
+  'external-link': '外部链接',
+}
+
+/**
+ * 为一批被跳过的危险部件生成诊断（按**类别**聚合，避免几十条重复警告）。
+ *
+ * 类别内可能命中多条不同规则（例如 `vbaProject.bin` 与 `vbaData.xml` 同属 `macro`
+ * 但原因不同）。此时原因全部列出，而不是只留下最后一条——否则诊断会声称一个
+ * 只对其中一部分部件成立的原因。
+ */
 export function dangerousPartDiagnostics(entryNames: readonly string[]): readonly DocumentDiagnostic[] {
-  const byKind = new Map<DangerousPartKind, { reason: string; count: number }>()
+  const byKind = new Map<DangerousPartKind, { reasons: Set<string>; count: number }>()
   for (const name of entryNames) {
     const part = classifyDangerousPart(name)
     if (part === undefined) continue
     const current = byKind.get(part.kind)
-    byKind.set(part.kind, { reason: part.reason, count: (current?.count ?? 0) + 1 })
+    if (current === undefined) byKind.set(part.kind, { reasons: new Set([part.reason]), count: 1 })
+    else {
+      current.reasons.add(part.reason)
+      current.count += 1
+    }
   }
   return [...byKind].map(([kind, value]) => ({
     code: DOCUMENT_DIAGNOSTIC_CODES.dangerousPartRemoved,
     severity: 'warning' as const,
-    message: `已跳过 ${value.count} 个${value.reason}部件（${kind}）：解析器不执行宏、脚本、嵌入对象或外部链接。`,
+    message: `已跳过 ${value.count} 个${DANGEROUS_KIND_LABELS[kind]}部件（${kind}）：${[...value.reasons].join('、')}。`
+      + '解析器不执行宏、脚本、嵌入对象或外部链接。',
   }))
 }
 

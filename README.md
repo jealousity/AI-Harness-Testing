@@ -150,7 +150,7 @@ ALLOW_PRIVATE_API=1 node server.mjs
 - 设计文档：**9 份全部定稿**，开放问题全部清零
 - 决策：**24 条全部确认**（D-01~D-20 + I-1~I-4）
 - 六阶段 prompt 模板：**全部评审通过**
-- 实现：核心编排、执行可信、知识库生命周期和通用平台基础已落地（`packages/platform-pipeline`，当前 295 项测试全绿）；方案一已提供无 Harness 的通用 runtime 端口、OpenAI-compatible 阶段/审核 runner、可恢复人工门、CLI 运行通道，以及覆盖平台 ACL 全部工具名的通用工具集与执行会话对账接线；仍有 Web 入口、跨进程文件锁、外部存储、预算计量等生产化工作待完成
+- 实现：核心编排、执行可信、知识库生命周期、通用平台基础和文档解析已落地（`packages/platform-pipeline`，当前 447 项测试全绿）；方案一已提供无 Harness 的通用 runtime 端口、OpenAI-compatible 阶段/审核 runner、可恢复人工门、CLI 运行通道，以及覆盖平台 ACL 全部工具名的通用工具集与执行会话对账接线；知识库已支持 PDF / Word / Excel / Markdown 四类文档的解析与知识投影（选型见 `docs/adr/0001-document-parsing-libraries.md`）；仍有 Web 入口、跨进程文件锁、外部存储、预算计量等生产化工作待完成
 - 当前阶段按源码构建和 Harness 宿主部署，不保留过期 tgz 打包产物；provider 配置、项目作用域和知识导入已具备基础实现
 - 测试与构建需要 Node ≥ 24（`src/harness/tool-timeout.ts` 使用了 `using` 显式资源管理语法）；用更低版本运行 `node --test` 会在加载该文件时报 `SyntaxError: Unexpected identifier`，属于环境问题而非代码缺陷
 - 本机默认堆上限下 `tsc --noEmit` 可能被系统 OOM 杀掉（退出码 137，无任何输出）；用 `NODE_OPTIONS=--max-old-space-size=6144 tsc --noEmit` 即可通过，同样是环境问题

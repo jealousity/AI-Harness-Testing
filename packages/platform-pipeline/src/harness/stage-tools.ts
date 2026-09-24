@@ -214,7 +214,7 @@ export function registerStageTools(ctx: Context, deps: StageToolsDeps): void {
     name: 'parse_doc',
     description:
       'Parse a project document into structured sections/tables/plainText with diagnostics and sourceRefs. '
-      + 'Supported: markdown / csv / tsv / text / yaml / json. '
+      + 'Supported: pdf / docx / xlsx / markdown / csv / tsv / text / yaml / json. '
       + '.doc/.xls and any format without an installed parser return status=unsupported with a reason '
       + 'instead of being read as text (docs/10 §5.6.1).',
     parameters: {

@@ -81,6 +81,17 @@ export interface ParsedSection {
   readonly sourceRef: string
 }
 
+/**
+ * 单元格值的**原始类型**（docs/10 §5.6.5 C「单元格值按显示值和原始类型区分」）。
+ *
+ * 为什么需要它：`rows` 里放的是**显示值**字符串，而显示值会撞车——
+ * 一个文本单元格 `2024-01-15` 与一个日期单元格的显示值完全相同。下游若要把日期
+ * 当日期用（排序、比较、生成测试数据），只有字符串是无法区分的。
+ */
+export type ParsedCellType =
+  | 'string' | 'number' | 'date' | 'datetime' | 'time'
+  | 'boolean' | 'error' | 'empty'
+
 /** 结构化表格。 */
 export interface ParsedTable {
   readonly id: string
@@ -102,6 +113,16 @@ export interface ParsedTable {
    * 文档列出的字段一个不少。
    */
   readonly rowRefs?: readonly string[]
+  /**
+   * 单元格原始类型，与 `rows` 同序同宽（含表头行吗？**不含**——与 `rows` 对齐，
+   * 表头类型可由 `headerTypes` 取）。
+   *
+   * 同为纯增量扩展，依据是 §5.6.5 C 明确要求区分字符串/数字/日期/布尔/错误/空值。
+   * 只有 Excel 解析器会填它；文本族与 Word/Markdown 的显示值即真实值，留空。
+   */
+  readonly cellTypes?: readonly (readonly ParsedCellType[])[]
+  /** 表头行的单元格原始类型，与 `headers` 同序。 */
+  readonly headerTypes?: readonly ParsedCellType[]
 }
 
 /** 解析结果的资源使用事实（docs/10 §5.6.4）。 */
@@ -197,6 +218,14 @@ export const DOCUMENT_DIAGNOSTIC_CODES = {
   truncated: 'TRUNCATED',
   emptyContent: 'EMPTY_CONTENT',
   noTextLayer: 'NO_TEXT_LAYER',
+  /**
+   * 该格式**在原理上**无法给出结构化表格，而不是"这次没提取到"。
+   *
+   * 用于 PDF：它只有绝对定位的文字与线段，没有表格语义（docs/10 §5.6.5 A 禁止把
+   * 不稳定的布局硬拼成"准确表格"）。有这个码，调用方才知道 `tables` 为空是
+   * **能力边界**而不是解析失败或漏读。
+   */
+  tableExtractionUnavailable: 'TABLE_EXTRACTION_UNAVAILABLE',
   encodingNotUtf8: 'ENCODING_NOT_UTF8',
   textOrderSuspect: 'TEXT_ORDER_SUSPECT',
   ocrDerived: 'OCR_DERIVED',
