@@ -1,130 +1,102 @@
-<!doctype html>
-<html lang="zh-CN" data-page-node-id="BzPJIvVtepJWEA0XLTpfJQ">
-<head data-page-node-id="Q4RaotaylA9skNBSDEYIRH">
-  <meta charset="utf-8" data-page-node-id="HmrUJBqzw7J1tzgy7BSxia">
-  <meta name="viewport" content="width=device-width, initial-scale=1" data-page-node-id="vRXmWnGvN6h2gcdecROb58">
-  <meta name="description" content="Harness Web：只需接入一个 OpenAI 兼容 API Key，即可运行六阶段测试辅助流水线。" data-page-node-id="zMF8x4LwV2yHZJ09IJNAJn">
-  <title>Harness Web · 测试辅助平台</title>
-  <link rel="stylesheet" href="/styles.css" data-page-node-id="0fWBh2wbLsIm0PkdwZHDbY">
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>通用测试辅助平台 · 流水线控制台</title>
+  <link rel="stylesheet" href="/styles.css">
 </head>
-<body data-page-node-id="mAEmfsOgsAKeVAqYKoWaxv">
-  <div class="noise" aria-hidden="true" data-page-node-id="Y3vzbKAXKDis9hG6oanXDW"></div>
-
-  <header class="topbar" data-page-node-id="cKEYfda5AKN55MgXYnp19Q">
-    <a class="brand" href="/" aria-label="Harness Web 首页" data-page-node-id="i3MQFC1C7mePn5DYGMGyR7">
-      <span class="brand-mark" aria-hidden="true" data-page-node-id="PRuA8R9N3I1imGjb7te2yM"><i data-page-node-id="EAQ51ANQXuqAh5cl5ex24j"></i><i data-page-node-id="yQQ7hxRjKTcZHqwYMZ5Rwa"></i><i data-page-node-id="nqFjxRJ0igjuBppG4950NS"></i></span>
-      <span data-page-node-id="MdEu0iXLuxPfAfONUq8gie">HARNESS <b data-page-node-id="kuB7LDHY3G0QdnpZ3l0yvF">WEB</b></span>
-    </a>
-    <nav class="main-nav" aria-label="主导航" data-page-node-id="q4O0UADFwjkIUdJnOmzgQb">
-      <a class="nav-link active" href="#workspace" data-page-node-id="MyXq5okabVUYy8FWnp4xS4">工作台</a>
-      <a class="nav-link" href="#pipeline" data-page-node-id="5dTjYIUUCj5C8TQMWWprFk">流水线</a>
-      <a class="nav-link" href="#artifact" data-page-node-id="nGSUsU0P8ZJ9UoyNvRTvfQ">产物</a>
-    </nav>
-    <div class="topbar-meta" data-page-node-id="6drZYGeQxymWqehrsmJ6WD">
-      <span class="live-dot" aria-hidden="true" data-page-node-id="HOp81VkVAd61zclLY239p0"></span>
-      <span data-page-node-id="aE5Nrpd8qqNF9cukHbjnh7">本地安全运行</span>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1>通用测试辅助平台</h1>
+      <p class="sub">六阶段流水线控制台 · receive → analyze → design → execute → report → archive</p>
     </div>
+    <div class="health" id="health">连接中…</div>
   </header>
 
-  <main class="shell" data-page-node-id="9F2lQRpiLFlHTcxgyIZAQe">
-    <section class="hero" aria-labelledby="page-title" data-page-node-id="YbFXlyVkSAbMTobcGvLWoF">
-      <div class="hero-grid" aria-hidden="true" data-page-node-id="BRXpdMvIWCLvx9srLaedKB"></div>
-      <div class="hero-copy" data-page-node-id="mGJGMZHbm3zEFv23KHtpvb">
-        <div class="hero-overline" data-page-node-id="bP5wWQaJeHCzFEt3tKYeVy"><span class="overline-line" data-page-node-id="5JppMCd12AMWSswm3E1wXL"></span><span data-page-node-id="VooMfFu8l72mVEv3YHWkx3">TEST PLATFORM / 01</span></div>
-        <h1 id="page-title" data-page-node-id="GnsaS66vwQh5FHp70SIBq0">把需求，变成<br data-page-node-id="1syQ9M7GCMRj7Z6fDRsCBN"><em data-page-node-id="s8xRCAeAQwBTWElxWR9BPG">可审计的测试产物。</em></h1>
-        <p class="hero-lede" data-page-node-id="8qpq9b63Ynuq4DdFuspU4b">不需要 Electron，不需要本地模型。接入一个 OpenAI 兼容 API Key，Harness 就能在浏览器里完成需求接收、分析、设计、执行计划和报告归档。</p>
-        <div class="hero-actions" data-page-node-id="FMytbLIULwbpJfNy5B5eng">
-          <a class="hero-cta" href="#workspace" data-page-node-id="MDwiUBSqzcWXAE7PCm6CkQ">开始配置 <span data-page-node-id="cngHdi2fCBOBXOtBHt0M8F">↘</span></a>
-          <div class="hero-proof" data-page-node-id="PlgilTSrQht6mJD7WB1Art"><span class="proof-avatars" data-page-node-id="uV4oz5kTTpC6kb0lWW0gDK"><i data-page-node-id="HcaV8ETnx96YBEZPISBOT1">H</i><i data-page-node-id="rSxo1gSQ8yFQjfrfToWVqL">AI</i><i data-page-node-id="l9wQIR1ByQzlV5T0WTniks">QA</i></span><span data-page-node-id="BrZbnLCUg05e6iDfibroHX">为每个阶段保留清晰证据链</span></div>
-        </div>
+  <!--
+    凭据说明（docs/10 §5.1、§5.3）：本页面**没有** API Key 输入框。
+    provider 凭据由服务端按配置里的 apiKeyEnv 从进程环境变量注入，
+    浏览器既不上传也无法读取。configRef 同样由服务端固定，不可在此填写。
+  -->
+  <p class="notice" id="credential-notice">
+    模型凭据由服务端环境变量注入（配置里的 <code>apiKeyEnv</code>）；本页面不接收、也不展示任何 API Key。
+  </p>
+
+  <main>
+    <section class="card">
+      <h2>1 · 创建 / 打开流水线</h2>
+      <div class="grid">
+        <label>项目 ID<input id="projectId" value="demo" autocomplete="off"></label>
+        <label>流水线 ID<input id="pipelineId" value="pipe-1" autocomplete="off"></label>
+        <label>需求输入文件（可选）<input id="requirementInput" placeholder="/abs/path/requirements.pdf" autocomplete="off"></label>
+        <label>Provider（可选）<input id="providerName" placeholder="primary" autocomplete="off"></label>
+        <label>被测服务基址（可选）<input id="targetBaseUrl" placeholder="https://staging.example.com" autocomplete="off"></label>
       </div>
-      <div class="hero-panel" aria-label="运行方式" data-page-node-id="0kEUAxVM0aToyIx3qnsOMf">
-        <div class="hero-panel-glow" data-page-node-id="dTT6PHpMPFyHgDlSHVVQdk"></div>
-        <div class="hero-panel-top" data-page-node-id="yZ8NGdrnyYzLhRevUHxQ5g"><span class="panel-label" data-page-node-id="a1cAjgJC1Z6NoQBcoY8vNE">QUICK START</span><span class="panel-index" data-page-node-id="eRcALoaMOL4gKM0EHWEdFc">01—03</span></div>
-        <div class="quick-steps" data-page-node-id="ODO7vsuFpVQnKkfTxPAPbB">
-          <div class="quick-step" data-page-node-id="Y14t4fy2DzsekNoxjfeuId"><span data-page-node-id="iCJFgWRkEHWWWKhvK18BLw">01</span><div data-page-node-id="3186VwgiSClPRATWhJx5eS"><strong data-page-node-id="m5MN7FuaHilmDmfpQpBjrI">接入 Key</strong><small data-page-node-id="Z1nCO1hT99S2QOOY3jWld4">选择兼容端点与模型</small></div><b data-page-node-id="mXc1t6ugqz9RjdQFCsO9H8">↗</b></div>
-          <div class="quick-step" data-page-node-id="Gfk7RFOf7nuZf7kW96Nn0r"><span data-page-node-id="PedrBvP51T8EUi0WHV8MVg">02</span><div data-page-node-id="gKMBGJVprDNle9nzBOaUfE"><strong data-page-node-id="WeBhZoxAtGo4LJNztBjXw3">粘贴需求</strong><small data-page-node-id="9WuIoRaxepc9DdS78uEdBW">输入验收标准与异常路径</small></div><b data-page-node-id="6qSLa6srqXCwfhTwYdUU12">↗</b></div>
-          <div class="quick-step" data-page-node-id="srKsexY2T6VgfexXgqjfLe"><span data-page-node-id="fpUWepy6aRV9uxo85M4qYJ">03</span><div data-page-node-id="CPf9PYsEOYmFOvj56bogfK"><strong data-page-node-id="pavFFvnW2w9yJf9hkhob09">查看产物</strong><small data-page-node-id="8bc55mMaNnoIg4lpsGl0Ds">逐阶段检查并复制结果</small></div><b data-page-node-id="nLgsbjvDoSZuBUfQp6CkRO">↗</b></div>
-        </div>
-        <div class="hero-panel-foot" data-page-node-id="RdoTbJulnZMxE8zOwzEFRZ"><span class="panel-dot" data-page-node-id="kCbE24xONTSK1bmcaHMlzb"></span><span data-page-node-id="yoqwYNRHlqliWoA9aFeAXY">Key 仅在本次运行期间使用</span></div>
+      <div class="actions">
+        <button id="btn-create" class="primary">创建流水线（202）</button>
+        <button id="btn-refresh">刷新</button>
+        <button id="btn-list">列出可见流水线</button>
       </div>
+      <pre class="out" id="out-create" hidden></pre>
+      <ul class="pipelines" id="pipeline-list"></ul>
     </section>
 
-    <section class="workspace-heading" id="workspace" aria-label="工作台概览" data-page-node-id="CKfTAV5rUJ9kYc6DGJwe3f">
-      <div data-page-node-id="tzEhY566eMSn7oYKXRAfon"><p class="section-kicker" data-page-node-id="z9htOZtljLFaSmr9PU8kkL">WORKSPACE / CONTROL CENTER</p><h2 data-page-node-id="uA3zE5gFTAlA7uDvaqnDXf">测试工作台</h2></div>
-      <div class="workspace-meta" data-page-node-id="sIQF69in1HDJjDI0x5AtMR"><span class="meta-chip" data-page-node-id="AnzH2qoxxCFx7YhoLgADJO"><i data-page-node-id="BDRhg07uR4le00avO9wnjB"></i> API Key 不落盘</span><span class="meta-chip" data-page-node-id="h0IhHRUGt25UXV73kg8MwW">OpenAI-compatible</span></div>
+    <section class="card">
+      <h2>2 · 运行控制</h2>
+      <div class="statusline">
+        <span class="badge" id="run-status">—</span>
+        <span class="muted" id="run-meta">尚未加载</span>
+      </div>
+      <div class="actions">
+        <button id="btn-run" class="primary">触发运行（后台，202）</button>
+        <button id="btn-cancel-run">取消后台运行</button>
+        <button id="btn-recover">恢复扫描（进程重启后）</button>
+        <label class="inline"><input type="checkbox" id="auto-poll" checked> 自动轮询（2s）</label>
+      </div>
+      <pre class="out" id="out-run" hidden></pre>
     </section>
 
-    <section class="workspace-grid" aria-label="Harness 工作区" data-page-node-id="2Ms7JM7jhIp42mczEwbMaS">
-      <aside class="setup-card card" data-page-node-id="jZftDdxVBSeYNESN4WlnlZ">
-        <div class="card-accent" data-page-node-id="UTPaBfCBWraSqNp1s8Dsyw"></div>
-        <div class="card-head" data-page-node-id="F8nuuXoiGa7svbqbeAGAfC">
-          <div data-page-node-id="xcZPpo0Of0pI0xxJb8zWpP"><p class="section-kicker" data-page-node-id="FemkqUu0wiYCEBMnsS55lR">01 / CONNECT</p><h2 data-page-node-id="yo2Yelum4tGhB0hZfoUvcN">接入模型</h2></div>
-          <span class="secure-badge" data-page-node-id="nFM3dEI3cMTgLnvkH2T4mD"><span data-page-node-id="nycLaTYx4pXTnFYhM6lpvk">●</span> SECURE</span>
-        </div>
-        <p class="muted intro" data-page-node-id="YBMYBjAIQQOYiFw20QJqn0">选择一个兼容端点，Key 只在本次运行期间驻留服务端内存。</p>
-
-        <form id="run-form" data-page-node-id="rPcBo4WQFjGVHvAtCgt9MK">
-          <fieldset data-page-node-id="Xi0OQhjhzXib4H1g5G2i5f">
-            <legend class="sr-only" data-page-node-id="H0u46RJPZIu9ElDRrPVmtM">模型连接配置</legend>
-            <label class="field-label" for="api-key" data-page-node-id="yZX4zl4kTK7QVB4n7OzxCh">API Key <span data-page-node-id="8WbOWJ0zWCwFN8pqJW0mDp">必填</span></label>
-            <div class="secret-field" data-page-node-id="UHPoWDidhDT0khy4pkVEfF">
-              <span class="field-leading" aria-hidden="true" data-page-node-id="BqVUF4mJhsaGpUJKIra3i3">⌁</span>
-              <input id="api-key" name="apiKey" type="password" autocomplete="off" placeholder="sk-..." required data-page-node-id="EQwLACSE2x9xucwZyYzTpZ">
-              <button class="icon-button" id="toggle-key" type="button" aria-label="显示 API Key" data-page-node-id="PTVn1gxGgF0J5PaaCy2giE">显示</button>
-            </div>
-            <div class="field-row" data-page-node-id="6L5ea4jA2ZAj1l3MC2wxGT">
-              <div data-page-node-id="Ajb02Q6eMEuiuGOhQpJVCC"><label class="field-label" for="base-url" data-page-node-id="ZcE8e4SvGDcF0amZuZrIq9">API Base URL</label><input id="base-url" name="baseUrl" value="https://api.deepseek.com" spellcheck="false" data-page-node-id="4SXH2EFB1Jpkibd0khb0vW"></div>
-              <div data-page-node-id="oOEOjLao4tg6gxGkxRJtG5"><label class="field-label" for="model" data-page-node-id="WYxovtIZfnC4LJKeWH4lvN">模型</label><input id="model" name="model" value="deepseek-chat" spellcheck="false" data-page-node-id="fs02XilFMGam21zYYmBVzM"></div>
-            </div>
-          </fieldset>
-
-          <fieldset data-page-node-id="J1ANqWr2kkaXBtsn6gGdkp">
-            <legend class="sr-only" data-page-node-id="UoZo4F35QMG4Oe8EpZAK6z">项目配置</legend>
-            <div class="field-divider" data-page-node-id="zSljVYJ0dMNaNGqlettEnb"><span data-page-node-id="moUdJv9UX8vMODOXeeXjGB">PROJECT CONTEXT</span></div>
-            <div class="field-row" data-page-node-id="EDA9jQlmPfKGq0ixQgZeap">
-              <div data-page-node-id="agrvEacOfEk2OozQz3fK0E"><label class="field-label" for="project-name" data-page-node-id="aAgNfH5480Un1raSYyIVEQ">项目名称</label><input id="project-name" name="projectName" value="登录能力改造" data-page-node-id="cA3app0oUkIFn9RrA9OVoi"></div>
-              <div data-page-node-id="4cflP7VLH8wkV8T3tobQ4j"><label class="field-label" for="project-type" data-page-node-id="UUc34Gp9GR8tsLcuCh6BDR">项目类型</label><select id="project-type" name="projectType" data-page-node-id="ogSXrsHzlGjEnWnPvmmtqr"><option value="api-service" data-page-node-id="kHSZ8dzEUDpHA4OYjMbxSs">API 服务</option><option value="web-ui" data-page-node-id="hy54uiCzaUwCuC6gZ1MsYm">Web 应用</option><option value="desktop-client" data-page-node-id="lq49xQauQEFI3AnNqxamJi">桌面客户端</option><option value="mixed" data-page-node-id="6kMVhKnlpsY2zLST0dggOX">混合项目</option></select></div>
-            </div>
-            <label class="field-label" for="requirement" data-page-node-id="nPu3jVpOSDokBRZ81ukZHe">待测试需求 <span data-page-node-id="wJAwDPzUmeIBdfVb0Y45KU">必填</span></label>
-            <textarea id="requirement" name="requirement" rows="9" required placeholder="描述目标、变更点、验收标准，或直接粘贴 Jira / PRD 内容"></textarea>
-            <div class="textarea-footer" data-page-node-id="DciP3TbLwNM2rnrEBXXVeO"><span data-page-node-id="TRA9oDs6rZPWpb1VNytdxf">建议包含验收标准与异常路径</span><button id="use-sample" type="button" class="text-button" data-page-node-id="xhahrQSijzPCgYISDd0zEq">填入示例</button></div>
-          </fieldset>
-
-          <button class="launch-button" type="submit" data-page-node-id="CIniayV1TCX5NioG2X70Ag"><span class="launch-icon" aria-hidden="true" data-page-node-id="ONEW55GTA0i91EdOIppGlJ">↗</span><span data-page-node-id="5WdkUsUAcdcBoNDnU46GYL">运行测试流水线</span><span class="launch-arrow" aria-hidden="true" data-page-node-id="PDEQVO1r3yoShJkOS5wHbX">→</span></button>
-          <p class="form-error" id="form-error" role="alert" data-page-node-id="jY8Qyj0K70oZUnGKFPG7EG"></p>
-        </form>
-        <div class="setup-footnote" data-page-node-id="KBoSZ2BctKPgLLAeNZhpOY"><span class="lock-icon" aria-hidden="true" data-page-node-id="yv7pJHaJWeSMQGQ2wDmUEs">⌁</span><span data-page-node-id="sto396uT0AAIKt3gybCcD9">适合本地运行或受控内网部署。若公开部署，请在前置层增加登录鉴权。</span></div>
-      </aside>
-
-      <section class="results-column" aria-label="流水线结果" data-page-node-id="5QyBTGRoBpWbcMU6mT7lZa">
-        <div class="pipeline-card card" id="pipeline" data-page-node-id="iCieEwQwc5MamZoHDgpEZv">
-          <div class="card-head pipeline-head" data-page-node-id="isfTKszGaPGp1HKozNHoIe">
-            <div data-page-node-id="Y6ESrPvTumpQBrVZgN2ZqN"><p class="section-kicker" data-page-node-id="OW0SzpYDkRYn8bClC4QczH">02 / PIPELINE</p><h2 data-page-node-id="fpadR4OUtOjuguN2vyQUG2">六阶段质量链</h2></div>
-            <div class="run-state" id="run-state" data-page-node-id="A08dAUYFlF4kqWJbr0EiE4"><span class="state-dot" aria-hidden="true" data-page-node-id="EZ6GMsk6Q8RBS1yqiHjIbp"></span><span data-page-node-id="4oyRi90wMdNIZ07wwfflFj">等待运行</span></div>
-          </div>
-          <div class="pipeline-summary" data-page-node-id="5mTSyeBxYpFbASuAuxDutK"><span data-page-node-id="ujN8xTeydwA2zzExvaoYRh">从需求到归档</span><strong data-page-node-id="pBoR21f4EdOg1W7cxw9xQp">6 <small data-page-node-id="mfw4pscgSPRcJbMTKGflQH">STAGES</small></strong></div>
-          <div class="stage-track" id="stage-track" data-page-node-id="Pfuvmg92WaVC9N0xB2OFP4"><div class="track-line" aria-hidden="true" data-page-node-id="59uPqHVZodO3HiRZOhJDSL"></div><div class="stage-list" data-page-node-id="8BbAnLU8P5BA9kaAPQ1yWC">
-            <button class="stage-item" data-stage="receive" type="button" data-page-node-id="oxIQ6jgSDSqkd057IUQmR3"><span class="stage-number" data-page-node-id="VkREmg9eASUdzXF3NCxeQW">01</span><span class="stage-name" data-page-node-id="jNnSi9vbvuPM94Eg4Z4dpB">需求接收</span><span class="stage-status" data-page-node-id="TMTtidLWW43VKXacL3Ee8A">待开始</span></button>
-            <button class="stage-item" data-stage="analyze" type="button" data-page-node-id="c9xItBGoqnycx2GcjHHEIo"><span class="stage-number" data-page-node-id="FBT3RK6dEH1lm1kfLdDE6t">02</span><span class="stage-name" data-page-node-id="TAQ14ZPAVLx2liKoGoCKKm">需求分析</span><span class="stage-status" data-page-node-id="Kubr6LGWGF8Rled5mcekUb">待开始</span></button>
-            <button class="stage-item" data-stage="design" type="button" data-page-node-id="EJnVxpapmif0RYKBAt0DsH"><span class="stage-number" data-page-node-id="aPffXXFi91QvHdwe7hdfyc">03</span><span class="stage-name" data-page-node-id="aH8AHU0tbLrMMDkpHKvKCz">测试设计</span><span class="stage-status" data-page-node-id="crq2WvwWj4DN6KVKaG7CI4">待开始</span></button>
-            <button class="stage-item" data-stage="execute" type="button" data-page-node-id="nOgaO0l74HzI2rP90jnj1S"><span class="stage-number" data-page-node-id="rFhdNTtnG0X42xYIxVifQP">04</span><span class="stage-name" data-page-node-id="iLowwWmy4jeOvBgHt2sr5n">测试执行</span><span class="stage-status" data-page-node-id="UaoRyY5BB0LDLzlWClDzat">待开始</span></button>
-            <button class="stage-item" data-stage="report" type="button" data-page-node-id="zwKn8SeGBhTL4AvBEZ0qxJ"><span class="stage-number" data-page-node-id="RBGtyFaXSGZDwrGlCpBux9">05</span><span class="stage-name" data-page-node-id="olZc92wiFLJtV16odAb1QX">测试报告</span><span class="stage-status" data-page-node-id="L19Oc2F542e4FW3OUY4Lbf">待开始</span></button>
-            <button class="stage-item" data-stage="archive" type="button" data-page-node-id="se3KEgbBWlfJpOASl6kJ6n"><span class="stage-number" data-page-node-id="uTI0aNTEvk1IDDemvBgih4">06</span><span class="stage-name" data-page-node-id="2HVmSSjSuUaJGcDqQYgcPT">产物归档</span><span class="stage-status" data-page-node-id="F5QQL6TYci3Y03o5z5PhvT">待开始</span></button>
-          </div></div>
-          <div class="pipeline-note" data-page-node-id="CTS5rmi44CBCwTBQQfWTml"><span class="note-mark" data-page-node-id="19tXecrHEVRB6TFiqg3pLr">i</span><span data-page-node-id="iFsL2tQafCnOdh8merh4Dj">执行阶段默认生成“待执行”计划，不会虚构对被测系统的真实请求。</span></div>
-        </div>
-
-        <div class="artifact-card card" id="artifact" data-page-node-id="mucyeKgGARizwiHB1HpHBL">
-          <div class="artifact-toolbar" data-page-node-id="9Jc59DC4bLE2SOnSYXUQYX"><div class="card-head artifact-head" data-page-node-id="D6qnTRIzsE7AQhBnYSfzP0"><div data-page-node-id="ng6zT2w1PSNDVdurALRlTc"><p class="section-kicker" data-page-node-id="rHfgA4MdsL29Rj5jt8ZUjH">03 / ARTIFACT</p><h2 id="artifact-title" data-page-node-id="7mN8qLjIlnCITrsXRBPH4m">阶段产物</h2></div><button class="copy-button" id="copy-artifact" type="button" disabled data-page-node-id="pbD0wvr3myOU5d1GjL9pJM">复制内容</button></div><div class="artifact-toolbar-line" data-page-node-id="T9NHFZamqvEGD3XbGblktW"></div></div>
-          <div class="artifact-empty" id="artifact-empty" data-page-node-id="ABXUtOAWICAIO7xp3YHZlG"><div class="empty-visual" aria-hidden="true" data-page-node-id="sTa11kEjeHCClQO6V5XFjK"><span data-page-node-id="Fb5NTrVvkodwNNyjyB6AJ9"></span><span data-page-node-id="TsuJpxtgeAnGFiwIC0LpX4"></span><span data-page-node-id="PBExBeymw6CWJPa5Btt0wa"></span><b data-page-node-id="pZyHvX59rPpV0GarAZbhOq">◎</b></div><h3 data-page-node-id="HORm4zG55UY9KxHBELIrwz">产物将在这里展开</h3><p data-page-node-id="SWpMSKvuSMipCmdy02OgIe">流水线完成每个阶段后，点击上方节点查看内容。</p><div class="empty-hint" data-page-node-id="9b7dcWhQ8m8yaT0RjG7qZc"><span data-page-node-id="mQrMBqLoI9389PxBrTwZFy">TIP</span> 先接入 API Key 和需求</div></div>
-          <pre class="artifact-content hidden" id="artifact-content" data-page-node-id="E4ycgAfC1J9DvrdbKNXFRz"></pre>
-        </div>
-      </section>
+    <section class="card">
+      <h2>3 · 阶段状态</h2>
+      <p class="hint">全部字段来自持久化事实（检查点 + 产物 + 人工门任务），不是浏览器本地推断。</p>
+      <div class="tablewrap">
+        <table class="stages">
+          <thead>
+            <tr><th>阶段</th><th>状态</th><th>机器门禁</th><th>审核结论</th><th>digest</th><th>时间</th><th></th></tr>
+          </thead>
+          <tbody id="stage-rows"><tr><td colspan="7" class="muted">尚未加载</td></tr></tbody>
+        </table>
+      </div>
+      <div id="stage-detail"></div>
     </section>
 
-    <footer class="footer" data-page-node-id="p9Rtl4F8mBddf5vKV1VAJA"><span data-page-node-id="pAl7fyGB20ycbbA1VCRcT3">HARNESS WEB EDITION <i data-page-node-id="X91ig78wnbnLTnPmueruLk">·</i> v0.1</span><span data-page-node-id="JanzW0SSDjGTYv03wNdf1z">OpenAI-compatible endpoints · ephemeral key handling</span></footer>
+    <section class="card">
+      <h2>4 · 人工门任务</h2>
+      <p class="hint">裁决必须显式选择结论，不存在「缺省即批准」；裁决只写任务，不会在本请求内跑完整条流水线。</p>
+      <div id="gate-list" class="gates"><p class="muted">尚未加载</p></div>
+    </section>
+
+    <section class="card">
+      <h2>5 · 阶段重入</h2>
+      <p class="hint">重入会作废该阶段及其下游产物并级联重跑。digest 用于防止页面打开过久后覆盖他人的新版本。</p>
+      <div class="grid">
+        <label>阶段<select id="reenter-stage"></select></label>
+        <label>原因<input id="reenter-reason" placeholder="需求变更" autocomplete="off"></label>
+        <label>当前 digest（自动填充）<input id="reenter-digest" readonly></label>
+      </div>
+      <div class="actions"><button id="btn-reenter">登记重入</button></div>
+      <pre class="out" id="out-reenter" hidden></pre>
+    </section>
+
+    <section class="card">
+      <h2>6 · 事件时间线</h2>
+      <p class="hint">只投影有持久化时间戳的事实（开门 / 认领 / 裁决 / 取消 / 消费 / 失败 / 重入）。</p>
+      <ul class="events" id="event-list"><li class="muted">尚未加载</li></ul>
+    </section>
   </main>
-  <script src="/app.js"></script>
+
+  <script src="/app.js" type="module"></script>
 </body>
 </html>

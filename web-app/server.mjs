@@ -1,71 +1,180 @@
+/**
+ * 通用测试辅助平台的 Web HTTP 外壳（docs/10 §5.1、§5.3、§5.4）。
+ *
+ * 本文件**只做三件事**：HTTP 路由、鉴权入口、响应映射。
+ *
+ * 流水线逻辑一律经
+ * `FilePipelineRunService` → `createPlatformHost` → `PipelineDriver`
+ * 完成。相对改造前（docs/10 §5.1）明确移除了：
+ *
+ * - `runs = new Map()` 作为唯一状态 → 事实来自检查点/产物/门任务，进程内只留后台句柄；
+ * - `promptFor()` 自建六阶段 prompt → 阶段 prompt 属 platform-pipeline；
+ * - `callModel()` 自建模型请求 → 由 `OpenAICompatibleClient` 按配置 provider 发起；
+ * - `runPipeline()` 自己串阶段、自己生成 archive → 由 `PipelineDriver` 执行；
+ * - Web 自己把 execute 标成"待执行" → 由 execute 阶段门禁对账真实执行记录；
+ * - Web 自己维护 artifact 数组 → 由 `ArtifactStore` 回读。
+ *
+ * 凭据策略（docs/10 §2.2、§5.3）：API Key **只**由服务端按配置里的 `apiKeyEnv`
+ * 从进程环境变量注入。浏览器既不上传、也无法读取任何 provider 凭据；
+ * `configRef` 也由服务端配置决定，浏览器不能借它指向任意文件。
+ *
+ * @module harness-web-app/server
+ */
+
 import { createServer } from 'node:http'
 import { readFile } from 'node:fs/promises'
-import { createHash, randomUUID } from 'node:crypto'
-import { isIP } from 'node:net'
-import { lookup } from 'node:dns/promises'
-import { extname, join, normalize, sep } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { extname, join, normalize, resolve, sep } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+
+import { loadPipelineConfig } from '../packages/platform-pipeline/src/config.ts'
+import {
+  AsyncPipelineRunner,
+  FilePipelineRunService,
+  PipelineRunError,
+  errorMessageOf,
+  redactSecrets,
+} from '../packages/platform-pipeline/src/web/index.ts'
 
 const ROOT = fileURLToPath(new URL('.', import.meta.url))
 const PUBLIC_DIR = join(ROOT, 'public')
+
+// ── 服务端配置（全部来自环境变量；浏览器不可覆盖）────────────────────────────
+
 const PORT = Number(process.env.PORT || 3080)
 const HOST = process.env.HOST || '127.0.0.1'
-const MAX_BODY = 64 * 1024
-const MAX_REQUIREMENT = 20_000
-const MAX_RUNS = 24
-const RUN_TTL_MS = 30 * 60 * 1000
-const MAX_ACTIVE_RUNS_PER_IP = 2
-const MAX_PROMPT_CONTEXT = 48_000
-const MODEL_TIMEOUT_MS = 180_000
-const ALLOW_PRIVATE_API = process.env.ALLOW_PRIVATE_API === '1'
-const runs = new Map()
-const activeRunsByIp = new Map()
+const MAX_BODY = Number(process.env.PLATFORM_MAX_BODY || 64 * 1024)
 
-function cleanupRuns(now = Date.now()) {
-  for (const [id, run] of runs) {
-    const finishedAt = run.finishedAt ? Date.parse(run.finishedAt) : NaN
-    if (Number.isFinite(finishedAt) && now - finishedAt > RUN_TTL_MS) runs.delete(id)
+/** 平台数据根：检查点、产物、门任务、知识库都落在这里。**必填**。 */
+const DATA_ROOT = requireEnv('PLATFORM_DATA_ROOT')
+/** 流水线配置文件路径。**必填**：API Key 的 `apiKeyEnv` 就声明在这份配置里。 */
+const CONFIG_PATH = requireEnv('PLATFORM_CONFIG_PATH')
+/**
+ * 客户端必须使用的逻辑配置引用（docs/10 §5.3）。
+ *
+ * 浏览器传的是**逻辑名**而不是路径：服务端把它映射到 {@link CONFIG_PATH}。
+ * 因此改配置指向不需要（也不能）由浏览器决定，路径穿越在类型上就不成立。
+ */
+const CONFIG_REF = process.env.PLATFORM_CONFIG_REF || 'default'
+
+/** 人工门等待上限；缺省 `0` = 只轮询一次就让出控制权，HTTP 不挂住等真人（§5.4）。 */
+const GATE_WAIT_TIMEOUT_MS = Number(process.env.PLATFORM_GATE_WAIT_TIMEOUT_MS || 0)
+const GATE_TASK_TTL_MS = optionalNumber(process.env.PLATFORM_GATE_TASK_TTL_MS)
+
+/**
+ * 是否信任请求头里的调用者身份。
+ *
+ * **默认关闭**：此时所有请求都用服务端配置的固定身份（见 {@link SERVER_ACTOR}），
+ * 客户端无法通过伪造请求头提权。只有在反向代理已完成真实鉴权、并会**剥除**
+ * 客户端自带的同名头时才应开启。
+ */
+const TRUST_ACTOR_HEADERS = process.env.PLATFORM_TRUST_ACTOR_HEADERS === '1'
+
+/** 单操作者模式下使用的身份（默认只有 viewer：不能裁决人工门）。 */
+const SERVER_ACTOR = {
+  actorId: process.env.PLATFORM_ACTOR_ID || 'web-operator',
+  ...(process.env.PLATFORM_ACTOR_TENANT ? { tenantId: process.env.PLATFORM_ACTOR_TENANT } : {}),
+  roles: splitList(process.env.PLATFORM_ACTOR_ROLES, ['viewer']),
+  ...(process.env.PLATFORM_ACTOR_PROJECTS ? { projectIds: splitList(process.env.PLATFORM_ACTOR_PROJECTS, []) } : {}),
+}
+
+/**
+ * 后台运行身份：**刻意不声明任何角色**。
+ *
+ * 后台运行只驱动流水线，不参与人工门裁决。`assertGateRole` 是失败关闭的，
+ * 因此这个身份即使被误用到裁决路径上也批准不了任何东西（"后台不得替人裁决"
+ * 的机器保证，docs/10 §1 原则）。
+ */
+const RUNNER_ACTOR = { actorId: process.env.PLATFORM_RUNNER_ACTOR_ID || 'web-runner' }
+
+function requireEnv(name) {
+  const value = process.env[name]
+  if (value === undefined || value.trim() === '') {
+    throw new Error(`缺少必需的环境变量 ${name}（Web 外壳不做隐式兜底）`)
   }
-  if (runs.size <= MAX_RUNS) return
-  for (const [id, run] of runs) {
-    if (!run.finishedAt) continue
-    runs.delete(id)
-    if (runs.size <= MAX_RUNS) break
+  return value
+}
+
+function optionalNumber(raw) {
+  if (raw === undefined || raw.trim() === '') return undefined
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`环境变量必须是非负整数：${raw}`)
+  return value
+}
+
+function splitList(raw, fallback) {
+  if (raw === undefined || raw.trim() === '') return fallback
+  return raw.split(',').map(item => item.trim()).filter(item => item !== '')
+}
+
+// ── 装配：service + 后台运行调度 ─────────────────────────────────────────────
+
+/**
+ * 逻辑 `configRef` → 实际配置路径。
+ *
+ * 只接受服务端配置的那一个引用：`configRef` 来自请求体，若直接当路径用就成了
+ * 任意文件读取（浏览器可以让服务端去解析 `/etc/passwd` 之类）。因此这里做白名单，
+ * 不匹配即 `config-invalid`。
+ */
+async function loadConfig(configRef) {
+  if (configRef !== CONFIG_REF) {
+    throw new Error(`未知的 configRef：${configRef}（本服务只接受 ${CONFIG_REF}）`)
   }
+  return loadPipelineConfig(CONFIG_PATH)
 }
 
-function activeRunCount(ip) {
-  return activeRunsByIp.get(ip) ?? 0
-}
-
-function reserveRunSlot(ip) {
-  const count = activeRunCount(ip)
-  if (count >= MAX_ACTIVE_RUNS_PER_IP) {
-    throw new Error('当前已有运行中的任务，请等待完成后再提交')
+/**
+ * 宿主工厂。默认用真实 `createPlatformHost`；`PLATFORM_HOST_MODULE` 指向一个
+ * 导出 `createHost(options)` 的模块时改用它。
+ *
+ * 存在的唯一理由是**测试**：端到端测试需要把 LLM 阶段运行器换成脚本化实现，
+ * 才能在不消耗 API Key 的前提下验证路由、鉴权、持久化与恢复语义。
+ */
+async function loadHostFactory() {
+  const modulePath = process.env.PLATFORM_HOST_MODULE
+  if (modulePath === undefined || modulePath.trim() === '') return undefined
+  const loaded = await import(pathToFileURL(resolve(modulePath)).href)
+  if (typeof loaded.createHost !== 'function') {
+    throw new Error(`PLATFORM_HOST_MODULE 必须导出 createHost(options)：${modulePath}`)
   }
-  activeRunsByIp.set(ip, count + 1)
+  return loaded.createHost
 }
 
-function releaseRunSlot(ip) {
-  const next = activeRunCount(ip) - 1
-  if (next > 0) activeRunsByIp.set(ip, next)
-  else activeRunsByIp.delete(ip)
-}
+const createHost = await loadHostFactory()
 
-const STAGES = [
-  { id: 'receive', label: '需求接收', short: 'RECEIVE' },
-  { id: 'analyze', label: '需求分析', short: 'ANALYZE' },
-  { id: 'design', label: '测试设计', short: 'DESIGN' },
-  { id: 'execute', label: '测试执行', short: 'EXECUTE' },
-  { id: 'report', label: '测试报告', short: 'REPORT' },
-  { id: 'archive', label: '产物归档', short: 'ARCHIVE' },
-]
+// 启动即加载配置：配置非法要在启动时失败，而不是等第一个请求才 500。
+await loadConfig(CONFIG_REF)
 
-const DEFAULTS = {
-  baseUrl: 'https://api.deepseek.com',
-  model: 'deepseek-chat',
-  projectType: 'api-service',
-}
+const service = new FilePipelineRunService({
+  dataRoot: DATA_ROOT,
+  loadConfig,
+  ...(createHost === undefined ? {} : { createHost }),
+  defaultGateWaitTimeoutMs: GATE_WAIT_TIMEOUT_MS,
+  ...(GATE_TASK_TTL_MS === undefined ? {} : { defaultGateTaskTtlMs: GATE_TASK_TTL_MS }),
+})
+
+const runner = new AsyncPipelineRunner({
+  service,
+  dataRoot: DATA_ROOT,
+  actor: RUNNER_ACTOR,
+  /**
+   * 后台运行收敛后的**运维日志**。
+   *
+   * 刻意只打日志、不落盘、也不进 HTTP 响应：运行期异常不写检查点，因此它不是
+   * 持久化事实，若暴露给页面就会被当成"流水线状态"。阶段级失败（门禁违规、审核
+   * findings）本来就由检查点持久化、经 `GET /api/pipelines/:id` 呈现；
+   * 权威的运行遥测属于 M3（docs/10 §7）。
+   */
+  onSettled: outcome => {
+    if (outcome.kind === 'error') {
+      console.error(`[pipeline ${outcome.pipelineId}] 运行前置失败 ${outcome.error.code}: ${outcome.error.message}`)
+      return
+    }
+    const { outcome: kind } = outcome.result
+    console.log(`[pipeline ${outcome.pipelineId}] 后台运行结束：${kind}`)
+  },
+})
+
+// ── HTTP 基础设施 ────────────────────────────────────────────────────────────
 
 function json(res, status, payload) {
   const body = JSON.stringify(payload)
@@ -80,254 +189,258 @@ function json(res, status, payload) {
   res.end(body)
 }
 
-function clientIp(req) {
-  // Do not trust forwarded headers: this server may be run without a trusted proxy.
-  return req.socket.remoteAddress || 'unknown'
-}
-
-function requestPath(req) {
+function pathnameOf(req) {
   try {
     return new URL(req.url || '/', 'http://localhost').pathname
   } catch {
-    throw new Error('无效的请求地址')
+    throw new PipelineRunError('invalid-request', '无效的请求地址')
   }
 }
 
-function errorMessage(error) {
-  return error instanceof Error ? error.message : String(error)
-}
-
-function isPrivateAddress(address) {
-  const normalized = address.toLowerCase()
-  if (normalized === '::1' || normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe80:')) return true
-  const parts = normalized.split('.').map(Number)
-  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false
-  const [a, b] = parts
-  return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 0)
-}
-
-async function safeBaseUrl(value) {
-  const input = String(value || DEFAULTS.baseUrl).trim().replace(/\/+$/, '')
-  const url = new URL(input)
-  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('API Base URL 必须使用 http 或 https')
-  if (url.username || url.password) throw new Error('API Base URL 不能包含用户名或密码')
-  if (!ALLOW_PRIVATE_API) {
-    const hostname = url.hostname.toLowerCase()
-    if (hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local') || hostname === '0.0.0.0') {
-      throw new Error('出于安全考虑，默认不允许访问本机或内网 API；如确需使用，请设置 ALLOW_PRIVATE_API=1')
-    }
-    const address = isIP(hostname) ? hostname : (await lookup(hostname)).address
-    if (isPrivateAddress(address)) {
-      throw new Error('出于安全考虑，默认不允许访问本机或内网 API；如确需使用，请设置 ALLOW_PRIVATE_API=1')
-    }
+function queryOf(req) {
+  try {
+    return new URL(req.url || '/', 'http://localhost').searchParams
+  } catch {
+    return new URLSearchParams()
   }
-  return input
 }
 
-function digest(value) {
-  return createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 16)
-}
-
-async function readBody(req) {
+async function readJsonBody(req) {
+  const declared = Number(req.headers['content-length'] || 0)
+  if (declared > MAX_BODY) throw new PipelineRunError('invalid-request', '请求体过大')
   let size = 0
   const chunks = []
   for await (const chunk of req) {
     size += chunk.length
-    if (size > MAX_BODY) throw new Error('请求体过大，请压缩需求文本后重试')
+    if (size > MAX_BODY) throw new PipelineRunError('invalid-request', '请求体过大')
     chunks.push(chunk)
   }
-  const raw = Buffer.concat(chunks).toString('utf8')
-  return raw ? JSON.parse(raw) : {}
-}
-
-function cleanText(value, fallback = '') {
-  return typeof value === 'string' ? value.trim() : fallback
-}
-
-function makeStage(id, status = 'queued') {
-  return { id, status, startedAt: null, finishedAt: null, digest: null, content: null, error: null }
-}
-
-async function createRun(input, ip) {
-  cleanupRuns()
-  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('请求体必须是 JSON 对象')
-  const apiKey = cleanText(input.apiKey)
-  if (!apiKey) throw new Error('请先输入 API Key')
-  if (apiKey.length > 512) throw new Error('API Key 长度异常，请检查是否粘贴了额外内容')
-  const requirement = cleanText(input.requirement)
-  if (!requirement) throw new Error('请填写待测试需求')
-  if (requirement.length > MAX_REQUIREMENT) throw new Error(`需求文本不能超过 ${MAX_REQUIREMENT} 个字符`)
-  const baseUrl = await safeBaseUrl(input.baseUrl)
-  reserveRunSlot(ip)
-
-  const run = {
-    id: randomUUID(),
-    createdAt: new Date().toISOString(),
-    finishedAt: null,
-    status: 'queued',
-    clientIp: ip,
-    projectName: cleanText(input.projectName, '未命名项目').slice(0, 80),
-    projectType: cleanText(input.projectType, DEFAULTS.projectType),
-    requirement,
-    baseUrl,
-    model: cleanText(input.model, DEFAULTS.model).slice(0, 160),
-    stages: Object.fromEntries(STAGES.map(({ id }) => [id, makeStage(id)])),
-    apiKey,
-    artifacts: [],
-    error: null,
-  }
-  runs.set(run.id, run)
-  return run
-}
-
-function publicRun(run) {
-  return {
-    id: run.id,
-    createdAt: run.createdAt,
-    status: run.status,
-    projectName: run.projectName,
-    projectType: run.projectType,
-    baseUrl: run.baseUrl,
-    model: run.model,
-    stages: run.stages,
-    artifacts: run.artifacts,
-    error: run.error,
-  }
-}
-
-function promptFor(stageId, run, previous) {
-  const upstream = previous.map((item) => `【${item.stageId}】\n${item.content}`).join('\n\n')
-  const context = upstream
-    ? `\n\n上游阶段产物（只读，必须保持事实一致）：\n${upstream.length > MAX_PROMPT_CONTEXT ? `${upstream.slice(0, MAX_PROMPT_CONTEXT)}\n\n[上游内容过长，后续内容已截断]` : upstream}`
-    : ''
-  const common = `你是测试辅助平台的 ${STAGES.find((stage) => stage.id === stageId)?.label || stageId} 专家。\n项目：${run.projectName}\n项目类型：${run.projectType}\n\n原始需求：\n${run.requirement}${context}`
-  const instructions = {
-    receive: `${common}\n\n请把原始需求整理成结构化需求摘要，明确目标、范围、验收标准、风险、未决问题。只输出 Markdown，不要编造需求中没有的业务事实。`,
-    analyze: `${common}\n\n请分析需求的可测试性与风险：拆解功能点、边界条件、异常路径、依赖、优先级，并列出需要向产品或研发确认的问题。只输出 Markdown。`,
-    design: `${common}\n\n请设计可执行测试方案。至少覆盖 happy path、校验失败、鉴权/权限、幂等性、并发或重试（适用时）。给出用例 ID、前置条件、步骤、期望结果和优先级。只输出 Markdown。`,
-    execute: `${common}\n\n请根据测试用例生成本次执行计划与执行记录模板。由于当前 Web 版没有接入被测系统，不要声称真实请求已发送；明确标记为“待执行”，并给出每条用例的执行命令/请求建议、证据要求和通过判定。只输出 Markdown。`,
-    report: `${common}\n\n请汇总上游结果形成测试报告草案：覆盖范围、风险、阻塞项、发布建议、证据索引和下一步动作。对无法真实执行的内容标记为“未执行”，不要虚构通过率。只输出 Markdown。`,
-  }
-  return instructions[stageId]
-}
-
-function wait(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-function providerMessage(payload) {
-  const message = payload?.error?.message || payload?.message
-  return typeof message === 'string' && message.trim() ? message.trim().slice(0, 300) : '服务商未返回具体错误信息'
-}
-
-async function callModel(run, prompt) {
-  const request = {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${run.apiKey}`,
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: run.model,
-      messages: [
-        { role: 'system', content: '你输出的是测试平台内部产物。优先准确、可审计、结构化；不要泄露 API Key。' },
-        { role: 'user', content: prompt },
-      ],
-      temperature: 0.2,
-      max_tokens: 4000,
-    }),
-    signal: AbortSignal.timeout(MODEL_TIMEOUT_MS),
-  }
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const response = await fetch(`${run.baseUrl}/chat/completions`, request)
-    const raw = await response.text()
-    let payload
-    try { payload = JSON.parse(raw) } catch { payload = null }
-    if (response.ok) {
-      const content = payload?.choices?.[0]?.message?.content
-      if (Array.isArray(content)) return content.map((part) => part?.text || '').join('').trim()
-      if (typeof content === 'string' && content.trim()) return content.trim()
-      throw new Error('模型返回中没有可用文本，请检查模型名称或 API Base URL')
-    }
-    if (attempt === 0 && (response.status === 429 || response.status >= 500)) {
-      await wait(800)
-      continue
-    }
-    throw new Error(`模型请求失败（HTTP ${response.status}）：${providerMessage(payload)}`)
-  }
-  throw new Error('模型请求失败，请稍后重试')
-}
-
-async function runPipeline(run) {
-  run.status = 'running'
-  const previous = []
+  const raw = Buffer.concat(chunks).toString('utf8').trim()
+  if (raw === '') return {}
   try {
-    for (const stage of STAGES.slice(0, -1)) {
-      const state = run.stages[stage.id]
-      state.status = 'running'
-      state.startedAt = new Date().toISOString()
-      const content = await callModel(run, promptFor(stage.id, run, previous))
-      const artifact = {
-        pipelineId: run.id,
-        stageId: stage.id,
-        version: 1,
-        digest: digest({ stageId: stage.id, content }),
-        content,
-      }
-      state.status = 'done'
-      state.finishedAt = new Date().toISOString()
-      state.digest = artifact.digest
-      state.content = content
-      previous.push(artifact)
-      run.artifacts.push(artifact)
+    const parsed = JSON.parse(raw)
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('请求体必须是 JSON 对象')
     }
-    const archiveContent = `# 产物归档\n\n- Pipeline ID: ${run.id}\n- 项目：${run.projectName}\n- 模型：${run.model}\n- 产物数量：${run.artifacts.length}\n- 归档摘要：${run.artifacts.map((item) => `${item.stageId}=${item.digest}`).join('，')}\n\n> 本次归档只记录 Web 端生成的阶段产物。执行阶段未连接被测系统，因此不能将“待执行”标记为真实通过。`
-    const archive = { pipelineId: run.id, stageId: 'archive', version: 1, digest: digest(archiveContent), content: archiveContent }
-    const archiveState = run.stages.archive
-    archiveState.status = 'done'
-    archiveState.startedAt = new Date().toISOString()
-    archiveState.finishedAt = new Date().toISOString()
-    archiveState.digest = archive.digest
-    archiveState.content = archive.content
-    run.artifacts.push(archive)
-    run.status = 'completed'
+    return parsed
   } catch (error) {
-    const active = Object.values(run.stages).find((stage) => stage.status === 'running')
-    if (active) {
-      active.status = 'failed'
-      active.error = errorMessage(error)
-      active.finishedAt = new Date().toISOString()
-    }
-    run.status = 'failed'
-    run.error = errorMessage(error)
-  } finally {
-    // The key is needed only while the run is in flight. Never expose it via publicRun().
-    run.apiKey = undefined
-    run.finishedAt = new Date().toISOString()
-    releaseRunSlot(run.clientIp)
-    cleanupRuns()
+    throw new PipelineRunError('invalid-request', `请求体不是合法 JSON 对象：${errorMessageOf(error)}`)
   }
 }
 
-function contentType(path) {
-  return {
-    '.html': 'text/html; charset=utf-8',
-    '.css': 'text/css; charset=utf-8',
-    '.js': 'text/javascript; charset=utf-8',
-    '.json': 'application/json; charset=utf-8',
-    '.svg': 'image/svg+xml',
-  }[extname(path)] || 'application/octet-stream'
+function optionalString(value, field) {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string') throw new PipelineRunError('invalid-request', `${field} 必须是字符串`)
+  return value
 }
 
-async function serveStatic(req, res) {
-  const requestPath = decodeURIComponent(new URL(req.url, 'http://localhost').pathname)
-  const relative = requestPath === '/' ? 'index.html' : requestPath.replace(/^\/+/, '')
+function requiredString(value, field) {
+  const parsed = optionalString(value, field)
+  if (parsed === undefined || parsed.trim() === '') {
+    throw new PipelineRunError('invalid-request', `${field} 必填`)
+  }
+  return parsed
+}
+
+/**
+ * 解析调用者身份（**鉴权入口**，docs/10 §5.3）。
+ *
+ * 默认返回服务端固定身份，完全忽略客户端请求头；只有显式开启
+ * `PLATFORM_TRUST_ACTOR_HEADERS=1` 时才读取请求头（此时必须由反向代理
+ * 完成真实鉴权并剥除同名头）。**失败关闭**：开启后若缺 `x-actor-id` 直接 401。
+ */
+function actorOf(req) {
+  if (!TRUST_ACTOR_HEADERS) return SERVER_ACTOR
+  const actorId = req.headers['x-actor-id']
+  if (typeof actorId !== 'string' || actorId.trim() === '') {
+    throw new PipelineRunError('unauthenticated', '缺少 x-actor-id（已开启 PLATFORM_TRUST_ACTOR_HEADERS）')
+  }
+  const tenant = req.headers['x-actor-tenant']
+  const roles = req.headers['x-actor-roles']
+  const projects = req.headers['x-actor-projects']
+  return {
+    actorId: actorId.trim(),
+    ...(typeof tenant === 'string' && tenant.trim() !== '' ? { tenantId: tenant.trim() } : {}),
+    roles: typeof roles === 'string' ? splitList(roles, []) : [],
+    ...(typeof projects === 'string' && projects.trim() !== ''
+      ? { projectIds: splitList(projects, []) }
+      : {}),
+  }
+}
+
+// ── 路由 ─────────────────────────────────────────────────────────────────────
+
+/**
+ * 路由表：`方法 + 正则` → 处理器。正则捕获组按顺序传给处理器。
+ *
+ * 处理器只做参数解析与响应映射；一切业务判定都在 service 内，因此
+ * 「HTTP 又写了一套流水线」在结构上不可能发生（docs/10 §5.2）。
+ */
+const ROUTES = [
+  ['GET', /^\/api\/pipelines$/, async (req, res) => {
+    json(res, 200, { pipelines: await service.list(actorOf(req)) })
+  }],
+
+  ['POST', /^\/api\/projects\/([^/]+)\/pipelines$/, async (req, res, projectId) => {
+    const body = await readJsonBody(req)
+    const configRef = optionalString(body.configRef, 'configRef') ?? CONFIG_REF
+    if (configRef !== CONFIG_REF) {
+      throw new PipelineRunError('invalid-request', `本服务只接受 configRef=${CONFIG_REF}`, { got: configRef })
+    }
+    const summary = await service.create({
+      projectId,
+      pipelineId: requiredString(body.pipelineId, 'pipelineId'),
+      configRef: CONFIG_REF,
+      ...optionalFields(body, ['requirementInput', 'providerName', 'targetBaseUrl', 'rulesetVersion']),
+      ...optionalNumbers(body, ['maxGateRetries', 'gateWaitTimeoutMs', 'gateTaskTtlMs']),
+      ...(Array.isArray(body.diagCredentials) ? { diagCredentials: body.diagCredentials } : {}),
+    }, actorOf(req))
+    // docs/10 §5.3：创建后返回 202 与流水线标识，不等待整条流水线完成。
+    json(res, 202, summary)
+  }],
+
+  ['POST', /^\/api\/pipelines\/([^/]+)\/run$/, async (req, res, pipelineId) => {
+    // 后台运行：立刻返回 202，不等人工裁决（docs/10 §5.4）。
+    // 用调用者自己的身份驱动运行，使后台运行与审计对象一致。
+    const trigger = await runner.trigger(pipelineId, actorOf(req))
+    json(res, 202, {
+      pipelineId,
+      started: trigger.started,
+      reason: trigger.reason,
+      running: runner.isRunning(pipelineId),
+    })
+  }],
+
+  ['POST', /^\/api\/pipelines\/([^/]+)\/cancel$/, async (req, res, pipelineId) => {
+    // 先确认调用者有权看这条流水线，再取消（否则等于把取消变成探测接口）。
+    await service.get(pipelineId, actorOf(req))
+    json(res, 202, { pipelineId, cancelled: runner.cancel(pipelineId, 'cancelled via web api') })
+  }],
+
+  ['GET', /^\/api\/pipelines\/([^/]+)\/gates$/, async (req, res, pipelineId) => {
+    const status = queryOf(req).get('status') ?? undefined
+    json(res, 200, {
+      gates: await service.listGateTasks({
+        pipelineId,
+        ...(status === null || status === undefined ? {} : { status }),
+      }, actorOf(req)),
+    })
+  }],
+
+  ['GET', /^\/api\/pipelines\/([^/]+)\/events$/, async (req, res, pipelineId) => {
+    json(res, 200, { events: await service.listEvents(pipelineId, actorOf(req)) })
+  }],
+
+  ['GET', /^\/api\/pipelines\/([^/]+)\/stages\/([^/]+)\/artifact$/, async (req, res, pipelineId, stageId) => {
+    const artifact = await service.getStageArtifact(pipelineId, stageId, actorOf(req))
+    if (artifact === null) {
+      // 尚未产出：404 而不是空对象——空对象会被页面当成"产物存在但内容为空"。
+      json(res, 404, { error: `阶段 ${stageId} 尚无产物` })
+      return
+    }
+    json(res, 200, artifact)
+  }],
+
+  ['POST', /^\/api\/pipelines\/([^/]+)\/reenter$/, async (req, res, pipelineId) => {
+    const body = await readJsonBody(req)
+    const checkpoint = await service.reenter({
+      pipelineId,
+      stageId: requiredString(body.stageId, 'stageId'),
+      reason: requiredString(body.reason, 'reason'),
+      ...optionalFields(body, ['expectedCurrentDigest']),
+    }, actorOf(req))
+    json(res, 202, {
+      pipelineId: checkpoint.pipelineId,
+      cursor: checkpoint.cursor,
+      reentries: checkpoint.reentries,
+    })
+  }],
+
+  ['GET', /^\/api\/pipelines\/([^/]+)$/, async (req, res, pipelineId) => {
+    const view = await service.get(pipelineId, actorOf(req))
+    json(res, 200, { ...view, running: runner.isRunning(pipelineId) })
+  }],
+
+  ['POST', /^\/api\/gates\/([^/]+)\/claim$/, async (req, res, gateTaskId) => {
+    const body = await readJsonBody(req)
+    json(res, 200, await service.claimGate({
+      pipelineId: requiredString(body.pipelineId, 'pipelineId'),
+      gateTaskId,
+      ...optionalNumbers(body, ['ttlMs']),
+    }, actorOf(req)))
+  }],
+
+  ['POST', /^\/api\/gates\/([^/]+)\/decide$/, async (req, res, gateTaskId) => {
+    const body = await readJsonBody(req)
+    json(res, 200, await service.decideGate({
+      pipelineId: requiredString(body.pipelineId, 'pipelineId'),
+      gateTaskId,
+      // action 必须显式传入：不存在"缺省即批准"（docs/10 §5.3）。
+      action: requiredString(body.action, 'action'),
+      ...optionalFields(body, ['note']),
+      ...optionalNumbers(body, ['expectedUpdatedAt']),
+    }, actorOf(req)))
+  }],
+
+  ['POST', /^\/api\/gates\/([^/]+)\/cancel$/, async (req, res, gateTaskId) => {
+    const body = await readJsonBody(req)
+    json(res, 200, await service.cancelGate({
+      pipelineId: requiredString(body.pipelineId, 'pipelineId'),
+      gateTaskId,
+      ...optionalFields(body, ['note']),
+    }, actorOf(req)))
+  }],
+
+  ['POST', /^\/api\/admin\/recover$/, async (req, res) => {
+    // docs/10 §5.4 第 7 步：进程重启后扫描 running/awaiting-gate 并恢复或标记可重入。
+    json(res, 200, { outcomes: await runner.recover() })
+  }],
+]
+
+/** 只挑出请求体里出现过的可选字符串字段（避免把 `undefined` 显式写进对象）。 */
+function optionalFields(body, names) {
+  const out = {}
+  for (const name of names) {
+    const value = optionalString(body[name], name)
+    if (value !== undefined) out[name] = value
+  }
+  return out
+}
+
+function optionalNumbers(body, names) {
+  const out = {}
+  for (const name of names) {
+    const raw = body[name]
+    if (raw === undefined || raw === null) continue
+    if (!Number.isSafeInteger(raw) || raw < 0) {
+      throw new PipelineRunError('invalid-request', `${name} 必须是非负整数`)
+    }
+    out[name] = raw
+  }
+  return out
+}
+
+// ── 静态资源 ─────────────────────────────────────────────────────────────────
+
+const CONTENT_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+}
+
+async function serveStatic(req, res, pathname) {
+  const relative = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '')
   const target = normalize(join(PUBLIC_DIR, relative))
-  if (!target.startsWith(PUBLIC_DIR + sep)) return json(res, 403, { error: 'forbidden' })
+  // 路径穿越防护：静态目录之外一律 403。
+  if (target !== PUBLIC_DIR && !target.startsWith(PUBLIC_DIR + sep)) {
+    return json(res, 403, { error: 'forbidden' })
+  }
   try {
     const body = await readFile(target)
     res.writeHead(200, {
-      'content-type': contentType(target),
+      'content-type': CONTENT_TYPES[extname(target)] || 'application/octet-stream',
       'cache-control': 'no-cache',
       'x-content-type-options': 'nosniff',
       'x-frame-options': 'DENY',
@@ -340,41 +453,50 @@ async function serveStatic(req, res) {
   }
 }
 
+// ── 服务器 ───────────────────────────────────────────────────────────────────
+
 const server = createServer(async (req, res) => {
+  let pathname = '/'
   try {
-    const pathname = requestPath(req)
-    if (req.method === 'GET' && pathname === '/health') return json(res, 200, { ok: true, app: 'harness-web-app' })
-    if (req.method === 'POST' && pathname === '/api/runs') {
-      if (!String(req.headers['content-type'] || '').toLowerCase().includes('application/json')) {
-        return json(res, 415, { error: '请求必须使用 application/json' })
-      }
-      const declaredLength = Number(req.headers['content-length'] || 0)
-      if (declaredLength > MAX_BODY) return json(res, 413, { error: '请求体过大，请压缩需求文本后重试' })
-      const ip = clientIp(req)
-      const input = await readBody(req)
-      const run = await createRun(input, ip)
-      void runPipeline(run)
-      return json(res, 202, { runId: run.id })
+    pathname = pathnameOf(req)
+    if (req.method === 'GET' && pathname === '/health') {
+      // 只回显可公开的运行时事实；不回显 dataRoot / configPath（不泄露部署布局）。
+      return json(res, 200, {
+        ok: true,
+        app: 'harness-web-app',
+        configRef: CONFIG_REF,
+        trustActorHeaders: TRUST_ACTOR_HEADERS,
+        running: runner.runningIds(),
+      })
     }
-    if (req.method === 'GET' && pathname.startsWith('/api/runs/')) {
-      cleanupRuns()
-      const run = runs.get(pathname.slice('/api/runs/'.length))
-      return run ? json(res, 200, publicRun(run)) : json(res, 404, { error: 'run not found' })
+
+    for (const [method, pattern, handler] of ROUTES) {
+      if (req.method !== method) continue
+      const match = pattern.exec(pathname)
+      if (match === null) continue
+      return await handler(req, res, ...match.slice(1).map(decodeURIComponent))
     }
-    if (req.method === 'GET') return serveStatic(req, res)
+
+    if (req.method === 'GET') return await serveStatic(req, res, pathname)
     return json(res, 405, { error: 'method not allowed' })
   } catch (error) {
-    const message = errorMessage(error)
-    const status = message.includes('请求体过大') ? 413 : message.includes('API Key') || message.includes('需求文本') ? 422 : 400
-    return json(res, status, { error: message })
+    // 错误映射：`PipelineRunError` 自带 HTTP 状态；未知异常一律 500，绝不降级成 200。
+    const mapped = error instanceof PipelineRunError
+      ? error
+      : new PipelineRunError('run-failed', errorMessageOf(error))
+    // 错误详情经 redactSecrets 脱敏后再出网：凭据不进日志也不进响应（docs/10 §2.2）。
+    return json(res, mapped.httpStatus, { error: redactSecrets(mapped.toView()) })
   }
 })
 
 server.listen(PORT, HOST, () => {
-  console.log(`Harness Web listening at http://${HOST}:${PORT}`)
+  // 只打印监听地址与逻辑配置引用，不打印 dataRoot / configPath / 任何凭据。
+  console.log(`Harness Web listening at http://${HOST}:${PORT} (configRef=${CONFIG_REF}, trustActorHeaders=${TRUST_ACTOR_HEADERS})`)
 })
 
 function shutdown() {
+  // 先中止后台运行，再关连接：避免运行中的流水线被硬切断而留下半写状态。
+  runner.shutdown('server shutting down')
   server.close(() => process.exit(0))
 }
 process.on('SIGINT', shutdown)

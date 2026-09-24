@@ -10,170 +10,41 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
-import { normalizeConfig } from '../src/config.ts'
-import { PipelineDriver, type ArtifactStore } from '../src/driver.ts'
 import { resolvePlatformRoots } from '../src/platform-roots.ts'
 import { STAGE_ORDER, type PipelineConfig, type StageId } from '../src/types.ts'
-import { DEFAULT_RULESET_VERSION, buildGateEngine, gateTaskStoreDir, taskStoreDir } from '../src/runtime/platform-host.ts'
-import type { PlatformHost, PlatformHostOptions } from '../src/runtime/platform-host.ts'
-import { FileHumanGateTaskStore, FileTaskStore, type HumanGateTask } from '../src/runtime/persistence.ts'
-import { PersistentHumanGate } from '../src/runtime/persistent-human-gate.ts'
-import { ScriptedStageRunner } from '../src/runtime/scripted-runtime.ts'
-import { InMemoryToolRegistry } from '../src/runtime/tool-registry.ts'
-import { OpenAICompatibleClient } from '../src/runtime/openai-client.ts'
-import type { ResolvedLlmProvider } from '../src/provider-registry.ts'
-import { FsArtifactStore, FsCheckpointPort } from '../src/stores/fs.ts'
-import type { SpawnRequest, SpawnedRun, StageSpawner } from '../src/stage-spawner.ts'
+import { DEFAULT_RULESET_VERSION } from '../src/runtime/platform-host.ts'
+import type { HumanGateTask } from '../src/runtime/persistence.ts'
 import {
   FilePipelineRunService,
   pipelineIndexDir,
+  scanPipelineIndex,
   type PipelineRunServiceOptions,
 } from '../src/web/pipeline-run-service.ts'
-import type { PlatformHostFactory } from '../src/web/pipeline-run-service.ts'
 import {
   PipelineRunError,
   type ActorContext,
-  type CreatePipelineRunInput,
 } from '../src/web/pipeline-run-types.ts'
+import {
+  API_KEY,
+  CREATE,
+  REVIEWER,
+  SCOPE,
+  ScriptedHost,
+  baseConfig,
+} from './web-fixtures.ts'
 
 let dir: string
 let config: PipelineConfig
-
-const API_KEY = 'sk-service-test-secret-value'
-const ENV_VAR = 'PLATFORM_SERVICE_TEST_KEY'
 
 test.beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'pp-svc-'))
   config = baseConfig()
 })
 test.afterEach(async () => { await rm(dir, { recursive: true, force: true }) })
-
-/** 最小可用配置：无机器门禁规则、关闭交叉检查，让契约测试只验证服务层接线。 */
-function baseConfig(overrides: Record<string, unknown> = {}): PipelineConfig {
-  return normalizeConfig({
-    projectId: 'demo',
-    projectType: 'api-service',
-    templateVersion: 'v1',
-    scaleTier: 'S',
-    scope: { tenantId: 'acme' },
-    stores: {
-      knowledge: { impl: 'markdown-fs', path: 'kb' },
-      cases: { impl: 'markdown-fs', path: 'cases' },
-      requirements: { primary: { impl: 'paste' } },
-    },
-    llm: {
-      defaultProvider: 'primary',
-      providers: {
-        primary: {
-          type: 'openai-compatible',
-          baseUrl: 'https://llm.example.com/v1',
-          model: 'test-model',
-          apiKeyEnv: ENV_VAR,
-          capabilities: { tools: true, structuredOutput: true },
-        },
-      },
-    },
-    stages: Object.fromEntries(STAGE_ORDER.map(id => [id, { rules: [], review: { enabled: false } }])),
-    ...overrides,
-  })
-}
-
-/** 记录 spawn 调用的脚本化运行器：用于断言"已批准阶段不重生成"。 */
-class RecordingSpawner implements StageSpawner {
-  readonly stages: StageId[] = []
-  private readonly inner: ScriptedStageRunner
-
-  constructor(artifacts: ArtifactStore) {
-    this.inner = new ScriptedStageRunner(artifacts, ({ request }) => ({
-      stage: request.stageId,
-      summary: `scripted artifact for ${request.stageId}`,
-    }))
-  }
-
-  runStage(request: SpawnRequest, cfg: PipelineConfig): Promise<SpawnedRun> {
-    this.stages.push(request.stageId)
-    return this.inner.runStage(request, cfg)
-  }
-}
-
-/**
- * 脚本化宿主（与 `createPlatformHost` 同样的装配顺序，只把 LLM 阶段运行器换成
- * `ScriptedStageRunner`）。
- *
- * 关键点：**产物库实例由宿主工厂创建并交给 spawner**，否则 spawner 会写到另一个
- * baseDir，driver 读不到产物、机器门禁以 R-ARTIFACT-READABLE 拦下。
- * 所有 host 实例共用同一个 `RecordingSpawner`，因此 spawn 记录跨多次 `run()` 累积。
- *
- * provider/llm 字段仍按真实形状构造（API Key 由宿主持有），用于验证服务层不会把它带进返回值。
- */
-class ScriptedHost {
-  private spawner: RecordingSpawner | undefined
-
-  /** 累计的 spawn 记录（跨多次 run 与多个 host 实例）。 */
-  get stages(): readonly StageId[] {
-    return this.spawner?.stages ?? []
-  }
-
-  readonly factory: PlatformHostFactory = (options: PlatformHostOptions): PlatformHost => {
-    const roots = resolvePlatformRoots(options.dataRoot, options.config)
-    const checkpointRoot = join(roots.checkpointRoot, options.pipelineId)
-    const artifacts = new FsArtifactStore(roots.artifactsRoot)
-    this.spawner ??= new RecordingSpawner(artifacts)
-    const spawner = this.spawner
-    const gateTasks = new FileHumanGateTaskStore(gateTaskStoreDir(roots.projectRoot))
-    const tasks = new FileTaskStore(taskStoreDir(roots.projectRoot))
-    const gate = new PersistentHumanGate({
-      store: gateTasks,
-      projectId: options.config.projectId,
-      pipelineId: options.pipelineId,
-      ...(options.config.scope?.tenantId === undefined ? {} : { tenantId: options.config.scope.tenantId }),
-      ...(options.gateWaitTimeoutMs === undefined ? {} : { waitTimeoutMs: options.gateWaitTimeoutMs }),
-      ...(options.gateTaskTtlMs === undefined ? {} : { taskTtlMs: options.gateTaskTtlMs }),
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
-    })
-    const provider: ResolvedLlmProvider = {
-      name: 'scripted',
-      type: 'openai-compatible',
-      baseUrl: 'https://llm.invalid/v1',
-      model: 'scripted',
-      apiKeyEnv: ENV_VAR,
-      apiKey: API_KEY,
-      capabilities: { tools: true, structuredOutput: true },
-    }
-    const driver = new PipelineDriver({
-      cfg: options.config,
-      pipelineId: options.pipelineId,
-      root: checkpointRoot,
-      rulesetVersion: DEFAULT_RULESET_VERSION,
-      spawn: spawner,
-      gates: buildGateEngine(options.config),
-      human: gate,
-      artifacts,
-      checkpoint: new FsCheckpointPort(),
-    })
-    return {
-      roots,
-      checkpointRoot,
-      provider,
-      llm: new OpenAICompatibleClient({
-        baseUrl: provider.baseUrl,
-        apiKey: provider.apiKey,
-        defaultModel: provider.model,
-        fetchImpl: async () => { throw new Error('scripted host: LLM 不应被调用') },
-      }),
-      tools: new InMemoryToolRegistry(),
-      artifacts,
-      gateTasks,
-      tasks,
-      gate,
-      driver,
-    }
-  }
-}
 
 function serviceOf(host: ScriptedHost, overrides: Partial<PipelineRunServiceOptions> = {}): FilePipelineRunService {
   return new FilePipelineRunService({
@@ -183,10 +54,6 @@ function serviceOf(host: ScriptedHost, overrides: Partial<PipelineRunServiceOpti
     ...overrides,
   })
 }
-
-const REVIEWER: ActorContext = { actorId: 'alice', tenantId: 'acme', roles: ['reviewer', 'admin'] }
-const CREATE: CreatePipelineRunInput = { projectId: 'demo', pipelineId: 'pipe-1', configRef: 'pipeline.yaml' }
-const SCOPE = { projectId: 'demo', pipelineId: 'pipe-1' } as const
 
 function isCode(code: string) {
   return (error: unknown): boolean => error instanceof PipelineRunError && error.code === code
@@ -695,4 +562,134 @@ test('错误码到 HTTP 状态的映射覆盖全部前置失败路径', () => {
   for (const [code, status] of Object.entries(expected)) {
     assert.equal(new PipelineRunError(code as never, 'x').httpStatus, status)
   }
+})
+
+// ── 索引扫描（docs/10 §5.4 第 7 步恢复扫描的输入）─────────────────────────────
+
+/** 把一条索引项直接写到磁盘（绕过 service，用于构造损坏/越权样本）。 */
+async function writeIndexFile(name: string, payload: unknown): Promise<void> {
+  const indexDir = pipelineIndexDir(dir)
+  await mkdir(indexDir, { recursive: true })
+  await writeFile(join(indexDir, name), typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2), 'utf8')
+}
+
+test('scanPipelineIndex 对不存在的索引目录返回空结果，而不是报错', async () => {
+  assert.deepEqual(await scanPipelineIndex(dir), { entries: [], unreadable: [] })
+})
+
+test('scanPipelineIndex 按 pipelineId 排序，保证恢复顺序确定', async () => {
+  await writeIndexFile('pipe-c.json', { pipelineId: 'pipe-c', tenantId: null, projectId: 'demo', configRef: 'c.yaml' })
+  await writeIndexFile('pipe-a.json', { pipelineId: 'pipe-a', tenantId: null, projectId: 'demo', configRef: 'a.yaml' })
+  await writeIndexFile('pipe-b.json', { pipelineId: 'pipe-b', tenantId: null, projectId: 'demo', configRef: 'b.yaml' })
+
+  const scan = await scanPipelineIndex(dir)
+  assert.deepEqual(scan.entries.map(entry => entry.pipelineId), ['pipe-a', 'pipe-b', 'pipe-c'])
+  assert.deepEqual(scan.unreadable, [])
+})
+
+test('scanPipelineIndex 报告损坏索引而不是静默跳过（恢复必须能看见无法恢复的项）', async () => {
+  await writeIndexFile('good.json', { pipelineId: 'good', tenantId: null, projectId: 'demo', configRef: 'p.yaml' })
+  await writeIndexFile('broken-json.json', '{ 这不是 JSON')
+  await writeIndexFile('missing-field.json', { pipelineId: 'missing-field' })
+  await writeIndexFile('mismatch.json', { pipelineId: 'other-id', tenantId: null, projectId: 'demo', configRef: 'p.yaml' })
+
+  const scan = await scanPipelineIndex(dir)
+  assert.deepEqual(scan.entries.map(entry => entry.pipelineId), ['good'])
+  assert.deepEqual(scan.unreadable.map(item => item.file).sort(), ['broken-json.json', 'mismatch.json', 'missing-field.json'])
+  assert.match(scan.unreadable.find(item => item.file === 'mismatch.json')!.reason, /与文件名不一致/)
+})
+
+// ── list：枚举调用者可见的流水线 ──────────────────────────────────────────────
+
+test('list 只返回调用者作用域内的流水线，越权项不泄露标识', async () => {
+  const service = serviceOf(new ScriptedHost())
+  await service.create(CREATE, REVIEWER)
+
+  const visible = await service.list(REVIEWER)
+  assert.deepEqual(visible.map(item => item.pipelineId), ['pipe-1'])
+  assert.equal(visible[0]!.status, 'queued')
+  assert.equal(visible[0]!.projectId, 'demo')
+  assert.equal(visible[0]!.configRef, 'pipeline.yaml')
+  assert.equal(visible[0]!.nextStage, 'receive')
+
+  // 项目白名单不含 demo：既不返回条目，也不通过报错泄露它存在。
+  const outsider: ActorContext = { actorId: 'bob', tenantId: 'acme', projectIds: ['other-project'] }
+  assert.deepEqual(await service.list(outsider), [])
+})
+
+test('list 的状态来自持久化事实：停在人工门后变为 waiting-human', async () => {
+  const { service } = await parkedAtReceiveGate()
+  const [summary] = await service.list(REVIEWER)
+  assert.equal(summary!.status, 'waiting-human')
+  // 裁决已批准但尚未被消费：cursor 仍停在 receive，下一次 run 要做的正是消费它。
+  // 因此 nextStage 是 receive 而不是 analyze（analyze 要等这次消费完成才轮到）。
+  assert.equal(summary!.nextStage, 'receive')
+})
+
+test('list 跳过索引损坏或配置不可解析的项，不用半成品状态冒充成功', async () => {
+  const service = serviceOf(new ScriptedHost())
+  await service.create(CREATE, REVIEWER)
+  await writeIndexFile('broken.json', '{ 不是 JSON')
+  // 指向不存在的配置：可读出索引，但 config-invalid，必须被跳过。
+  await writeIndexFile('orphan.json', { pipelineId: 'orphan', tenantId: null, projectId: 'demo', configRef: 'no-such.yaml' })
+
+  const visible = await service.list(REVIEWER)
+  assert.deepEqual(visible.map(item => item.pipelineId), ['pipe-1'])
+})
+
+test('list 空 actorId 一律 unauthenticated', async () => {
+  const service = serviceOf(new ScriptedHost())
+  await assert.rejects(() => service.list({ actorId: '  ' }), isCode('unauthenticated'))
+})
+
+test('配置声明 scope.environment 时服务仍可用（部署维度不参与调用者作用域比较）', async () => {
+  // 回归：`assertScope` 曾把 `scope.environment` 也拿去和调用者比较，而 `ActorContext`
+  // 从不携带 environment，导致**任何声明了它的配置永久不可用**
+  // （`expected staging, got (missing)`）。示例配置 examples/pipeline.yaml 正是这种情况。
+  config = baseConfig({ scope: { tenantId: 'acme', environment: 'staging' } })
+  const host = new ScriptedHost()
+  const service = serviceOf(host)
+
+  const summary = await service.create(CREATE, REVIEWER)
+  assert.equal(summary.status, 'queued')
+  // 项目目录只由租户与项目推导，environment 不影响路径。
+  const roots = resolvePlatformRoots(dir, config)
+  assert.ok(roots.projectRoot.endsWith(join('tenants', 'acme', 'projects', 'demo')))
+  assert.equal(roots.projectRoot.includes('staging'), false)
+  assert.equal((await service.get('pipe-1', REVIEWER)).status, 'queued')
+})
+
+// ── getStageArtifact：回读产物文件 ────────────────────────────────────────────
+
+test('getStageArtifact 在阶段尚未产出时返回 null，不编造空产物', async () => {
+  const service = serviceOf(new ScriptedHost())
+  await service.create(CREATE, REVIEWER)
+  assert.equal(await service.getStageArtifact('pipe-1', 'receive', REVIEWER), null)
+})
+
+test('getStageArtifact 回读真实产物内容、digest 与相对路径', async () => {
+  const { service } = await parkedAtReceiveGate()
+  const artifact = await service.getStageArtifact('pipe-1', 'receive', REVIEWER)
+  assert.ok(artifact !== null)
+  assert.equal(artifact.stageId, 'receive')
+  // 相对产物根的路径：不向浏览器泄露服务器部署布局。
+  assert.equal(artifact.artifactPath, 'artifacts/pipe-1/receive.json')
+  assert.equal(artifact.artifactPath.startsWith('/'), false)
+  assert.equal(artifact.version, 1)
+  assert.deepEqual(artifact.content, { stage: 'receive', summary: 'scripted artifact for receive' })
+  assert.match(artifact.digest, /^[0-9a-f]{16,}$/)
+  // digest 必须与检查点里持久化的那份一致，否则页面会展示一个"算出来对不上"的值。
+  const view = await service.get('pipe-1', REVIEWER)
+  assert.equal(artifact.digest, view.stages[0]!.digest)
+})
+
+test('getStageArtifact 拒绝未知阶段与越权调用者', async () => {
+  const service = serviceOf(new ScriptedHost())
+  await service.create(CREATE, REVIEWER)
+  await assert.rejects(
+    () => service.getStageArtifact('pipe-1', 'not-a-stage' as never, REVIEWER),
+    isCode('invalid-request'),
+  )
+  const outsider: ActorContext = { actorId: 'bob', tenantId: 'acme', projectIds: ['other-project'] }
+  await assert.rejects(() => service.getStageArtifact('pipe-1', 'receive', outsider), isCode('forbidden'))
 })

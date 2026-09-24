@@ -22,7 +22,7 @@
  * @module platform-pipeline/web/pipeline-run-service
  */
 
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { validatePipelineAcl } from '../acl.ts'
@@ -45,6 +45,7 @@ import { FileHumanGateTaskStore, type HumanGateTask } from '../runtime/persisten
 import { HumanGateWaitAbortedError } from '../runtime/persistent-human-gate.ts'
 import {
   PipelineRunError,
+  errorMessageOf,
   toPipelineRunError,
   type ActorContext,
   type CreatePipelineRunInput,
@@ -52,12 +53,15 @@ import {
   type GateClaimInput,
   type GateDecisionInput,
   type GateTaskFilter,
+  type PipelineEventKind,
+  type PipelineEventView,
   type PipelineRunFailure,
   type PipelineRunStatus,
   type PipelineRunSummary,
   type PipelineRunView,
   type ReenterInput,
   type RunResult,
+  type StageArtifactView,
   type StageView,
 } from './pipeline-run-types.ts'
 
@@ -86,6 +90,29 @@ export interface PipelineRunServiceOptions {
   readonly signal?: AbortSignal
 }
 
+/** `run()` 的每次调用选项。 */
+export interface RunCallOptions {
+  /**
+   * 本次运行的取消信号（由 `PipelineRunRegistry` 的句柄提供）。
+   *
+   * 与 service 构造参数 `signal` 是**并列**关系：任一中止即中止本次运行
+   * （用 `AbortSignal.any` 合并）。这样"取消某一条流水线的后台运行"不会
+   * 连带取消同一 service 实例上其他流水线的运行。
+   */
+  readonly signal?: AbortSignal
+}
+
+/**
+ * 合并多个取消信号；全部缺省时返回 `undefined`（而不是造一个永不中止的信号，
+ * 避免下游把它当成"宿主声明了不会取消"）。
+ */
+export function combineSignals(...signals: readonly (AbortSignal | undefined)[]): AbortSignal | undefined {
+  const present = signals.filter((signal): signal is AbortSignal => signal !== undefined)
+  if (present.length === 0) return undefined
+  if (present.length === 1) return present[0]
+  return AbortSignal.any(present)
+}
+
 /**
  * Web/HTTP 可调用的服务契约（docs/10 §4.2 M0-2 原文签名）。
  *
@@ -96,7 +123,30 @@ export interface PipelineRunServiceOptions {
 export interface PipelineRunService {
   create(input: CreatePipelineRunInput, actor: ActorContext): Promise<PipelineRunSummary>
   get(pipelineId: string, actor: ActorContext): Promise<PipelineRunView>
-  run(pipelineId: string, actor: ActorContext): Promise<RunResult>
+  /**
+   * 枚举**当前调用者可见且可读取**的流水线（docs/10 §5.4 第 7 步的恢复扫描、
+   * §5.3 查询接口的列表页）。
+   *
+   * 只返回作用域内且配置可解析的项：作用域外的 pipelineId 不返回（不泄露他人
+   * 标识），索引/配置损坏的项也不返回（不用半成品状态冒充成功）。恢复扫描需要
+   * 把损坏项**报告**出来，因此它直接用 {@link scanPipelineIndex}，不走本方法。
+   */
+  list(actor: ActorContext): Promise<readonly PipelineRunSummary[]>
+  run(pipelineId: string, actor: ActorContext, options?: RunCallOptions): Promise<RunResult>
+  /**
+   * 回读某阶段的产物文件（`GET /api/pipelines/:pipelineId/stages/:stageId/artifact`）。
+   *
+   * 返回 `null` 表示该阶段尚未产出（`StageState.artifact` 为空）或产物文件已不存在；
+   * 两种情况都不编造空产物。
+   */
+  getStageArtifact(pipelineId: string, stageId: StageId, actor: ActorContext): Promise<StageArtifactView | null>
+  /**
+   * 流水线事件时间线（`GET /api/pipelines/:pipelineId/events`）。
+   *
+   * 只投影**有持久化时间戳**的事实（见 `PipelineEventKind`），按时间升序返回。
+   * 不生成"服务器看到请求的时刻"这类非事实事件。
+   */
+  listEvents(pipelineId: string, actor: ActorContext): Promise<readonly PipelineEventView[]>
   reenter(input: ReenterInput, actor: ActorContext): Promise<Checkpoint>
   listGateTasks(filter: GateTaskFilter, actor: ActorContext): Promise<readonly HumanGateTask[]>
   claimGate(input: GateClaimInput, actor: ActorContext): Promise<HumanGateTask>
@@ -121,6 +171,61 @@ export interface PipelineIndexEntry {
 /** 流水线索引目录：`<dataRoot>/pipelines`。集中在此处生成，调用点不得自行拼路径。 */
 export function pipelineIndexDir(dataRoot: string): string {
   return join(dataRoot, 'pipelines')
+}
+
+/**
+ * 索引扫描结果。
+ *
+ * `unreadable` 必须显式返回而不是静默跳过：恢复扫描（docs/10 §5.4 第 7 步）要能
+ * 报告"这条流水线因索引损坏而无法恢复"，否则运维会以为全部恢复了。
+ */
+export interface PipelineIndexScan {
+  readonly entries: readonly PipelineIndexEntry[]
+  readonly unreadable: readonly { readonly file: string; readonly reason: string }[]
+}
+
+/**
+ * 扫描全部流水线索引项（按 `pipelineId` 排序，保证恢复顺序确定）。
+ *
+ * 索引目录不存在 = 尚无任何流水线，返回空结果而不是报错。
+ * 单个索引文件损坏只影响它自己，不会让整次扫描失败。
+ */
+export async function scanPipelineIndex(dataRoot: string): Promise<PipelineIndexScan> {
+  const dir = pipelineIndexDir(dataRoot)
+  let names: string[]
+  try {
+    names = await readdir(dir)
+  } catch (error) {
+    if (isMissingFile(error)) return { entries: [], unreadable: [] }
+    throw error
+  }
+
+  const entries: PipelineIndexEntry[] = []
+  const unreadable: { file: string; reason: string }[] = []
+  for (const name of names.filter(candidate => candidate.endsWith('.json')).sort()) {
+    try {
+      const parsed = JSON.parse(await readFile(join(dir, name), 'utf8')) as unknown
+      if (!isIndexEntry(parsed)) throw new Error('索引字段缺失或类型不符')
+      // 文件名才是权威键（readIndex 按文件名读取）；两者不一致说明索引被改写坏了。
+      const expected = name.replace(/\.json$/, '')
+      if (parsed.pipelineId !== expected) {
+        throw new Error(`索引 pipelineId 与文件名不一致：${parsed.pipelineId} ≠ ${expected}`)
+      }
+      entries.push(parsed)
+    } catch (error) {
+      unreadable.push({ file: name, reason: errorMessageOf(error) })
+    }
+  }
+  return { entries, unreadable }
+}
+
+function isIndexEntry(value: unknown): value is PipelineIndexEntry {
+  if (value === null || typeof value !== 'object') return false
+  const candidate = value as Record<string, unknown>
+  return typeof candidate.pipelineId === 'string' && candidate.pipelineId !== ''
+    && typeof candidate.projectId === 'string' && candidate.projectId !== ''
+    && typeof candidate.configRef === 'string' && candidate.configRef !== ''
+    && (candidate.tenantId === null || typeof candidate.tenantId === 'string')
 }
 
 /** 需要人工门权限的角色（docs/10 §5.3「校验 actor 是否有该项目的人工门权限」）。 */
@@ -196,13 +301,73 @@ export class FilePipelineRunService implements PipelineRunService {
     return this.buildView(config, checkpoint)
   }
 
-  async run(pipelineId: string, actor: ActorContext): Promise<RunResult> {
+  async list(actor: ActorContext): Promise<readonly PipelineRunSummary[]> {
+    assertActor(actor)
+    const scan = await scanPipelineIndex(this.options.dataRoot)
+    const summaries: PipelineRunSummary[] = []
+    for (const entry of scan.entries) {
+      try {
+        // loadRun 内含作用域校验：作用域外会抛 scope-mismatch/forbidden，直接跳过。
+        const { config, checkpoint } = await this.loadRun(entry.pipelineId, actor)
+        const view = await this.buildView(config, checkpoint)
+        summaries.push({
+          pipelineId: view.pipelineId,
+          tenantId: view.tenantId,
+          projectId: view.projectId,
+          configRef: entry.configRef,
+          status: view.status,
+          nextStage: view.nextStage,
+        })
+      } catch {
+        // 不返回：作用域外的项不泄露标识；配置损坏的项不用半成品状态冒充成功。
+        // 恢复扫描需要报告这类项，因此它直接用 scanPipelineIndex() 并记录 unreadable。
+        continue
+      }
+    }
+    return summaries.sort((a, b) => (a.pipelineId < b.pipelineId ? -1 : a.pipelineId > b.pipelineId ? 1 : 0))
+  }
+
+  async getStageArtifact(pipelineId: string, stageId: StageId, actor: ActorContext): Promise<StageArtifactView | null> {
+    assertActor(actor)
+    assertSafeIdentifier(pipelineId, 'pipelineId')
+    if (!STAGE_ORDER.includes(stageId)) {
+      throw new PipelineRunError('invalid-request', `未知阶段：${stageId}`, { allowed: [...STAGE_ORDER] })
+    }
+    const { config, checkpoint } = await this.loadRun(pipelineId, actor)
+    const state = checkpoint.stageStates[stageId]!
+    // 尚未产出（idle 或产物已被重入归档）时返回 null，不编造空产物。
+    if (state.artifact === '') return null
+
+    const roots = resolvePlatformRoots(this.options.dataRoot, config)
+    const artifact = await new FsArtifactStore(roots.artifactsRoot).read(state.artifact)
+    if (artifact === null) return null
+    return {
+      pipelineId,
+      stageId,
+      artifactPath: artifact.path,
+      digest: artifact.digest,
+      version: artifact.version,
+      inputs: artifact.inputs,
+      content: artifact.content,
+    }
+  }
+
+  async listEvents(pipelineId: string, actor: ActorContext): Promise<readonly PipelineEventView[]> {
+    assertActor(actor)
+    assertSafeIdentifier(pipelineId, 'pipelineId')
+    const { config, checkpoint } = await this.loadRun(pipelineId, actor)
+    const roots = resolvePlatformRoots(this.options.dataRoot, config)
+    const tasks = await new FileHumanGateTaskStore(gateTaskStoreDir(roots.projectRoot)).list({ pipelineId })
+    return buildEventTimeline(checkpoint, tasks)
+  }
+
+  async run(pipelineId: string, actor: ActorContext, options: RunCallOptions = {}): Promise<RunResult> {
     assertActor(actor)
     assertSafeIdentifier(pipelineId, 'pipelineId')
     const { config, checkpointRoot } = await this.locate(pipelineId, actor)
     await this.requireCheckpoint(checkpointRoot)
 
-    const host = this.createHost(this.hostOptions(config, pipelineId))
+    const host = this.createHost(this.hostOptions(config, pipelineId, options.signal))
 
     try {
       const outcome = await host.driver.run()
@@ -369,15 +534,21 @@ export class FilePipelineRunService implements PipelineRunService {
     return config
   }
 
-  /** 配置声明的租户/项目/环境必须与调用者一致（跨项目读取在此被拒）。 */
+  /** 配置声明的租户/项目必须与调用者一致（跨项目读取在此被拒）。 */
   private assertScope(config: PipelineConfig, projectId: string, actor: ActorContext): void {
     assertProjectAllowed(actor, projectId)
     try {
+      // 只比较**调用者能够声明**的维度：项目与租户。
+      //
+      // `scope.environment` 刻意不参与比较：它是**部署维度**（由服务端配置决定），
+      // 不在 `ActorContext` 里、调用者无法声明它，`projectDataRoot` 推导项目目录时
+      // 也只用租户与项目。把它放进比较的后果不是"更严格"，而是**任何声明了
+      // `scope.environment` 的配置永久不可用**（`expected staging, got (missing)`），
+      // 示例配置 `examples/pipeline.yaml` 正是这种情况。
       assertScopeMatch(
         {
           projectId: config.projectId,
           ...(config.scope?.tenantId === undefined ? {} : { tenantId: config.scope.tenantId }),
-          ...(config.scope?.environment === undefined ? {} : { environment: config.scope.environment }),
         },
         { projectId, ...(actor.tenantId === undefined ? {} : { tenantId: actor.tenantId }) },
       )
@@ -386,8 +557,11 @@ export class FilePipelineRunService implements PipelineRunService {
     }
   }
 
-  private hostOptions(config: PipelineConfig, pipelineId: string): PlatformHostOptions {
+  private hostOptions(config: PipelineConfig, pipelineId: string, callSignal?: AbortSignal): PlatformHostOptions {
     const gateTaskTtlMs = this.options.defaultGateTaskTtlMs
+    // 每次调用的信号与 service 级信号并列：任一中止即中止本次运行。
+    // 这样取消某条流水线的后台运行不会连带取消同实例上其他流水线的运行。
+    const signal = combineSignals(this.options.signal, callSignal)
     return {
       config,
       dataRoot: this.options.dataRoot,
@@ -395,17 +569,19 @@ export class FilePipelineRunService implements PipelineRunService {
       // 缺省 0：HTTP handler 不在请求内挂住等真人裁决（docs/10 §5.4）。
       gateWaitTimeoutMs: this.options.defaultGateWaitTimeoutMs ?? 0,
       ...(gateTaskTtlMs === undefined ? {} : { gateTaskTtlMs }),
-      ...(this.options.signal === undefined ? {} : { signal: this.options.signal }),
+      ...(signal === undefined ? {} : { signal }),
     }
   }
 
   /** 门任务存储：路径经 `gateTaskStoreDir` 统一生成（docs/10 §4.3）。 */
-  private async gateStoreOf(pipelineId: string, projectId: string, actor: ActorContext): Promise<{
+  private async gateStoreOf(pipelineId: string, projectId: string | undefined, actor: ActorContext): Promise<{
     readonly store: FileHumanGateTaskStore
     readonly config: PipelineConfig
   }> {
     const { config } = await this.locate(pipelineId, actor)
-    if (config.projectId !== projectId) {
+    // 项目一律由索引 + 配置推导；调用方自报的项目只作**额外**一致性校验。
+    // 不匹配即拒：防止把两个不同流水线的项目/流水线标识拼在一起绕过作用域。
+    if (projectId !== undefined && config.projectId !== projectId) {
       throw new PipelineRunError('scope-mismatch', `项目不匹配：期望 ${config.projectId}，收到 ${projectId}`, {
         expected: config.projectId,
         actual: projectId,
@@ -417,7 +593,7 @@ export class FilePipelineRunService implements PipelineRunService {
 
   /** 读取门任务并校验它确实属于给定项目/流水线（防止跨流水线裁决）。 */
   private async requireGateTask(
-    input: { readonly projectId: string; readonly pipelineId: string; readonly gateTaskId: string },
+    input: { readonly projectId?: string; readonly pipelineId: string; readonly gateTaskId: string },
     actor: ActorContext,
   ): Promise<{ readonly store: FileHumanGateTaskStore; readonly task: HumanGateTask }> {
     assertSafeIdentifier(input.pipelineId, 'pipelineId')
@@ -425,11 +601,20 @@ export class FilePipelineRunService implements PipelineRunService {
     const { store } = await this.gateStoreOf(input.pipelineId, input.projectId, actor)
     const task = await store.get(input.gateTaskId)
     if (task === null) throw new PipelineRunError('not-found', `门任务不存在：${input.gateTaskId}`, { gateTaskId: input.gateTaskId })
-    if (task.pipelineId !== input.pipelineId || task.projectId !== input.projectId) {
+    // 流水线归属是必检项：这是"用 A 流水线的身份裁决 B 流水线任务"的唯一防线。
+    if (task.pipelineId !== input.pipelineId) {
       throw new PipelineRunError('scope-mismatch', `门任务不属于该流水线：${input.gateTaskId}`, {
         gateTaskId: input.gateTaskId,
         expectedPipeline: input.pipelineId,
         actualPipeline: task.pipelineId,
+      })
+    }
+    // 项目只在调用方显式声明时校验（HTTP 路径里没有 projectId，由索引推导）。
+    if (input.projectId !== undefined && task.projectId !== input.projectId) {
+      throw new PipelineRunError('scope-mismatch', `门任务不属于该项目：${input.gateTaskId}`, {
+        gateTaskId: input.gateTaskId,
+        expectedProject: input.projectId,
+        actualProject: task.projectId,
       })
     }
     return { store, task }
@@ -573,6 +758,111 @@ function deriveRunFailure(
 function lastFailureOf(state: StageState): StageState['failures'][number] | undefined {
   return state.failures[state.failures.length - 1]
 }
+
+/**
+ * 从持久化事实重建事件时间线（`GET /api/pipelines/:pipelineId/events`）。
+ *
+ * 纯函数：输入是检查点 + 门任务，输出是排序后的事件。**每条事件的 `at` 都来自
+ * 磁盘上的时间戳**（见 `PipelineEventKind` 的映射表），因此同一份数据在任何进程、
+ * 任何时刻读出的时间线完全相同。
+ *
+ * 排序：先按 `at` 升序，`at` 相同再按 {@link EVENT_ORDER} 定序（同一毫秒内
+ * "开门 → 认领 → 裁决 → 消费"必须稳定，否则页面上的因果顺序会随机翻转），
+ * 最后按 `gateTaskId` 兜底，保证结果确定。
+ */
+export function buildEventTimeline(
+  checkpoint: Checkpoint,
+  tasks: readonly HumanGateTask[],
+): readonly PipelineEventView[] {
+  const events: PipelineEventView[] = []
+
+  for (const stageId of STAGE_ORDER) {
+    for (const failure of checkpoint.stageStates[stageId]!.failures) {
+      events.push({
+        kind: 'stage-failure',
+        at: failure.at,
+        stageId,
+        gateTaskId: null,
+        actorId: null,
+        detail: `[${failure.kind}]${failure.rule === undefined ? '' : ` ${failure.rule}`}${failure.detail === undefined ? '' : `: ${failure.detail}`}`,
+      })
+    }
+  }
+
+  for (const record of checkpoint.reentries) {
+    events.push({
+      kind: 'reenter',
+      at: record.at,
+      stageId: record.stageId,
+      gateTaskId: null,
+      actorId: record.by,
+      detail: `${record.reason}（cursor ${record.cursorBefore} → ${record.cursorAfter}${record.cascade ? '，级联下游' : ''}）`,
+    })
+  }
+
+  for (const task of tasks) {
+    events.push({
+      kind: 'gate-opened',
+      at: task.createdAt,
+      stageId: task.stageId,
+      gateTaskId: task.gateTaskId,
+      actorId: null,
+      detail: `产物 ${task.artifactPath} 送审（机器门禁 ${task.machineStatus}）`,
+    })
+    if (task.claimedBy !== undefined && task.lease !== undefined) {
+      events.push({
+        kind: 'gate-claimed',
+        at: task.lease.acquiredAt,
+        stageId: task.stageId,
+        gateTaskId: task.gateTaskId,
+        actorId: task.claimedBy,
+        detail: `认领至 ${new Date(task.lease.expiresAt).toISOString()}`,
+      })
+    }
+    if (task.decision !== undefined) {
+      events.push({
+        kind: 'gate-decided',
+        at: task.decision.at,
+        stageId: task.stageId,
+        gateTaskId: task.gateTaskId,
+        actorId: task.decision.by,
+        detail: task.decision.note === '' ? task.decision.action : `${task.decision.action}：${task.decision.note}`,
+      })
+    }
+    if (task.cancellation !== undefined) {
+      events.push({
+        kind: 'gate-cancelled',
+        at: task.cancellation.at,
+        stageId: task.stageId,
+        gateTaskId: task.gateTaskId,
+        actorId: task.cancellation.by,
+        detail: task.cancellation.note === '' ? '已取消' : task.cancellation.note,
+      })
+    }
+    if (task.consumedAt !== undefined) {
+      events.push({
+        kind: 'gate-consumed',
+        at: task.consumedAt,
+        stageId: task.stageId,
+        gateTaskId: task.gateTaskId,
+        actorId: null,
+        detail: '裁决已驱动过一次门，不会被重复消费',
+      })
+    }
+  }
+
+  return events.sort((a, b) => {
+    if (a.at !== b.at) return a.at - b.at
+    const byKind = EVENT_ORDER.indexOf(a.kind) - EVENT_ORDER.indexOf(b.kind)
+    if (byKind !== 0) return byKind
+    return (a.gateTaskId ?? '') < (b.gateTaskId ?? '') ? -1 : (a.gateTaskId ?? '') > (b.gateTaskId ?? '') ? 1 : 0
+  })
+}
+
+/** 同一毫秒内的因果定序（开门 → 认领 → 裁决 → 取消 → 消费 → 失败 → 重入）。 */
+const EVENT_ORDER: readonly PipelineEventKind[] = [
+  'gate-opened', 'gate-claimed', 'gate-decided', 'gate-cancelled', 'gate-consumed', 'stage-failure', 'reenter',
+]
 
 /**
  * 阶段当前生效的产物摘要。

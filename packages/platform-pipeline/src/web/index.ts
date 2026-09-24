@@ -10,13 +10,34 @@
 export {
   FilePipelineRunService,
   assertTargetBaseUrlAllowed,
+  buildEventTimeline,
+  combineSignals,
   deriveRunStatus,
   pipelineIndexDir,
+  scanPipelineIndex,
   type PipelineIndexEntry,
+  type PipelineIndexScan,
   type PipelineRunService,
   type PipelineRunServiceOptions,
   type PlatformHostFactory,
+  type RunCallOptions,
 } from './pipeline-run-service.ts'
+
+export {
+  PipelineRunRegistry,
+  type PipelineRunHandle,
+  type RunSettlement,
+} from './pipeline-run-registry.ts'
+
+export {
+  AsyncPipelineRunner,
+  decideRecovery,
+  type AsyncPipelineRunnerOptions,
+  type BackgroundRunOutcome,
+  type RecoveryAction,
+  type RecoveryOutcome,
+  type TriggerResult,
+} from './async-runner.ts'
 
 export {
   PIPELINE_RUN_ERROR_HTTP_STATUS,
@@ -31,6 +52,8 @@ export {
   type GateClaimInput,
   type GateDecisionInput,
   type GateTaskFilter,
+  type PipelineEventKind,
+  type PipelineEventView,
   type PipelineRunErrorCode,
   type PipelineRunErrorView,
   type PipelineRunFailure,
@@ -40,6 +63,7 @@ export {
   type PipelineScope,
   type ReenterInput,
   type RunResult,
+  type StageArtifactView,
   type StageFailureView,
   type StageView,
   type StageViolationView,

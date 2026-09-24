@@ -16,7 +16,7 @@
  */
 
 import type { HumanGateTaskStatus } from '../runtime/persistence.ts'
-import type { CheckpointStatus, ReentryRecord, StageId } from '../types.ts'
+import type { CheckpointStatus, InputLocks, ReentryRecord, StageId } from '../types.ts'
 
 // ── 作用域与身份（docs/10 §10 P0-A「明确 actor/tenant/project/pipeline scope 类型」）──
 
@@ -148,6 +148,70 @@ export interface PipelineRunFailure {
 }
 
 /**
+ * 阶段产物视图（`GET /api/pipelines/:pipelineId/stages/:stageId/artifact`，docs/10 §5.3）。
+ *
+ * 直接回读产物文件（`FsArtifactStore.read`），不做任何补齐或推断：
+ * `version` / `inputs` 缺省时由 `wrapContent` 补成 `1` / `{}`，因此页面看到的是
+ * 「磁盘上这条产物是什么」，而不是「服务端以为它应该是什么」。
+ *
+ * `artifactPath` 是**相对产物根**的路径（如 `artifacts/pipe-1/receive.json`），
+ * 不返回服务器绝对路径（docs/10 §5.3 不泄露部署布局）。
+ */
+export interface StageArtifactView {
+  readonly pipelineId: string
+  readonly stageId: StageId
+  readonly artifactPath: string
+  readonly digest: string
+  readonly version: number
+  readonly inputs: InputLocks
+  readonly content: unknown
+}
+
+/**
+ * 事件类型（`GET /api/pipelines/:pipelineId/events`，docs/10 §5.3）。
+ *
+ * 只覆盖**有持久化时间戳**的事实：
+ *
+ * | 事件 | 时间戳来源 | 执行者来源 |
+ * |---|---|---|
+ * | `gate-opened` | `HumanGateTask.createdAt` | 无（系统开门） |
+ * | `gate-claimed` | `HumanGateTask.lease.acquiredAt` | `claimedBy` |
+ * | `gate-decided` | `decision.at` | `decision.by` |
+ * | `gate-cancelled` | `cancellation.at` | `cancellation.by` |
+ * | `gate-consumed` | `consumedAt` | 无（编排器消费） |
+ * | `stage-failure` | `StageState.failures[].at` | 无 |
+ * | `reenter` | `ReentryRecord.at` | `ReentryRecord.by` |
+ *
+ * M3 会引入权威的运行遥测（LLM 调用、工具步骤、耗时，docs/10 §7），届时事件流
+ * 会以那套数据为准；在那之前本投影就是"能从磁盘重建的全部时间线"。
+ */
+export type PipelineEventKind =
+  | 'gate-opened'
+  | 'gate-claimed'
+  | 'gate-decided'
+  | 'gate-cancelled'
+  | 'gate-consumed'
+  | 'stage-failure'
+  | 'reenter'
+
+/**
+ * 一条事件。
+ *
+ * `at` 一律来自持久化时间戳，**不是**服务端观测时间；因此同一条流水线的
+ * 事件流在重启后、在不同进程里读到的顺序与时间完全一致。
+ */
+export interface PipelineEventView {
+  readonly kind: PipelineEventKind
+  readonly at: number
+  readonly stageId: StageId | null
+  /** 关联的人工门任务 id；`stage-failure` / `reenter` 为 `null`。 */
+  readonly gateTaskId: string | null
+  /** 执行者；系统产生的事件（开门、消费、失败）为 `null`。 */
+  readonly actorId: string | null
+  readonly detail: string
+}
+
+/**
  * 流水线运行视图（`GET /api/pipelines/:pipelineId`，docs/10 §5.3）。
  *
  * 事实来源是检查点 + 产物 + 人工门任务；进程内运行句柄（`pipeline-run-registry.ts`）
@@ -224,7 +288,14 @@ export type RunResult =
 
 /** 重入请求（`POST /api/pipelines/:pipelineId/reenter`，docs/10 §5.3）。 */
 export interface ReenterInput {
-  readonly projectId: string
+  /**
+   * 可选：调用方自报的项目。
+   *
+   * 作用域**不由本字段决定**——`reenter` 用 `pipelineId` 从流水线索引反解项目与配置，
+   * 再用 `ActorContext` 做越权判定（docs/10 §5.3）。因此本字段仅用于调用方自查，
+   * 填错也不会放宽或收紧任何权限（这正是 docs/10 §5.3 示例里没有它的原因）。
+   */
+  readonly projectId?: string
   readonly pipelineId: string
   readonly stageId: StageId
   readonly reason: string
@@ -235,16 +306,23 @@ export interface ReenterInput {
   readonly expectedCurrentDigest?: string
 }
 
-/** 人工门任务过滤（`GET /api/pipelines/:pipelineId/gates`）。 */
+/**
+ * 人工门任务过滤（`GET /api/pipelines/:pipelineId/gates`）。
+ *
+ * `projectId` 可选：HTTP 路径里只有 `pipelineId`，项目由索引反解（docs/10 §5.3）。
+ * 提供时作为**额外的**一致性校验，不匹配即拒（防止调用方把两个不同流水线的
+ * 项目/流水线标识拼在一起）。
+ */
 export interface GateTaskFilter {
-  readonly projectId: string
+  readonly projectId?: string
   readonly pipelineId: string
   readonly status?: HumanGateTaskStatus
 }
 
 /** 认领人工门任务（`POST /api/gates/:gateTaskId/claim`）。 */
 export interface GateClaimInput {
-  readonly projectId: string
+  readonly projectId?: string
+  /** 必填：跨流水线裁决的唯一防线（任务记录里的 pipelineId 必须与它一致）。 */
   readonly pipelineId: string
   readonly gateTaskId: string
   /** 租约时长；缺省由 store 决定。 */
@@ -259,7 +337,8 @@ export interface GateClaimInput {
  * 下一次 `run` 会认这条结论，已消费表示这条裁决已经驱动过一次门，不会再复用。
  */
 export interface GateDecisionInput {
-  readonly projectId: string
+  readonly projectId?: string
+  /** 必填：跨流水线裁决的唯一防线。 */
   readonly pipelineId: string
   readonly gateTaskId: string
   readonly action: 'approved' | 'changes-needed' | 'rejected'
@@ -274,7 +353,8 @@ export interface GateDecisionInput {
 
 /** 取消人工门任务（`POST /api/gates/:gateTaskId/cancel`）。 */
 export interface GateCancelInput {
-  readonly projectId: string
+  readonly projectId?: string
+  /** 必填：跨流水线取消的唯一防线。 */
   readonly pipelineId: string
   readonly gateTaskId: string
   readonly note?: string

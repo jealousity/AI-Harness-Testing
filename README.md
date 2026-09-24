@@ -6,39 +6,76 @@
 
 > 契约定边界、门禁管产物、ACL 管动作、executor 保执行可信、检查点保恢复、人工门保责任、agent 只管自己那一阶段。
 
-## Web 应用（仅需 API Key）
+## Web 应用（通用 runtime 的 HTTP 外壳）
 
-`web-app/` 是浏览器优先的可运行版本：不依赖 Electron、桌面端配置或本地模型，只需一个 OpenAI 兼容 API Key 即可启动六阶段测试辅助流水线。
+`web-app/` 是浏览器可用的控制台：不依赖 Electron、桌面端配置或本地模型。
+它**不是**独立实现，而是 `packages/platform-pipeline` 的 HTTP 外壳——路由、鉴权入口
+与响应映射之外的一切（阶段逻辑、检查点、人工门、产物、执行对账）都经
+`PipelineRunService` → `createPlatformHost` → `PipelineDriver` 完成。
 
 ```bash
-cd web-app
-node server.mjs
+# 必填：平台数据根 + 流水线配置文件（API Key 的 apiKeyEnv 就声明在这份配置里）
+PLATFORM_DATA_ROOT=/var/lib/test-platform \
+PLATFORM_CONFIG_PATH=examples/pipeline.yaml \
+PLATFORM_ACTOR_TENANT=demo-tenant \
+PLATFORM_ACTOR_ROLES=reviewer,admin \
+node web-app/server.mjs
 # 浏览器打开 http://127.0.0.1:3080
 ```
 
-默认使用 DeepSeek 兼容端点；页面也支持修改 API Base URL 与模型名称。API Key 只在当前流水线运行期间驻留服务端内存，不写入浏览器存储、运行日志或阶段产物。执行阶段默认生成“待执行”计划，不会伪造被测系统的真实通过结果。
+**凭据策略**：API Key **只**由服务端按配置里的 `apiKeyEnv` 从进程环境变量注入。
+浏览器既不上传也无法读取；页面上没有、也不会有 API Key 输入框。`configRef` 同样是
+服务端配置的逻辑引用（`PLATFORM_CONFIG_REF`），浏览器传路径会被拒绝——否则它就成了
+任意文件读取入口。
 
-Web 版默认只允许访问公网模型端点，并限制单个来源同时运行 2 个任务；如明确需要连接本机 Ollama 或内网网关，可用 `ALLOW_PRIVATE_API=1 node server.mjs` 开启内网地址。生产部署还应在反向代理前增加登录鉴权、HTTPS、持久化存储和多进程任务队列。
+**身份与权限**：默认使用服务端配置的固定身份（`PLATFORM_ACTOR_ID` 等），
+客户端请求头被完全忽略。只有反向代理已完成真实鉴权、并会剥除同名头时，才应设置
+`PLATFORM_TRUST_ACTOR_HEADERS=1` 改从请求头取身份。人工门裁决要求 `reviewer`/`admin`
+角色，且判定是**失败关闭**的（未声明角色即拒绝）。
 
-```bash
-# 可选：修改监听地址/端口
-HOST=127.0.0.1 PORT=3080 node server.mjs
-# 可选：允许本机或内网模型端点（只建议本地开发）
-ALLOW_PRIVATE_API=1 node server.mjs
+### 主要环境变量
+
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `PLATFORM_DATA_ROOT` | 是 | 检查点、产物、门任务、知识库的数据根 |
+| `PLATFORM_CONFIG_PATH` | 是 | 流水线配置文件路径（yaml/json） |
+| `PLATFORM_CONFIG_REF` | 否 | 逻辑配置引用名，默认 `default` |
+| `PLATFORM_ACTOR_ID` / `_TENANT` / `_ROLES` / `_PROJECTS` | 否 | 服务端固定身份（默认只有 `viewer`） |
+| `PLATFORM_TRUST_ACTOR_HEADERS` | 否 | `1` = 信任 `x-actor-*` 请求头（仅限已鉴权的反向代理后） |
+| `PLATFORM_GATE_WAIT_TIMEOUT_MS` | 否 | 人工门等待上限，默认 `0` = 只轮询一次就让出控制权 |
+| `HOST` / `PORT` | 否 | 监听地址与端口，默认 `127.0.0.1:3080` |
+
+### 后台运行语义
+
+HTTP 触发（`POST /api/pipelines/:id/run`）立刻返回 `202`，流水线在后台跑；
+人工门等待超时后本次运行以 `waiting-human` 结束（**不会**在 HTTP 请求内挂住等真人裁决）。
+裁决接口只写任务，裁决后再次触发即续跑。进程重启后 `POST /api/admin/recover`
+会扫描 `running` / `awaiting-gate` 状态并恢复或标记为可重入。
+
+### 接口
+
+```text
+POST /api/projects/:projectId/pipelines         创建（202）
+GET  /api/pipelines                             列出调用者可见的流水线
+GET  /api/pipelines/:pipelineId                 运行视图（阶段/违规/findings/失败）
+POST /api/pipelines/:pipelineId/run             后台触发运行（202）
+POST /api/pipelines/:pipelineId/cancel          取消本进程内的后台运行
+POST /api/pipelines/:pipelineId/reenter         登记重入（带 expectedCurrentDigest 乐观并发）
+GET  /api/pipelines/:pipelineId/gates           人工门任务
+GET  /api/pipelines/:pipelineId/events          事件时间线（只含持久化时间戳）
+GET  /api/pipelines/:pipelineId/stages/:stageId/artifact   阶段产物
+POST /api/gates/:gateTaskId/claim               认领
+POST /api/gates/:gateTaskId/decide              裁决（action 必须显式传入）
+POST /api/gates/:gateTaskId/cancel              取消任务
+POST /api/admin/recover                         恢复扫描（进程重启后）
 ```
 
-### 当前版本已补齐的运行保障
-
-- 输入校验：JSON Content-Type、请求体大小、API Key 长度、Base URL 协议及凭据格式
-- SSRF 防护：默认拒绝 localhost、私网、回环、链路本地和未解析为公网地址的模型端点
-- 资源保护：单来源并发上限、运行记录数量上限、完成记录 TTL 清理
-- 失败恢复：429 与 5xx 自动进行一次退避重试；服务商错误只返回截断后的错误信息
-- 浏览器安全：移除通配 CORS，增加 CSP、`X-Frame-Options`、`nosniff`、`no-store` 等响应头
-- Prompt 控制：上游产物上下文设有长度上限，避免多阶段内容无限膨胀
+生产部署仍应在反向代理前增加登录鉴权与 HTTPS；当前实现是**单进程**的，
+跨进程并发互斥由 M2 的 pipeline lock 承担。
 
 ## 原始 harness 实现状态与本轮加固
 
-本项目的核心实现位于 `packages/platform-pipeline`，Web 版只是额外的浏览器演示入口，不代表原始 harness 的全部能力。当前原始 harness 已完成以下高优先级加固：
+本项目的核心实现位于 `packages/platform-pipeline`，`web-app/` 是它的 HTTP 外壳（不再是独立的浏览器演示实现）。当前原始 harness 已完成以下高优先级加固：
 
 - 阶段 `fs_read` / `fs_write` 统一限制在工作区根内，拒绝 `..`、绝对路径越界和软链接逃逸
 - `executor_run` 按显式 `pipelineId` 精确选择 `design.json`，不再按 mtime 猜测；多项目共用目录时避免串读
