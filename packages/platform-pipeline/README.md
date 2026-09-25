@@ -32,7 +32,7 @@
 | `documents/` | 文档解析注册表与统一中间表示：格式检测（magic bytes 优先）/ 限额与超时 / 安全解包（白名单 + 逐块硬上限 + 路径穿越即拒绝）/ **PDF**（`pdfjs-dist`，按页 `#page=N`，不产出表格）/ **DOCX**（标题三级判据、列表、表格、合并单元格不复制内容、页眉页脚不并入正文、宏与嵌入对象不解压）/ **XLSX**（两趟解包、日期/布尔/错误/公式按缓存值、隐藏 sheet 默认不读、`#sheet=接口!A2:F20`）/ Markdown·CSV·TSV·TXT·YAML·JSON 解析器 / `ParsedDocument` → draft 知识投影。CLI、Web、Harness 三入口共用 `defaultParserRegistry()` | 10 §5.6 |
 | `documents/xml.ts` + `documents/zip-reader.ts` | OOXML 的唯一 XML 与 ZIP 入口：自研分词器不做实体扩展（XXE 与实体爆炸**构造上不可能**）；白名单解包使不读的字节不可能造成危害；不信任 ZIP 声明值，按逐块实际字节执行硬上限 | 10 §5.6.5 / ADR-0001 |
 | `runtime/` | 无 Harness 的 StageRunner / LlmClient / ToolRegistry / HumanGate 端口、ScriptedStageRunner、OpenAICompatibleClient、OpenAIStageRunner、TaskStore 与 HumanGateTaskStore、平台标准工具集（`parse_doc`/`kb_*`/`case_*`/`executor_run`/`env_diag`/`req_pull`/`gate_check`） | 方案一 |
-| `web/` | 无 HTTP 框架依赖的 `PipelineRunService`：作用域/身份校验、配置装载与缓存、宿主装配、检查点与人工门驱动的 create/get/run/reenter/gate-*；Web 状态与阶段视图（12 字段）全部由持久化事实重建 | 10 §4/§5 |
+| `web/` | 无 HTTP 框架依赖的 `PipelineRunService`：作用域/身份校验、配置装载与缓存、宿主装配、检查点与人工门驱动的 create/get/list/run/reenter/gate-*/artifact/events；Web 状态与阶段视图（12 字段）全部由持久化事实重建。另有 `pipeline-run-registry.ts`（进程内运行句柄，**刻意不导出状态查询**，只存句柄与取消信号）与 `async-runner.ts`（触发/取消/进程重启后的恢复扫描，`decideRecovery` 为纯函数） | 10 §4/§5 |
 
 ## 使用
 
@@ -94,10 +94,14 @@ await ctx.plugin(platformPipelineHost, {
 ## 状态
 
 - 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）+ 1 份 ADR（docs/adr/0001 文档解析库选型）
-- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **447 项测试全绿**
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **493 项测试全绿**
   - 注：在受限沙箱里跑全量 `node --test` 时，`test/fs-tools.test.ts` 的清理步骤可能被宿主 `safe-delete` 批量删除守卫拦下（按「每轮删除次数 > 阈值」判定，与代码无关）。单独运行该文件即通过。
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
-- Web 运行服务（M0 契约层）：`platform-pipeline/web` 提供无 HTTP 框架依赖的 `PipelineRunService`，覆盖 create/get/run/reenter 与人工门 list/claim/decide/cancel；Web 状态与阶段视图全部由检查点、产物与人工门任务重建，服务层不复制阶段逻辑。HTTP 路由接入见 docs/10 §5（M1）。
+- Web 运行服务（M0 契约层）：`platform-pipeline/web` 提供无 HTTP 框架依赖的 `PipelineRunService`，覆盖 create/get/list/run/reenter 与人工门 list/claim/decide/cancel，以及 `getStageArtifact`/`listEvents`/`scanPipelineIndex`；Web 状态与阶段视图全部由检查点、产物与人工门任务重建，服务层不复制阶段逻辑。
+- **Web 接入（P0-B 完成，docs/10 §5）**：`web-app/` 是这套 runtime 的 **HTTP 外壳**（不再是独立的浏览器演示实现），按 §5.4「持久化状态 + 进程内触发器」工作——HTTP 触发立刻 `202`，后台跑 driver，人工门以 `waiting-human` 让出控制权，进程重启后由 `POST /api/admin/recover` 扫描恢复。
+  - **凭据边界**：API Key 只由服务端按配置里的 `apiKeyEnv` 从环境变量注入，浏览器既不上传也读不到；`configRef` 是服务端白名单逻辑引用（否则等于开放任意文件读取）。
+  - **身份边界**：默认**不信任**任何请求头（`PLATFORM_TRUST_ACTOR_HEADERS=1` 才读 `x-actor-*`，且缺 `x-actor-id` 即 401）；后台运行身份**刻意不声明 roles**，因此「后台不得替人裁决」是机器保证而非约定。
+  - 接口：`GET /health`、`GET/POST /api/pipelines*`（create `202`、`run`/`cancel` `202`、`gates`、`events`、`stages/:id/artifact`（无产物 `404`）、`reenter`）、`POST /api/gates/:id/{claim,decide,cancel}`、`POST /api/admin/recover`。
 - **文档解析（P0-A1 完成）**：`documents/` 已提供注册表 + 统一中间表示 + **PDF/DOCX/XLSX/Markdown 四类必支持格式** + 文本族与分隔符表格解析器；`parse_doc` 走注册表，返回 `status`/`confidence`/`sections`/`tables`/`plainText`/`sourceRefs`/`diagnostics`/`limits`，并按 §5.6.8 不回传原始字节。`.doc`/`.xls` 按 ADR-0001 §9 显式 `unsupported` 并给出定向转换提示。
   - `sourceRef` 四级可追溯：`requirements.pdf#page=3`、`spec.docx#heading=1.1,table=1,row=2`、`cases.xlsx#sheet=接口!A2:F20`、`cases.csv#table=1,row=2`。
   - 不伪装：无文本层 → `partial` + `NO_TEXT_LAYER`；无缓存公式值 → `FORMULA_VALUE_UNAVAILABLE` 且**绝不自行计算**；无解析器 → `unsupported`；二进制族 magic 不匹配 → **绝不退回按文本读**。

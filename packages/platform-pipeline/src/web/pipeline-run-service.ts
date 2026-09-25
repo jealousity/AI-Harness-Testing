@@ -447,6 +447,14 @@ export class FilePipelineRunService implements PipelineRunService {
     if (!GATE_DECISIONS.includes(input.action)) {
       throw new PipelineRunError('invalid-request', `未知裁决：${input.action}`, { allowed: [...GATE_DECISIONS] })
     }
+    // 动作语义校验前置：`changes-needed` / `rejected` 必须带非空 note。
+    // store 层也强制这条规则，但那里抛的是普通 `Error`，会被下面的 catch 归成
+    // `gate-not-decidable`（409）——把「请求不合法」误报成「门不可裁决」，与
+    // 「未知裁决 → 400」自相矛盾。这里先按 `invalid-request` 拒绝，并且**在
+    // claim 之前**返回，因此失败的请求不会留下任何租约副作用。
+    if (input.action !== 'approved' && (input.note ?? '').trim() === '') {
+      throw new PipelineRunError('invalid-request', `${input.action} 必须带非空 note`, { action: input.action })
+    }
     const { store, task } = await this.requireGateTask(input, actor)
 
     // 已消费的裁决不允许再次驱动门（docs/10 §5.3）。

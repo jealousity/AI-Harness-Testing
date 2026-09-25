@@ -296,14 +296,32 @@ test('decide 自动认领，但不抢占他人未过期的 claim', async () => {
   )
 })
 
-test('changes-needed/rejected 必须带非空 note', async () => {
+test('changes-needed/rejected 必须带非空 note，且按「请求不合法」拒绝而不是「门不可裁决」', async () => {
   const service = serviceOf(new ScriptedHost())
   await service.create(CREATE, REVIEWER)
   const result = await expectWaitingHuman(await service.run('pipe-1', REVIEWER))
-  await assert.rejects(
-    () => service.decideGate({ ...SCOPE, gateTaskId: result.gateTaskId, action: 'rejected' }, REVIEWER),
-    isCode('gate-not-decidable'),
+
+  // 400 而不是 409：这是请求本身不合法，与「门已是终态」是两件事。
+  // 若在这里报 409，页面会去刷新任务状态，而真正该做的是补一个说明。
+  for (const action of ['rejected', 'changes-needed'] as const) {
+    await assert.rejects(
+      () => service.decideGate({ ...SCOPE, gateTaskId: result.gateTaskId, action }, REVIEWER),
+      isCode('invalid-request'),
+    )
+    await assert.rejects(
+      () => service.decideGate({ ...SCOPE, gateTaskId: result.gateTaskId, action, note: '   ' }, REVIEWER),
+      isCode('invalid-request'),
+    )
+  }
+
+  // 被拒的请求不留副作用：任务仍未被认领，可以正常裁决。
+  const gates = await service.listGateTasks(SCOPE, REVIEWER)
+  assert.equal(gates.find(task => task.gateTaskId === result.gateTaskId)?.claimedBy, undefined)
+  const decided = await service.decideGate(
+    { ...SCOPE, gateTaskId: result.gateTaskId, action: 'rejected', note: '范围不清' },
+    REVIEWER,
   )
+  assert.equal(decided.decision?.action, 'rejected')
 })
 
 test('未知裁决动作被拒绝，不会退化成"缺省批准"', async () => {

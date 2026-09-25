@@ -78,13 +78,19 @@ class WebApp {
 
     // 脚本化宿主模块：与 createPlatformHost 同装配顺序，只换掉 LLM 阶段运行器。
     // 产物内容带自增 `call`，因此"是否重生成"能从 digest 上直接看出来。
+    // `initialCall` 从既有日志行数续号：进程重启后 call 仍单调，否则重生成的
+    // 产物会拿到与重启前相同的编号，digest 相同，"被重生成"就不可见了。
     await writeFile(join(dir, 'scripted-host.mjs'), [
-      "import { appendFileSync } from 'node:fs'",
+      "import { appendFileSync, readFileSync } from 'node:fs'",
       `import { ScriptedHost } from ${JSON.stringify(FIXTURES_URL)}`,
       '',
+      'const logPath = process.env.SPAWN_LOG',
+      'const initialCall = readFileSync(logPath, "utf8").split("\\n").filter(line => line.trim() !== "").length',
+      '',
       'const host = new ScriptedHost({',
+      '  initialCall,',
       '  content: ({ stageId, call }) => ({ stage: stageId, call }),',
-      '  onSpawn: (stageId, call) => appendFileSync(process.env.SPAWN_LOG, `${stageId} ${call}\\n`),',
+      '  onSpawn: (stageId, call) => appendFileSync(logPath, `${stageId} ${call}\\n`),',
       '})',
       '',
       'export function createHost(options) { return host.factory(options) }',
@@ -446,7 +452,13 @@ test('验收5：changes-needed 打回当前阶段，旧裁决不被重复消费'
     const analyzeTask = gates.body.gates.find((item: any) => item.status === 'pending')
     assert.equal(analyzeTask.stageId, 'analyze')
     const noNote = await decide(app, analyzeTask, 'changes-needed')
-    assert.equal(noNote.status, 400, 'changes-needed 缺少 note 必须被拒')
+    assert.equal(noNote.status, 400, `changes-needed 缺少 note 必须被拒：${JSON.stringify(noNote.body)}`)
+    assert.equal(noNote.body.error.code, 'invalid-request')
+    // 被拒的请求不留副作用：任务仍是未决、未认领状态。
+    const stillPending = (await app.request('GET', `/api/pipelines/${PIPELINE_ID}/gates`))
+      .body.gates.find((item: any) => item.gateTaskId === analyzeTask.gateTaskId)
+    assert.equal(stillPending.status, 'pending')
+    assert.equal(stillPending.claimedBy, undefined)
     assert.equal((await decide(app, analyzeTask, 'changes-needed', '边界条件缺失')).status, 200)
 
     // 再次触发：analyze 重跑（新 call），receive 不动。
@@ -550,9 +562,23 @@ test('验收7：execute 缺少真实执行数据时门禁失败，不出现伪�
     // 绝不出现"待执行"被当成通过：report / archive 不得推进。
     assert.equal(view.stages.find((stage: any) => stage.stageId === 'report').status, 'idle')
     assert.equal(view.stages.find((stage: any) => stage.stageId === 'archive').status, 'idle')
-    // 也没有为该阶段伪造人工门任务（门禁失败不自动进入人工批准，docs/10 §10 P1-A）。
+    // 门禁失败会为该阶段开一条 **gate-failed 升级任务**（供人查看违规清单），但它
+    // 不对应任何产物（`artifactPath` 为空）、`machineStatus` 为 failed，因此不满足
+    // `PersistentHumanGate.findResumableTask` 的匹配条件（要求 machineStatus=passed
+    // 且 artifactPath 与产物一致），**永远不可能被误当阶段门批准**。
+    // 这里断言的是"不存在可批准的 execute 阶段门"，而不是"一条任务都没有"——
+    // 后者与 `gateFailed` 的设计（升级给人看）相反。
     const gates = await app.request('GET', `/api/pipelines/${PIPELINE_ID}/gates`)
-    assert.equal(gates.body.gates.some((item: any) => item.stageId === 'execute'), false)
+    const executeTasks = gates.body.gates.filter((item: any) => item.stageId === 'execute')
+    assert.equal(executeTasks.length, 1, '门禁失败应开一条升级任务，且只有一条')
+    assert.equal(executeTasks[0].machineStatus, 'failed')
+    assert.equal(executeTasks[0].artifactPath, '')
+    assert.equal(executeTasks[0].status, 'pending')
+    assert.equal(
+      executeTasks.some((item: any) => item.machineStatus === 'passed'),
+      false,
+      '不存在可被当阶段门批准的 execute 任务',
+    )
   }, {
     stages: Object.fromEntries(
       ['receive', 'analyze', 'design', 'execute', 'report', 'archive'].map(id => [

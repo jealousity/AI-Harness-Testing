@@ -71,17 +71,26 @@ export interface ScriptedHostOptions {
    * ——需要断言"产物被重生成/未被重生成"时必须注入带计数的实现。
    */
   readonly content?: (input: { readonly stageId: StageId; readonly call: number }) => unknown
-  /** 每次 spawn 的回调（`call` 跨 host 实例累计，从 1 开始）。 */
+  /** 每次 spawn 的回调（`call` 跨 host 实例累计，从 `initialCall + 1` 开始）。 */
   readonly onSpawn?: (stageId: StageId, call: number) => unknown
+  /**
+   * `call` 的起始值。
+   *
+   * 端到端测试必须**跨进程**续号（进程重启后从既有 spawn 日志的行数接着数）：
+   * 否则重启后重生成的产物会拿到与重启前相同的 `call`，内容相同 → digest 相同，
+   * 于是「重启后产物被重生成」这件事在断言里彻底不可见。
+   */
+  readonly initialCall?: number
 }
 
 /** 记录 spawn 调用的脚本化运行器：用于断言"已批准阶段不重生成"。 */
 export class RecordingSpawner implements StageSpawner {
   readonly stages: StageId[] = []
   private readonly inner: ScriptedStageRunner
-  private call = 0
+  private call: number
 
   constructor(artifacts: ArtifactStore, options: ScriptedHostOptions = {}) {
+    this.call = options.initialCall ?? 0
     this.inner = new ScriptedStageRunner(artifacts, ({ request }) => {
       this.call += 1
       const call = this.call
