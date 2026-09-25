@@ -34,7 +34,7 @@ import type { SubagentRuntime } from '@deepseek-ai/dsh-subagent'
 // 依赖必须由使用者自己声明，不能依赖测试宿主捎带。
 import type {} from '@deepseek-ai/dsh-user-questions'
 import { loadPipelineConfig } from '../config.ts'
-import { acquirePipelineLock } from '../checkpoint-lock.ts'
+import { acquirePipelineLock, fileLockAudit, lockAuditPath } from '../checkpoint-lock.ts'
 import { FsArtifactStore, FsCheckpointPort } from '../stores/fs.ts'
 import { MarkdownCaseStore, MarkdownKnowledgeStore } from '../stores/markdown.ts'
 import { MachineGateEngine, platformGenericRules } from '../gates/machine.ts'
@@ -342,6 +342,11 @@ export async function apply(ctx: Context, config: HostPluginConfig): Promise<voi
     ? join(dirname(artifactsRoot), 'executor', 'session.json')
     : join(runtime.roots.projectRoot, 'executor', 'session.json')
   const executorDir = dirname(config.executionSessionPath ?? defaultExecutorSession)
+  // 幂等台账：与通用宿主（runtime/platform-tools.ts）落在**同一个**项目作用域目录下，
+  // 两个入口各写一份台账等于同一操作有两套"首次结果"（docs/10 §6.3 M2-3）。
+  const idempotencyRoot = config.dataRoot === undefined
+    ? join(artifactsRoot, 'idempotency')
+    : join(runtime.roots.projectRoot, 'idempotency')
   registerStageTools(ctx, {
     // 【不变式】baseDir == artifactsRoot == **阶段子会话继承的工作区根**。
     //
@@ -363,6 +368,7 @@ export async function apply(ctx: Context, config: HostPluginConfig): Promise<voi
     pipelineIdProvider: () => activePipelineId,
     sessionPathProvider: (pipelineId) => join(executorDir, pipelineId, 'session.json'),
     evidenceDirProvider: (pipelineId) => join(executorDir, pipelineId, 'evidence'),
+    idempotencyRoot,
     ...(config.targetBaseUrl === undefined ? {} : { targetBaseUrl: config.targetBaseUrl }),
     ...(config.receiveInput === undefined ? {} : { receiveInput: config.receiveInput }),
     checkpointRoot: checkpointRoot,
@@ -438,7 +444,11 @@ export async function apply(ctx: Context, config: HostPluginConfig): Promise<voi
       activePipelineId = pipelineId
       let lock: Awaited<ReturnType<typeof acquirePipelineLock>>
       try {
-        lock = await acquirePipelineLock(checkpointRoot, pipelineId)
+        // 与 CLI / Web 抢同一把锁（同一路径、同一 acquire/release 语义）：checkpointRoot 是
+        // checkpoints 根，锁落在 `<checkpointRoot>/<pipelineId>/.pipeline.lock`（docs/10 §6.3）。
+        lock = await acquirePipelineLock(checkpointRoot, pipelineId, {
+          audit: fileLockAudit(lockAuditPath(checkpointRoot)),
+        })
       } catch (error) {
         activePipelineId = undefined
         activePipelines.delete(pipelineId)

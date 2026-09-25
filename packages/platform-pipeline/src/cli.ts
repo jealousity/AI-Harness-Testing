@@ -15,6 +15,7 @@
 import { join } from 'node:path'
 
 import { loadCheckpoint } from './checkpoint.ts'
+import { acquirePipelineLock, fileLockAudit, lockAuditPath } from './checkpoint-lock.ts'
 import { loadPipelineConfig } from './config.ts'
 import { validatePipelineAcl } from './acl.ts'
 import { STAGE_ORDER, type StageId } from './types.ts'
@@ -191,49 +192,70 @@ async function run(args: readonly string[]): Promise<void> {
   const pending: HumanGateTask[] = []
   const host = await openHost(args, { gateWaitTimeoutMs: optionalInteger(args, '--wait-ms') ?? 0, pending })
 
+  // 与 Web / Harness 抢**同一把**锁（docs/10 §6.3 M2-1）：路径由 `pipelineLockPath` 统一算出。
+  // 此前 CLI 完全不上锁，Web 的锁路径又与 Harness 不一致，等于"同一份检查点谁都能写"（§6.2 第 5 条）。
+  const lock = await acquirePipelineLock(host.roots.checkpointRoot, pipelineId, {
+    audit: fileLockAudit(lockAuditPath(host.roots.checkpointRoot)),
+  })
+
   try {
-    const outcome = await host.driver.run()
-    printJson({
-      outcome: outcome.outcome,
-      ...('stageId' in outcome ? { stageId: outcome.stageId } : {}),
-      checkpointRoot: host.checkpointRoot,
-    })
-  } catch (error) {
-    if (error instanceof HumanGateWaitAbortedError && error.reason === 'timeout') {
-      const open = await host.gateTasks.list({ pipelineId, status: 'pending' })
+    try {
+      const outcome = await host.driver.run()
       printJson({
-        outcome: 'waiting-human',
-        stageId: error.stageId,
-        gateTaskId: error.gateTaskId,
+        outcome: outcome.outcome,
+        ...('stageId' in outcome ? { stageId: outcome.stageId } : {}),
         checkpointRoot: host.checkpointRoot,
-        hint: `裁决后重新执行 run 即从该门续跑；查看待办：node src/cli.ts gate-list --config ${configPath} --data-root ${dataRoot}`,
-        pending: open.map(summarizeGateTask),
       })
-      process.exitCode = EXIT_WAITING_HUMAN
-      return
+    } catch (error) {
+      if (error instanceof HumanGateWaitAbortedError && error.reason === 'timeout') {
+        const open = await host.gateTasks.list({ pipelineId, status: 'pending' })
+        printJson({
+          outcome: 'waiting-human',
+          stageId: error.stageId,
+          gateTaskId: error.gateTaskId,
+          checkpointRoot: host.checkpointRoot,
+          hint: `裁决后重新执行 run 即从该门续跑；查看待办：node src/cli.ts gate-list --config ${configPath} --data-root ${dataRoot}`,
+          pending: open.map(summarizeGateTask),
+        })
+        process.exitCode = EXIT_WAITING_HUMAN
+        return
+      }
+      throw error
     }
-    throw error
+  } finally {
+    // 让出控制权（waiting-human）时在这里释放：`awaiting-gate` 检查点与 pending 任务都是
+    // 持久化事实，不受影响；下一次 run 会重新 acquire（§6.3 M2-2）。
+    await lock.release()
   }
 }
 
 async function reenter(args: readonly string[]): Promise<void> {
   const stageId = requireArg(args, '--stage') as StageId
   if (!STAGE_ORDER.includes(stageId)) throw new Error(`--stage 必须是 ${STAGE_ORDER.join(' | ')}`)
+  const pipelineId = requireArg(args, '--pipeline-id')
   // 只动检查点，不解析 provider：没有 API Key 的运维同学也要能登记重入。
   const host = createCheckpointHost({
     config: await loadPipelineConfig(requireArg(args, '--config')),
     dataRoot: requireArg(args, '--data-root'),
-    pipelineId: requireArg(args, '--pipeline-id'),
+    pipelineId,
     ...(argValue(args, '--ruleset-version') === undefined ? {} : { rulesetVersion: argValue(args, '--ruleset-version') }),
   })
-  const checkpoint = await host.driver.reenter(stageId, requireArg(args, '--by'), requireArg(args, '--reason'))
-  printJson({
-    pipelineId: checkpoint.pipelineId,
-    cursor: checkpoint.cursor,
-    nextStage: STAGE_ORDER[checkpoint.cursor] ?? null,
-    reentries: checkpoint.reentries.length,
-    hint: '重入已登记；执行 run 即级联重跑该阶段及全部下游。',
+  // 重入会写检查点，因此与 run 抢同一把锁。
+  const lock = await acquirePipelineLock(host.roots.checkpointRoot, pipelineId, {
+    audit: fileLockAudit(lockAuditPath(host.roots.checkpointRoot)),
   })
+  try {
+    const checkpoint = await host.driver.reenter(stageId, requireArg(args, '--by'), requireArg(args, '--reason'))
+    printJson({
+      pipelineId: checkpoint.pipelineId,
+      cursor: checkpoint.cursor,
+      nextStage: STAGE_ORDER[checkpoint.cursor] ?? null,
+      reentries: checkpoint.reentries.length,
+      hint: '重入已登记；执行 run 即级联重跑该阶段及全部下游。',
+    })
+  } finally {
+    await lock.release()
+  }
 }
 
 /** 解析人工门任务存储：`--gate-root` 直连，否则由 `--config` + `--data-root` 推导。 */

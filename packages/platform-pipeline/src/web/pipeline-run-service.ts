@@ -15,9 +15,11 @@
  * - **不在 service 层复制阶段逻辑**。
  *
  * 明确不做（分别属于后续里程碑，见 docs/10 §3）：
- * - 并发锁与幂等键 → M2 / P0-C（`checkpoint-lock.ts`）；
  * - 预算与阶段耗时遥测 → M3 / P1-A；
  * - 后台调度与进程内运行句柄 → M1 的 `async-runner.ts` / `pipeline-run-registry.ts`。
+ *
+ * 幂等（docs/10 §6.3 M2-3）：`create` 与 `decideGate` 走 `idempotency.ts` 的台账；
+ * 运行锁在 `run`/`reenter` 内落地（`checkpoint-lock.ts`）。
  *
  * @module platform-pipeline/web/pipeline-run-service
  */
@@ -27,8 +29,24 @@ import { join } from 'node:path'
 
 import { validatePipelineAcl } from '../acl.ts'
 import { initialCheckpoint, loadCheckpoint } from '../checkpoint.ts'
+import {
+  acquirePipelineLock,
+  fileLockAudit,
+  lockAuditPath,
+  PipelineLockHeldError,
+  type PipelineLock,
+} from '../checkpoint-lock.ts'
 import { loadPipelineConfig } from '../config.ts'
-import { resolvePlatformRoots } from '../platform-roots.ts'
+import {
+  IDEMPOTENCY_NAMESPACES,
+  IdempotencyConflictError,
+  fileIdempotencyLedger,
+  idempotencyDir,
+  idempotencyFingerprint,
+  idempotencyKey,
+  type IdempotencyLedger,
+} from '../idempotency.ts'
+import { resolvePlatformRoots, type PlatformStorageRoots } from '../platform-roots.ts'
 import { assertScopeMatch } from '../platform-scope.ts'
 import { FsArtifactStore, FsCheckpointPort } from '../stores/fs.ts'
 import type { ArtifactStore } from '../driver.ts'
@@ -88,6 +106,13 @@ export interface PipelineRunServiceOptions {
   readonly assertTargetBaseUrl?: (url: string) => void
   /** 取消信号（本 service 实例内所有 run 共享；M1 的 async-runner 会改为每 run 独立）。 */
   readonly signal?: AbortSignal
+  /**
+   * 运行锁的 stale 上限（毫秒）。缺省 6 小时——与 CLI / Harness 一致。
+   *
+   * 判断依据是锁的 `heartbeatAt` 而不是取得时间，因此**长跑流水线不会被误抢**：
+   * 锁会按 `staleMs / 3` 自动续租。只有"进程被杀、心跳停摆"才会超过这个上限。
+   */
+  readonly lockStaleMs?: number
 }
 
 /** `run()` 的每次调用选项。 */
@@ -264,19 +289,44 @@ export class FilePipelineRunService implements PipelineRunService {
     this.assertScope(config, input.projectId, actor)
 
     const roots = resolvePlatformRoots(this.options.dataRoot, config)
+    const rulesetVersion = input.rulesetVersion ?? DEFAULT_RULESET_VERSION
+    const namespace = IDEMPOTENCY_NAMESPACES.pipelineCreate
+    // 键字段 = docs/10 §6.3 的 `tenantId/projectId/pipelineId`。
+    return this.runIdempotent(
+      roots.projectRoot,
+      namespace,
+      idempotencyKey(namespace, [config.scope?.tenantId ?? '', config.projectId, input.pipelineId]),
+      // 指纹只覆盖 create 真正落盘的字段：请求体里的 `targetBaseUrl`/`maxGateRetries` 等
+      // 创建时不读取，把它们算进指纹只会让"改了不影响创建结果的字段"的重试误报冲突。
+      idempotencyFingerprint(namespace, [config.projectId, input.pipelineId, input.configRef, rulesetVersion]),
+      () => this.createOnce(input, config, roots, rulesetVersion),
+    )
+  }
+
+  /**
+   * 首次创建（幂等台账未命中时执行）。
+   *
+   * 幂等语义：同一 `(tenantId, projectId, pipelineId)` 且请求内容一致的重复投递返回
+   * **首次的 summary**，不再报 409——这是 §6.4「重试不产生副作用」要的行为。真正
+   * 换了内容（如另一个 `configRef`）的请求由指纹比对拦成 `conflict`，因此
+   * §5.3 的「绝不静默复用」仍然成立：静默复用的只是**同一个**请求。
+   */
+  private async createOnce(
+    input: CreatePipelineRunInput,
+    config: PipelineConfig,
+    roots: PlatformStorageRoots,
+    rulesetVersion: string,
+  ): Promise<PipelineRunSummary> {
     const checkpointRoot = join(roots.checkpointRoot, input.pipelineId)
     const checkpoint = new FsCheckpointPort()
 
     // pipelineId 在租户/项目作用域内唯一（docs/10 §5.3）：已存在即冲突，绝不静默复用。
+    // 走到这里说明台账里没有本次请求的记录，磁盘上的同 id 流水线是别人/旧版本建的。
     if (await this.readIndex(input.pipelineId) !== null) {
       throw new PipelineRunError('conflict', `pipeline 已存在：${input.pipelineId}`, { pipelineId: input.pipelineId })
     }
     // 先落盘后返回（docs/10 §1 原则 5）：创建成功 = 磁盘上已有可恢复的初始检查点。
-    await checkpoint.save(checkpointRoot, initialCheckpoint(
-      input.pipelineId,
-      config.templateVersion,
-      input.rulesetVersion ?? DEFAULT_RULESET_VERSION,
-    ))
+    await checkpoint.save(checkpointRoot, initialCheckpoint(input.pipelineId, config.templateVersion, rulesetVersion))
     await this.writeIndex({
       pipelineId: input.pipelineId,
       tenantId: config.scope?.tenantId ?? null,
@@ -364,28 +414,44 @@ export class FilePipelineRunService implements PipelineRunService {
   async run(pipelineId: string, actor: ActorContext, options: RunCallOptions = {}): Promise<RunResult> {
     assertActor(actor)
     assertSafeIdentifier(pipelineId, 'pipelineId')
-    const { config, checkpointRoot } = await this.locate(pipelineId, actor)
+    const { config, checkpointRoot, checkpointBase } = await this.locate(pipelineId, actor)
     await this.requireCheckpoint(checkpointRoot)
 
-    const host = this.createHost(this.hostOptions(config, pipelineId, options.signal))
-
+    // 运行互斥（§6.3 M2-2）：锁覆盖 load checkpoint → 阶段产物生成 → 门禁/审核/人工门
+    // 推进 → checkpoint save。**不含**人工门"阻塞等待"之后的续写——见下面的说明。
+    const lock = await this.acquireRunLock(checkpointBase, pipelineId)
     try {
-      const outcome = await host.driver.run()
-      const view = await this.buildView(config, await this.requireCheckpoint(checkpointRoot))
-      if (outcome.outcome === 'completed') return { outcome: 'completed', view }
-      return { outcome: outcome.outcome, stageId: outcome.stageId, view }
-    } catch (error) {
-      const view = await this.buildView(config, await this.requireCheckpoint(checkpointRoot))
-      // 人工门等待被中止：超时 = 让出控制权等真人裁决（docs/10 §4.2、§5.4 第 4 步）；
-      // 信号中止 / 任务被外部取消 = 本次运行取消。两条路径都绝不自动批准。
-      if (error instanceof HumanGateWaitAbortedError) {
-        if (error.reason === 'timeout') {
-          return { outcome: 'waiting-human', stageId: error.stageId, gateTaskId: error.gateTaskId, view }
+      const host = this.createHost(this.hostOptions(config, pipelineId, options.signal))
+
+      try {
+        const outcome = await host.driver.run()
+        const view = await this.buildView(config, await this.requireCheckpoint(checkpointRoot))
+        if (outcome.outcome === 'completed') return { outcome: 'completed', view }
+        return { outcome: outcome.outcome, stageId: outcome.stageId, view }
+      } catch (error) {
+        const view = await this.buildView(config, await this.requireCheckpoint(checkpointRoot))
+        // 人工门等待被中止：超时 = 让出控制权等真人裁决（docs/10 §4.2、§5.4 第 4 步）；
+        // 信号中止 / 任务被外部取消 = 本次运行取消。两条路径都绝不自动批准。
+        if (error instanceof HumanGateWaitAbortedError) {
+          if (error.reason === 'timeout') {
+            return { outcome: 'waiting-human', stageId: error.stageId, gateTaskId: error.gateTaskId, view }
+          }
+          return { outcome: 'cancelled', view }
         }
-        return { outcome: 'cancelled', view }
+        // 运行期异常不写检查点，因此无法从持久化事实重建 —— 只能随本次 RunResult 返回。
+        return { outcome: 'failed', error: toPipelineRunError(error).toView(), view }
       }
-      // 运行期异常不写检查点，因此无法从持久化事实重建 —— 只能随本次 RunResult 返回。
-      return { outcome: 'failed', error: toPipelineRunError(error).toView(), view }
+    } finally {
+      // §6.3 M2-2「人工门等待期间可以释放运行锁，但必须保留 awaiting-gate checkpoint 和
+      // pending task。裁决后的下一次运行重新 acquire」：让出控制权（waiting-human /
+      // cancelled / failed）时这里就释放，`awaiting-gate` 与 pending task 都是持久化事实，
+      // 不受影响；下一次 run 会重新 acquire。
+      //
+      // 反过来，**阻塞等待中（`--wait-ms > 0`）刻意不释放**：那种情况下本进程稍后还要
+      // 继续推进并写检查点，而同节又要求 checkpoint save 在锁内。中途放手会让另一个进程
+      // 同时写同一份检查点——比"多占一会儿锁"危险得多。长时间阻塞靠自动续租（心跳）
+      // 保证不被误判 stale。
+      await lock.release()
     }
   }
 
@@ -396,7 +462,7 @@ export class FilePipelineRunService implements PipelineRunService {
     if (!STAGE_ORDER.includes(input.stageId)) {
       throw new PipelineRunError('invalid-request', `未知阶段：${input.stageId}`, { allowed: [...STAGE_ORDER] })
     }
-    const { config, checkpointRoot } = await this.locate(input.pipelineId, actor)
+    const { config, checkpointRoot, checkpointBase } = await this.locate(input.pipelineId, actor)
     const current = await this.requireCheckpoint(checkpointRoot)
 
     // 乐观并发：页面打开过久时不得覆盖他人产生的新版本（docs/10 §5.3）。
@@ -410,14 +476,20 @@ export class FilePipelineRunService implements PipelineRunService {
       })
     }
 
-    // 只动检查点，不解析 provider：没有 API Key 的运维同学也要能登记重入（与 CLI 一致）。
-    const host = createCheckpointHost({
-      config,
-      dataRoot: this.options.dataRoot,
-      pipelineId: input.pipelineId,
-      ...(this.options.signal === undefined ? {} : { signal: this.options.signal }),
-    })
-    return host.driver.reenter(input.stageId, actor.actorId, input.reason)
+    // 重入会写检查点（cursor 回退 + 下游标 needs-reentry），因此与 run 抢同一把锁。
+    const lock = await this.acquireRunLock(checkpointBase, input.pipelineId)
+    try {
+      // 只动检查点，不解析 provider：没有 API Key 的运维同学也要能登记重入（与 CLI 一致）。
+      const host = createCheckpointHost({
+        config,
+        dataRoot: this.options.dataRoot,
+        pipelineId: input.pipelineId,
+        ...(this.options.signal === undefined ? {} : { signal: this.options.signal }),
+      })
+      return await host.driver.reenter(input.stageId, actor.actorId, input.reason)
+    } finally {
+      await lock.release()
+    }
   }
 
   async listGateTasks(filter: GateTaskFilter, actor: ActorContext): Promise<readonly HumanGateTask[]> {
@@ -455,8 +527,37 @@ export class FilePipelineRunService implements PipelineRunService {
     if (input.action !== 'approved' && (input.note ?? '').trim() === '') {
       throw new PipelineRunError('invalid-request', `${input.action} 必须带非空 note`, { action: input.action })
     }
-    const { store, task } = await this.requireGateTask(input, actor)
+    if (input.decisionId !== undefined) assertSafeIdentifier(input.decisionId, 'decisionId')
+    const { store, task, projectRoot } = await this.requireGateTask(input, actor)
 
+    // 缺省不带 decisionId = 不启用幂等：行为与 M2 之前逐字一致（终态 → gate-not-decidable，
+    // 已消费 → gate-consumed）。带上它以后，同一个 (gateTaskId, decisionId) 的重复投递
+    // 会重放首次裁决结果（§6.4「同一 gate decision 重试不会重复消费」）。
+    if (input.decisionId === undefined) return this.decideOnce(store, task, input, actor)
+
+    const namespace = IDEMPOTENCY_NAMESPACES.gateDecision
+    return this.runIdempotent(
+      projectRoot,
+      namespace,
+      idempotencyKey(namespace, [task.gateTaskId, input.decisionId]),
+      idempotencyFingerprint(namespace, [input.pipelineId, task.gateTaskId, input.action, input.note ?? '', actor.actorId]),
+      () => this.decideOnce(store, task, input, actor),
+    )
+  }
+
+  /**
+   * 真正的裁决（幂等层之下）。
+   *
+   * 终态、`consumedAt` 与乐观并发校验都放在这里而不是 `decideGate` 的入口：
+   * 重复投递**必须能走到幂等台账**才能被重放，若在入口就按「已消费」拒掉，
+   * 重试永远拿不到首次结果（§6.4 的反面）。
+   */
+  private async decideOnce(
+    store: FileHumanGateTaskStore,
+    task: HumanGateTask,
+    input: GateDecisionInput,
+    actor: ActorContext,
+  ): Promise<HumanGateTask> {
     // 已消费的裁决不允许再次驱动门（docs/10 §5.3）。
     if (task.consumedAt !== undefined) {
       throw new PipelineRunError('gate-consumed', `该裁决已被消费，不能再驱动门：${task.gateTaskId}`, {
@@ -508,13 +609,48 @@ export class FilePipelineRunService implements PipelineRunService {
   private async locate(pipelineId: string, actor: ActorContext): Promise<{
     readonly config: PipelineConfig
     readonly checkpointRoot: string
+    /** checkpoints 根（不含 pipelineId）：锁路径由它与 pipelineId 一起拼出。 */
+    readonly checkpointBase: string
   }> {
     const entry = await this.requireIndex(pipelineId)
     const config = await this.configOf(entry.configRef)
     // 索引与配置漂移（改配置里的 projectId 后没重建索引）在这里被拦下，而不是串到别的项目目录。
     this.assertScope(config, entry.projectId, actor)
     const roots = resolvePlatformRoots(this.options.dataRoot, config)
-    return { config, checkpointRoot: join(roots.checkpointRoot, pipelineId) }
+    return { config, checkpointRoot: join(roots.checkpointRoot, pipelineId), checkpointBase: roots.checkpointRoot }
+  }
+
+  /**
+   * 取得该流水线的运行锁（docs/10 §6.3 M2-1/M2-2）。
+   *
+   * 锁路径由 {@link pipelineLockPath} 统一算出，与 CLI / Harness 完全一致——此前 Web 与
+   * Harness 传的基准目录不同（一个是 per-pipeline 目录、一个是 checkpoints 根），拼出的
+   * 锁路径不一样，等于没锁（§6.2 第 5 条）。
+   *
+   * 抢不到锁时抛 `conflict`(409) 而不是 500：这是"别人正在跑"，不是服务故障。
+   */
+  private async acquireRunLock(checkpointBase: string, pipelineId: string): Promise<PipelineLock> {
+    try {
+      return await acquirePipelineLock(checkpointBase, pipelineId, {
+        audit: fileLockAudit(lockAuditPath(checkpointBase)),
+        ...(this.options.lockStaleMs === undefined ? {} : { staleMs: this.options.lockStaleMs }),
+      })
+    } catch (error) {
+      if (error instanceof PipelineLockHeldError) {
+        throw new PipelineRunError('conflict', error.message, {
+          pipelineId,
+          lockPath: error.lockPath,
+          holder: error.holder === null ? null : {
+            ownerId: error.holder.ownerId,
+            generation: error.holder.generation,
+            pid: error.holder.pid,
+            host: error.holder.host,
+            heartbeatAt: error.holder.heartbeatAt,
+          },
+        })
+      }
+      throw error
+    }
   }
 
   private async loadRun(pipelineId: string, actor: ActorContext): Promise<{
@@ -523,6 +659,39 @@ export class FilePipelineRunService implements PipelineRunService {
   }> {
     const { config, checkpointRoot } = await this.locate(pipelineId, actor)
     return { config, checkpoint: await this.requireCheckpoint(checkpointRoot) }
+  }
+
+  /**
+   * 幂等执行（docs/10 §6.3 M2-3）。
+   *
+   * 台账按**项目**共享（`idempotencyDir(projectRoot)`），命名空间区分子目录，
+   * 因此 Web、CLI 与运行时工具看到的是同一份台账——各自拼路径会让幂等静默失效，
+   * 和锁路径分裂是同一类错误（§6.2 第 5 条）。
+   *
+   * `IdempotencyConflictError` → `conflict`(409)：同一把键上出现了不同内容的请求，
+   * 属于调用方错误，不是服务故障。
+   */
+  private async runIdempotent<T>(
+    projectRoot: string,
+    namespace: string,
+    key: string,
+    fingerprint: string,
+    produce: () => Promise<T>,
+  ): Promise<T> {
+    const ledger: IdempotencyLedger = fileIdempotencyLedger(idempotencyDir(projectRoot))
+    try {
+      return (await ledger.run({ namespace, key, fingerprint, produce })).result
+    } catch (error) {
+      if (error instanceof IdempotencyConflictError) {
+        throw new PipelineRunError('conflict', error.message, {
+          namespace: error.namespace,
+          key: error.key,
+          recordedFingerprint: error.recordedFingerprint,
+          requestedFingerprint: error.requestedFingerprint,
+        })
+      }
+      throw error
+    }
   }
 
   private async configOf(configRef: string): Promise<PipelineConfig> {
@@ -585,6 +754,8 @@ export class FilePipelineRunService implements PipelineRunService {
   private async gateStoreOf(pipelineId: string, projectId: string | undefined, actor: ActorContext): Promise<{
     readonly store: FileHumanGateTaskStore
     readonly config: PipelineConfig
+    /** 项目根：幂等台账目录由它与 `idempotencyDir` 拼出，与锁/产物同源。 */
+    readonly projectRoot: string
   }> {
     const { config } = await this.locate(pipelineId, actor)
     // 项目一律由索引 + 配置推导；调用方自报的项目只作**额外**一致性校验。
@@ -596,17 +767,21 @@ export class FilePipelineRunService implements PipelineRunService {
       })
     }
     const roots = resolvePlatformRoots(this.options.dataRoot, config)
-    return { store: new FileHumanGateTaskStore(gateTaskStoreDir(roots.projectRoot)), config }
+    return {
+      store: new FileHumanGateTaskStore(gateTaskStoreDir(roots.projectRoot)),
+      config,
+      projectRoot: roots.projectRoot,
+    }
   }
 
   /** 读取门任务并校验它确实属于给定项目/流水线（防止跨流水线裁决）。 */
   private async requireGateTask(
     input: { readonly projectId?: string; readonly pipelineId: string; readonly gateTaskId: string },
     actor: ActorContext,
-  ): Promise<{ readonly store: FileHumanGateTaskStore; readonly task: HumanGateTask }> {
+  ): Promise<{ readonly store: FileHumanGateTaskStore; readonly task: HumanGateTask; readonly projectRoot: string }> {
     assertSafeIdentifier(input.pipelineId, 'pipelineId')
     assertSafeIdentifier(input.gateTaskId, 'gateTaskId')
-    const { store } = await this.gateStoreOf(input.pipelineId, input.projectId, actor)
+    const { store, projectRoot } = await this.gateStoreOf(input.pipelineId, input.projectId, actor)
     const task = await store.get(input.gateTaskId)
     if (task === null) throw new PipelineRunError('not-found', `门任务不存在：${input.gateTaskId}`, { gateTaskId: input.gateTaskId })
     // 流水线归属是必检项：这是"用 A 流水线的身份裁决 B 流水线任务"的唯一防线。
@@ -625,7 +800,7 @@ export class FilePipelineRunService implements PipelineRunService {
         actualProject: task.projectId,
       })
     }
-    return { store, task }
+    return { store, task, projectRoot }
   }
 
   private async requireCheckpoint(checkpointRoot: string): Promise<Checkpoint> {

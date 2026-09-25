@@ -63,7 +63,35 @@ export {
   saveCheckpoint,
 } from './checkpoint.ts'
 
-export { acquirePipelineLock, type PipelineLock } from './checkpoint-lock.ts'
+export {
+  acquirePipelineLock,
+  fileLockAudit,
+  lockAuditPath,
+  pipelineCheckpointDir,
+  pipelineLockPath,
+  PipelineLockHeldError,
+  type AcquirePipelineLockOptions,
+  type PipelineLock,
+  type PipelineLockAudit,
+  type PipelineLockEvent,
+  type PipelineLockEventKind,
+  type PipelineLockOwner,
+} from './checkpoint-lock.ts'
+
+export {
+  IDEMPOTENCY_NAMESPACES,
+  IdempotencyConflictError,
+  fileIdempotencyLedger,
+  idempotencyDir,
+  idempotencyFingerprint,
+  idempotencyKey,
+  type IdempotencyField,
+  type IdempotencyLedger,
+  type IdempotencyNamespace,
+  type IdempotencyOutcome,
+  type IdempotencyRecord,
+  type IdempotencyRequest,
+} from './idempotency.ts'
 
 export {
   LlmProviderRegistry,

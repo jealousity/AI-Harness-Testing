@@ -344,11 +344,24 @@ function renderGates(gates) {
       note.placeholder = '裁决说明（打回/拒绝时必填）'
       const row = document.createElement('div')
       row.className = 'actions'
+      // 幂等（docs/10 §6.3 M2-3）：同一个 (任务, 动作, 说明) 沿用同一个 decisionId，
+      // 因此双击或网络重试会被服务端**重放首次裁决结果**，而不是二次驱动门。
+      // 说明文字一改就换一个 id——那是另一个裁决意图，不该被当成重试。
+      const decisionIds = new Map()
+      const decisionIdFor = action => {
+        const intent = `${task.gateTaskId}\u0000${action}\u0000${note.value}`
+        let id = decisionIds.get(intent)
+        if (id === undefined) {
+          id = newDecisionId()
+          decisionIds.set(intent, id)
+        }
+        return id
+      }
       for (const [action, label] of [['approved', '批准'], ['changes-needed', '打回重跑'], ['rejected', '拒绝']]) {
         const button = document.createElement('button')
         button.textContent = label
         if (action === 'approved') button.className = 'primary'
-        button.addEventListener('click', () => decideGate(task, action, note.value, box))
+        button.addEventListener('click', () => decideGate(task, action, note.value, box, decisionIdFor(action)))
         row.append(button)
       }
       const cancelButton = document.createElement('button')
@@ -362,7 +375,13 @@ function renderGates(gates) {
   }
 }
 
-async function decideGate(task, action, note, box) {
+/** 裁决幂等标识。非安全上下文（局域网 http）没有 `crypto.randomUUID`，退回随机串。 */
+function newDecisionId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  return `dec-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+async function decideGate(task, action, note, box, decisionId) {
   try {
     await api('POST', `/api/gates/${encodeURIComponent(task.gateTaskId)}/decide`, {
       pipelineId: current.pipelineId,
@@ -370,6 +389,8 @@ async function decideGate(task, action, note, box) {
       note,
       // 乐观并发：带上页面看到的 updatedAt，避免覆盖他人在同一页面上完成的裁决。
       expectedUpdatedAt: task.updatedAt,
+      // 幂等：重复投递（双击/重试）返回首次裁决结果，不二次驱动门。
+      decisionId,
     })
     report('out-run', `已裁决 ${task.stageId} → ${action}；再次触发运行即消费该裁决。`)
     await refresh()

@@ -10,10 +10,12 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
+import { acquirePipelineLock, pipelineLockPath } from '../src/checkpoint-lock.ts'
 import { resolvePlatformRoots } from '../src/platform-roots.ts'
 import { STAGE_ORDER, type PipelineConfig, type StageId } from '../src/types.ts'
 import { DEFAULT_RULESET_VERSION } from '../src/runtime/platform-host.ts'
@@ -77,8 +79,8 @@ async function approve(service: FilePipelineRunService, gateTaskId: string): Pro
   await service.decideGate({ ...SCOPE, gateTaskId, action: 'approved' }, REVIEWER)
 }
 
-/** 走一遍「创建 → 运行到 receive 人工门 → 裁决批准」。 */
-async function parkedAtReceiveGate() {
+/** 走一遍「创建 → 运行到 receive 人工门」，**不裁决**。 */
+async function parkedAtOpenGate() {
   const host = new ScriptedHost()
   const service = serviceOf(host)
   await service.create(CREATE, REVIEWER)
@@ -86,8 +88,14 @@ async function parkedAtReceiveGate() {
   assert.equal(first.stageId, 'receive')
   const task = await openGateTaskOf(service)
   assert.equal(task.gateTaskId, first.gateTaskId)
-  await approve(service, first.gateTaskId)
   return { host, service, task, first }
+}
+
+/** 走一遍「创建 → 运行到 receive 人工门 → 裁决批准」。 */
+async function parkedAtReceiveGate() {
+  const parked = await parkedAtOpenGate()
+  await approve(parked.service, parked.first.gateTaskId)
+  return parked
 }
 
 // ── create / get ────────────────────────────────────────────────────────────
@@ -111,9 +119,44 @@ test('create 先落盘初始检查点，再返回 queued（docs/10 §1 原则 5�
   assert.equal(checkpoint.rulesetVersion, DEFAULT_RULESET_VERSION)
 })
 
-test('create 对已存在的 pipelineId 返回 conflict（作用域内唯一）', async () => {
+test('create 幂等：同一 (tenantId, projectId, pipelineId) 且内容一致的重复投递返回首次 summary', async () => {
+  const service = serviceOf(new ScriptedHost())
+  const first = await service.create(CREATE, REVIEWER)
+  const roots = resolvePlatformRoots(dir, config)
+  const checkpointPath = join(roots.checkpointRoot, 'pipe-1', 'checkpoint.json')
+  const before = await readFile(checkpointPath, 'utf8')
+
+  // §6.4「重试不产生副作用」：返回首次结果，不报错、不重建检查点。
+  const again = await service.create(CREATE, REVIEWER)
+  assert.deepEqual(again, first)
+  assert.equal(await readFile(checkpointPath, 'utf8'), before)
+
+  // 台账落在项目根下，与锁/产物同源（§4.3）。
+  const index = JSON.parse(await readFile(join(pipelineIndexDir(dir), 'pipe-1.json'), 'utf8')) as { configRef: string }
+  assert.equal(index.configRef, CREATE.configRef)
+  assert.equal(existsSync(join(roots.projectRoot, 'idempotency')), true)
+})
+
+test('create 幂等只对"同一个请求"生效：同 id 换 configRef 仍返回 conflict', async () => {
   const service = serviceOf(new ScriptedHost())
   await service.create(CREATE, REVIEWER)
+  // 键字段相同（tenantId/projectId/pipelineId）但内容不同 → 指纹不一致 → 拒绝，
+  // 这正是 §5.3「绝不静默复用」要拦的情况。
+  await assert.rejects(
+    () => service.create({ ...CREATE, configRef: 'other.yaml' }, REVIEWER),
+    isCode('conflict'),
+  )
+})
+
+test('create 对磁盘上已存在但无幂等记录的 pipelineId 返回 conflict（作用域内唯一）', async () => {
+  const service = serviceOf(new ScriptedHost())
+  // 模拟"旧版本 / 别的入口建过、台账里没有记录"：直接写索引，不写台账。
+  await mkdir(pipelineIndexDir(dir), { recursive: true })
+  await writeFile(
+    join(pipelineIndexDir(dir), 'pipe-1.json'),
+    JSON.stringify({ pipelineId: 'pipe-1', tenantId: 'acme', projectId: 'demo', configRef: CREATE.configRef }),
+    'utf8',
+  )
   await assert.rejects(() => service.create(CREATE, REVIEWER), isCode('conflict'))
 })
 
@@ -348,6 +391,83 @@ test('已裁决的任务不能再次裁决，已消费的裁决不能再次驱�
   await assert.rejects(
     () => service.decideGate({ ...SCOPE, gateTaskId: task.gateTaskId, action: 'approved' }, REVIEWER),
     isCode('gate-consumed'),
+  )
+})
+
+test('decide 带 decisionId：重复投递重放首次裁决结果，不重复消费', async () => {
+  const { service, task } = await parkedAtOpenGate()
+
+  // 首次裁决：带 decisionId。
+  const first = await service.decideGate({ ...SCOPE, gateTaskId: task.gateTaskId, action: 'approved', decisionId: 'dec-1' }, REVIEWER)
+  assert.equal(first.status, 'approved')
+  assert.equal(first.consumedAt, undefined)
+
+  // run 消费该裁决——此后不带 decisionId 的再次裁决会被拒（下一条用例）。
+  await service.run('pipe-1', REVIEWER)
+  const [consumedOnce] = await service.listGateTasks(SCOPE, REVIEWER)
+  assert.ok(consumedOnce?.consumedAt !== undefined, 'run 之后裁决应已被消费')
+
+  // §6.4「同一 gate decision 重试不会重复消费」：同一个 (gateTaskId, decisionId) 的
+  // 重复投递重放首次结果，而不是报 gate-consumed、更不会二次驱动门。
+  const replay = await service.decideGate({ ...SCOPE, gateTaskId: task.gateTaskId, action: 'approved', decisionId: 'dec-1' }, REVIEWER)
+  // 逐字段比对而不是 deepEqual：重放的是台账里的 **JSON 快照**，`undefined` 字段
+  // （如未设置的 `lease`/`consumedAt`）在序列化时被丢掉。HTTP 响应本来就要走
+  // JSON.stringify，两条路径在线路上的形状完全一致，因此这里比对的是语义字段。
+  assert.equal(replay.gateTaskId, first.gateTaskId)
+  assert.equal(replay.status, 'approved')
+  assert.equal(replay.updatedAt, first.updatedAt)
+  assert.deepEqual(replay.decision, first.decision)
+  assert.equal(replay.lease, undefined)
+  // 快照是**裁决当时**的事实：那时裁决还没被 run 消费，所以这里必须是 undefined。
+  assert.equal(replay.consumedAt, undefined)
+
+  // 裁决只被消费了一次：消费时间戳在重放前后完全一致，没有被第二次消费改写。
+  const [after] = await service.listGateTasks(SCOPE, REVIEWER)
+  assert.equal(after?.status, 'approved')
+  assert.equal(after?.consumedAt, consumedOnce.consumedAt)
+  assert.equal(after?.decision?.at, first.decision?.at)
+})
+
+test('decide 的幂等键只认同一个 decisionId：换了 decisionId 仍按既有语义拒绝', async () => {
+  const { service, task } = await parkedAtOpenGate()
+  await service.decideGate({ ...SCOPE, gateTaskId: task.gateTaskId, action: 'approved', decisionId: 'dec-1' }, REVIEWER)
+
+  // 不同 decisionId = 另一次裁决意图：任务已终态，仍按 gate-not-decidable 拒绝。
+  await assert.rejects(
+    () => service.decideGate({ ...SCOPE, gateTaskId: task.gateTaskId, action: 'approved', decisionId: 'dec-2' }, REVIEWER),
+    isCode('gate-not-decidable'),
+  )
+})
+
+test('decide 同一 decisionId 携带不同内容 → conflict，不静默重放', async () => {
+  const { service, task } = await parkedAtOpenGate()
+  await service.decideGate({ ...SCOPE, gateTaskId: task.gateTaskId, action: 'approved', decisionId: 'dec-1' }, REVIEWER)
+
+  await assert.rejects(
+    () => service.decideGate({ ...SCOPE, gateTaskId: task.gateTaskId, action: 'rejected', note: '范围不清', decisionId: 'dec-1' }, REVIEWER),
+    isCode('conflict'),
+  )
+})
+
+test('decide 的幂等记录落在项目根的 idempotency/ 下，且不改变不带 decisionId 时的行为', async () => {
+  const { service, task } = await parkedAtOpenGate()
+  const roots = resolvePlatformRoots(dir, config)
+
+  await service.decideGate({ ...SCOPE, gateTaskId: task.gateTaskId, action: 'approved', decisionId: 'dec-1' }, REVIEWER)
+  assert.equal(existsSync(join(roots.projectRoot, 'idempotency', 'gate-decision')), true)
+
+  // 不带 decisionId = 不启用幂等：已裁决 → gate-not-decidable（与 M2 之前逐字一致）。
+  await assert.rejects(
+    () => service.decideGate({ ...SCOPE, gateTaskId: task.gateTaskId, action: 'approved' }, REVIEWER),
+    isCode('gate-not-decidable'),
+  )
+})
+
+test('decide 拒绝非法 decisionId（不把路径拼接交给下游）', async () => {
+  const { service, task } = await parkedAtOpenGate()
+  await assert.rejects(
+    () => service.decideGate({ ...SCOPE, gateTaskId: task.gateTaskId, action: 'approved', decisionId: '../escape' }, REVIEWER),
+    isCode('invalid-request'),
   )
 })
 
@@ -710,4 +830,120 @@ test('getStageArtifact 拒绝未知阶段与越权调用者', async () => {
   )
   const outsider: ActorContext = { actorId: 'bob', tenantId: 'acme', projectIds: ['other-project'] }
   await assert.rejects(() => service.getStageArtifact('pipe-1', 'receive', outsider), isCode('forbidden'))
+})
+
+// ── 运行互斥锁（docs/10 §6.3 M2-1/M2-2、§6.4） ───────────────────────────────
+
+test('run 期间持锁，让出控制权（waiting-human）后释放；awaiting-gate 与 pending 任务都还在', async () => {
+  const host = new ScriptedHost()
+  const checkpointBase = resolvePlatformRoots(dir, config).checkpointRoot
+  const lockPath = pipelineLockPath(checkpointBase, 'pipe-1')
+
+  // 装配宿主发生在取得锁之后、driver.run() 之前，因此在这里探测即可证明"运行中持锁"。
+  let lockedDuringAssembly: boolean | undefined
+  const service = serviceOf(host, {
+    createHost: options => {
+      lockedDuringAssembly = existsSync(lockPath)
+      return host.factory(options)
+    },
+  })
+  await service.create(CREATE, REVIEWER)
+  assert.equal(existsSync(lockPath), false, '运行前不应有锁')
+
+  const result = await expectWaitingHuman(await service.run('pipe-1', REVIEWER))
+  assert.equal(result.stageId, 'receive')
+  assert.equal(lockedDuringAssembly, true, '运行中必须持锁')
+  assert.equal(existsSync(lockPath), false, '停在人工门 = 已让出控制权，锁必须已释放')
+
+  // 让出控制权不得影响任何持久化事实（§6.3 M2-2 的后半句）。
+  const view = await service.get('pipe-1', REVIEWER)
+  assert.equal(view.status, 'waiting-human')
+  assert.equal(view.openGateTaskId, result.gateTaskId)
+  assert.equal(view.stages.find(stage => stage.stageId === 'receive')!.status, 'awaiting-gate')
+  const pending = await service.listGateTasks(SCOPE, REVIEWER)
+  assert.equal(pending.filter(task => task.status === 'pending').length, 1)
+})
+
+test('另一进程持锁时 run 抛 conflict(409)，且一个阶段都不 spawn', async () => {
+  const host = new ScriptedHost()
+  const service = serviceOf(host)
+  await service.create(CREATE, REVIEWER)
+
+  const checkpointBase = resolvePlatformRoots(dir, config).checkpointRoot
+  const held = await acquirePipelineLock(checkpointBase, 'pipe-1', { heartbeatMs: 0 })
+  try {
+    await assert.rejects(() => service.run('pipe-1', REVIEWER), (error: unknown) => {
+      assert.ok(isCode('conflict')(error))
+      assert.match((error as PipelineRunError).message, /已被其他进程锁定/)
+      return true
+    })
+    assert.deepEqual(host.stages, [], '被锁拒绝的运行不得 spawn 任何阶段')
+  } finally {
+    await held.release()
+  }
+
+  // 锁释放后照常推进
+  const result = await expectWaitingHuman(await service.run('pipe-1', REVIEWER))
+  assert.equal(result.stageId, 'receive')
+  assert.deepEqual(host.stages, ['receive'])
+})
+
+test('reenter 也抢同一把锁：别人在跑时登记重入会被拒', async () => {
+  const service = serviceOf(new ScriptedHost())
+  await service.create(CREATE, REVIEWER)
+  await service.run('pipe-1', REVIEWER)
+
+  const checkpointBase = resolvePlatformRoots(dir, config).checkpointRoot
+  const held = await acquirePipelineLock(checkpointBase, 'pipe-1', { heartbeatMs: 0 })
+  try {
+    await assert.rejects(
+      () => service.reenter({ ...SCOPE, stageId: 'receive', reason: '需求变更' }, REVIEWER),
+      isCode('conflict'),
+    )
+  } finally {
+    await held.release()
+  }
+
+  const checkpoint = await service.reenter({ ...SCOPE, stageId: 'receive', reason: '需求变更' }, REVIEWER)
+  assert.equal(checkpoint.reentries.length, 1)
+  assert.equal(existsSync(join(checkpointBase, 'pipe-1', '.pipeline.lock')), false, 'reenter 结束后必须释放')
+})
+
+test('两个 service 实例（模拟两个进程）串行推进同一 pipeline：第二次续上同一个门，不重复 spawn', async () => {
+  const hostA = new ScriptedHost()
+  const hostB = new ScriptedHost()
+  const a = serviceOf(hostA)
+  const b = serviceOf(hostB)
+  await a.create(CREATE, REVIEWER)
+
+  // 先让"另一个进程"占着锁，B 必须被拒（而不是各自跑一遍）
+  const checkpointBase = resolvePlatformRoots(dir, config).checkpointRoot
+  const held = await acquirePipelineLock(checkpointBase, 'pipe-1', { heartbeatMs: 0 })
+  await assert.rejects(() => b.run('pipe-1', REVIEWER), isCode('conflict'))
+  await held.release()
+
+  const first = await expectWaitingHuman(await a.run('pipe-1', REVIEWER))
+  // 另一个实例接着跑：检查点里 receive 仍是 awaiting-gate，因此必须续上同一个门、
+  // 不重新 spawn（否则会覆盖真人正在看的那份产物）。
+  const second = await expectWaitingHuman(await b.run('pipe-1', REVIEWER))
+  assert.equal(second.gateTaskId, first.gateTaskId)
+  assert.deepEqual(hostA.stages, ['receive'])
+  assert.deepEqual(hostB.stages, [], '停在人工门时第二个实例不得重新 spawn')
+
+  // 门任务只有一条，且没有被重复开门
+  const tasks = await b.listGateTasks(SCOPE, REVIEWER)
+  assert.equal(tasks.length, 1)
+})
+
+test('run 在宿主装配失败时抛错，但锁一定被释放（不会把流水线锁死）', async () => {
+  const host = new ScriptedHost()
+  const service = serviceOf(host, {
+    // 装配失败属于"前置失败"，按契约抛错（HTTP 层映射成 500），不伪装成 RunResult。
+    createHost: () => { throw new Error('装配失败（测试注入）') },
+  })
+  await service.create(CREATE, REVIEWER)
+
+  const lockPath = pipelineLockPath(resolvePlatformRoots(dir, config).checkpointRoot, 'pipe-1')
+  await assert.rejects(() => service.run('pipe-1', REVIEWER), /装配失败（测试注入）/)
+  assert.equal(existsSync(lockPath), false, '异常路径也必须释放锁')
 })

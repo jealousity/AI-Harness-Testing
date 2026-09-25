@@ -329,6 +329,54 @@ test('executor_run 能在标准布局 <artifactsRoot>/artifacts/<pid>/design.jso
   }
 })
 
+test('executor_run 幂等：同一批用例重复投递重放既有记录，不重复执行、不改会话（docs/10 §6.3 M2-3）', async () => {
+  const ctx = await mount()
+  ctx.tools.register(subagentStub())
+  const d = await deps()
+
+  const { createServer } = await import('node:http')
+  const server = createServer((_req, res) => { res.writeHead(200); res.end('ok') })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  const port = typeof address === 'object' && address !== null ? address.port : 0
+
+  try {
+    await mkdir(join(d.artifactsRoot, 'artifacts', 'host-2026'), { recursive: true })
+    await writeFile(
+      join(d.artifactsRoot, 'artifacts', 'host-2026', 'design.json'),
+      JSON.stringify({ testCases: [{ id: 'TC-1', steps: [{ action: 'GET /health', expected: ['200'] }] }] }),
+    )
+    registerStageTools(ctx, { ...d, baseDir: d.artifactsRoot, targetBaseUrl: `http://127.0.0.1:${port}` })
+
+    const first = await ctx.tools.get('executor_run')!.execute({ caseIds: ['TC-1'] } as never, {} as never) as {
+      records?: Array<{ seq: number; caseId: string }>
+      replayedCaseIds?: string[]
+    }
+    assert.equal(first.replayedCaseIds, undefined)
+    assert.equal(first.records?.[0]?.seq, 1)
+    const sessionAfterFirst = await readFile(d.sessionPath, 'utf8')
+
+    // §6.4「同一 executor invocation 重试不会重复产生不可对账记录」。
+    const again = await ctx.tools.get('executor_run')!.execute({ caseIds: ['TC-1'] } as never, {} as never) as typeof first
+    assert.deepEqual(again.records, first.records)
+    assert.deepEqual(again.replayedCaseIds, ['TC-1'])
+    assert.equal(await readFile(d.sessionPath, 'utf8'), sessionAfterFirst, '重放不得改写会话文件')
+
+    // 设计变了（产物字节变了）→ inputDigest 变了 → 是新的一轮执行，正常续接链尾。
+    await writeFile(
+      join(d.artifactsRoot, 'artifacts', 'host-2026', 'design.json'),
+      JSON.stringify({
+        testCases: [{ id: 'TC-1', steps: [{ action: 'GET /health', expected: ['200'] }, { action: 'GET /health', expected: ['200'] }] }],
+      }),
+    )
+    const rerun = await ctx.tools.get('executor_run')!.execute({ caseIds: ['TC-1'] } as never, {} as never) as typeof first
+    assert.equal(rerun.replayedCaseIds, undefined)
+    assert.equal(rerun.records?.[0]?.seq, 2)
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+})
+
 /**
  * 回归：executor_run 被多次调用（分批执行）时必须**续接**会话，不能覆盖。
  *

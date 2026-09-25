@@ -349,6 +349,17 @@ export interface GateDecisionInput {
    * 避免覆盖他人的裁决（docs/10 §5.3「不允许覆盖已经 consumed 的裁决」）。
    */
   readonly expectedUpdatedAt?: number
+  /**
+   * 幂等标识（docs/10 §6.3 M2-3：human gate decision 的键 = `gateTaskId/decisionId`）。
+   *
+   * **由调用方生成**（一次裁决意图一个 id，重试沿用同一个）。服务端生成不了：
+   * 重试请求与首次请求在服务端看起来完全一样，只有调用方知道自己"又发了一次"。
+   *
+   * 缺省 = 不启用幂等，行为与 M2 之前完全一致（终态 → `gate-not-decidable`，
+   * 已消费 → `gate-consumed`）。带上它以后，同一个 `(gateTaskId, decisionId)`
+   * 的重复投递会**重放首次裁决结果**，不再报错、也不会二次驱动门（§6.4）。
+   */
+  readonly decisionId?: string
 }
 
 /** 取消人工门任务（`POST /api/gates/:gateTaskId/cancel`）。 */

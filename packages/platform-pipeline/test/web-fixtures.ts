@@ -81,16 +81,27 @@ export interface ScriptedHostOptions {
    * 于是「重启后产物被重生成」这件事在断言里彻底不可见。
    */
   readonly initialCall?: number
+  /**
+   * 每个阶段 spawn 前的异步钩子（毫秒级延迟、等待另一个进程的信号……）。
+   *
+   * 双进程并发测试需要**确定性**的重叠窗口：没有它，一次 run 只有十几毫秒，
+   * 两个进程几乎不可能真的同时处在临界区里，测试会退化成"碰运气"；
+   * 而固定 `sleep` 在并行跑全量测试时又会被拖长到失效——所以钩子必须是
+   * 可以"等另一个进程的信号"的，而不是只能等一个固定时长。
+   */
+  readonly beforeStage?: (request: SpawnRequest) => Promise<void>
 }
 
 /** 记录 spawn 调用的脚本化运行器：用于断言"已批准阶段不重生成"。 */
 export class RecordingSpawner implements StageSpawner {
   readonly stages: StageId[] = []
   private readonly inner: ScriptedStageRunner
+  private readonly beforeStage: ((request: SpawnRequest) => Promise<void>) | undefined
   private call: number
 
   constructor(artifacts: ArtifactStore, options: ScriptedHostOptions = {}) {
     this.call = options.initialCall ?? 0
+    this.beforeStage = options.beforeStage
     this.inner = new ScriptedStageRunner(artifacts, ({ request }) => {
       this.call += 1
       const call = this.call
@@ -101,9 +112,10 @@ export class RecordingSpawner implements StageSpawner {
     })
   }
 
-  runStage(request: SpawnRequest, cfg: PipelineConfig): Promise<SpawnedRun> {
+  async runStage(request: SpawnRequest, cfg: PipelineConfig): Promise<SpawnedRun> {
     this.stages.push(request.stageId)
-    return this.inner.runStage(request, cfg)
+    if (this.beforeStage !== undefined) await this.beforeStage(request)
+    return await this.inner.runStage(request, cfg)
   }
 }
 

@@ -14,9 +14,16 @@
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Context } from '@deepseek-ai/cordis'
-import { mkdir, readdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdir, readdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { HttpExecutor, type HttpCase, type HttpStep } from '../executor/http.ts'
+import {
+  IDEMPOTENCY_NAMESPACES,
+  fileIdempotencyLedger,
+  idempotencyFingerprint,
+  idempotencyKey,
+} from '../idempotency.ts'
 import { parseWorkspaceDocument } from '../runtime/platform-tools.ts'
 import { KnowledgeConflictError, MarkdownCaseStore, MarkdownKnowledgeStore, type KnowledgeEntry, type VersionedCase } from '../stores/markdown.ts'
 import { loadCheckpoint } from '../checkpoint.ts'
@@ -25,6 +32,15 @@ const TOOL_TIMEOUT_MS = 180_000
 
 /** 抽象目录中需要 DENY 但宿主不提供实现的名字（注册为无操作 stub 以通过 restrict 校验）。 */
 const STUBBED_DENY_TOOLS = [] as const
+
+/** 幂等台账里存的执行记录摘要（与 executor_run 回给 agent 的形状一致，重放时原样返回）。 */
+interface StageExecutorRecordView {
+  readonly seq: number
+  readonly caseId: string
+  readonly status: string
+  readonly evidenceRefs: readonly string[]
+  readonly durationMs: number
+}
 
 export interface StageToolsDeps {
   /** 相对路径基准目录（工作区根）。产物根应在其下。 */
@@ -45,6 +61,14 @@ export interface StageToolsDeps {
   readonly sessionPathProvider?: (pipelineId: string) => string
   /** 可选的按 pipeline 隔离证据目录。 */
   readonly evidenceDirProvider?: (pipelineId: string) => string
+  /**
+   * 幂等台账根目录（docs/10 §6.3 M2-3）。
+   *
+   * 缺省 `join(baseDir, 'idempotency')`；宿主应显式传项目作用域下的同一个目录，
+   * 使 Harness 入口与通用宿主（`runtime/platform-tools.ts`）共用一份台账——
+   * 两个入口各写一份台账，等于同一操作在两处各有一套"首次结果"。
+   */
+  readonly idempotencyRoot?: string
   /** 本地知识库/用例库适配；未提供时工具返回 available=false，不伪装为空结果。 */
   readonly knowledgeStore?: MarkdownKnowledgeStore
   readonly caseStore?: MarkdownCaseStore
@@ -415,6 +439,8 @@ export function registerStageTools(ctx: Context, deps: StageToolsDeps): void {
         properties: {
           records: { type: 'array', items: { type: 'json' } },
           error: { type: 'string' },
+          // 本次没有真正执行、直接重放既有记录的用例 id（docs/10 §6.3 M2-3）。
+          replayedCaseIds: { type: 'array', items: { type: 'string' } },
         },
       },
       render: (_args, value) => textResult(JSON.stringify(value.records ?? value.error ?? [])),
@@ -433,7 +459,8 @@ export function registerStageTools(ctx: Context, deps: StageToolsDeps): void {
         if (designPath === undefined) {
           return { error: `未找到 design 产物（${deps.artifactsRoot}/*/design.json）：design 阶段尚未完成。` }
         }
-        const design = JSON.parse(await readFile(designPath, 'utf8')) as {
+        const rawDesign = await readFile(designPath, 'utf8')
+        const design = JSON.parse(rawDesign) as {
           pipelineId?: string
           testCases?: Array<{ id: string; steps: Array<Record<string, unknown>> }>
           reusedCases?: Array<{ id: string; steps: Array<Record<string, unknown>> }>
@@ -448,6 +475,38 @@ export function registerStageTools(ctx: Context, deps: StageToolsDeps): void {
         }
         if (new Set(selectedIds).size !== selectedIds.length) {
           return { error: 'caseIds 不能包含重复用例' }
+        }
+
+        // ── 幂等分流（docs/10 §6.3 M2-3）：键 = pipelineId/caseId/inputDigest ──────
+        // inputDigest 取 design 产物的字节摘要 + 被测基址：同一份设计打向同一个服务
+        // 才算"同一次执行"。重复投递（重试、进程被杀后重来）直接重放既有记录，
+        // 不再执行第二遍——否则会话里会多出一条同用例记录，被 R4-08 判成
+        // "多余执行"，把一份本来 pass 的产物判成 BLOCKING。
+        const ledger = fileIdempotencyLedger(deps.idempotencyRoot ?? join(deps.baseDir, 'idempotency'))
+        const invocationNamespace = IDEMPOTENCY_NAMESPACES.executorInvocation
+        const pipelineKey = requestedPipelineId ?? design.pipelineId ?? ''
+        const designDigest = createHash('sha256').update(rawDesign, 'utf8').digest('hex')
+        const replayable = new Map<string, StageExecutorRecordView>()
+        const pending: string[] = []
+        const keys = new Map<string, { readonly key: string; readonly fingerprint: string }>()
+        for (const caseId of selectedIds as string[]) {
+          const fields = [
+            pipelineKey,
+            caseId,
+            idempotencyKey(IDEMPOTENCY_NAMESPACES.executorCaseInput, [pipelineKey, caseId, designDigest, baseUrl]),
+          ]
+          const key = idempotencyKey(invocationNamespace, fields)
+          keys.set(caseId, { key, fingerprint: idempotencyFingerprint(invocationNamespace, fields) })
+          const record = await ledger.lookup<StageExecutorRecordView>(invocationNamespace, key)
+          if (record === null) pending.push(caseId)
+          else replayable.set(caseId, record.result)
+        }
+        if (pending.length === 0) {
+          // 全部命中：一个用例都不执行，会话文件一个字节都不改。
+          return {
+            records: (selectedIds as string[]).map(id => replayable.get(id)),
+            replayedCaseIds: selectedIds as string[],
+          } as never
         }
         const cases: HttpCase[] = allDesignCases.map((tc) => {
           const steps: HttpStep[] = tc.steps.map((raw, index) => {
@@ -500,7 +559,7 @@ export function registerStageTools(ctx: Context, deps: StageToolsDeps): void {
         const evidenceRoot = deps.evidenceDirProvider?.(requestedPipelineId ?? '') ?? deps.evidenceDir
         const prior = await readSessionFile(sessionPath)
         const last = prior?.records[prior.records.length - 1]
-        const session = await executor.run(selectedIds, {
+        const session = await executor.run(pending, {
           designArtifactPath: designPath,
           evidenceDir: evidenceRoot,
           invocationId: `inv-${Date.now()}`,
@@ -520,12 +579,41 @@ export function registerStageTools(ctx: Context, deps: StageToolsDeps): void {
           evidence: [...(prior?.evidence ?? []), ...session.evidence],
         }
         await mkdir(dirname(sessionPath), { recursive: true })
-        await writeFile(sessionPath, JSON.stringify({ pipelineId: requestedPipelineId, evidenceDir: evidenceRoot, ...merged }, null, 2))
+        // 原子写（tmp → rename）：会话是 R4-08/09/10 的对账依据，半截写入等于把真实
+        // 执行数据变成"不可对账"——正是 docs/10 §6.4 要避免的状态。
+        const tmpSessionPath = `${sessionPath}.tmp-${process.pid}`
+        await writeFile(tmpSessionPath, JSON.stringify({ pipelineId: requestedPipelineId, evidenceDir: evidenceRoot, ...merged }, null, 2))
+        await rename(tmpSessionPath, sessionPath)
+
+        // 登记台账：记录已在会话里落盘，produce 是**纯返回**，不产生副作用。
+        // 登记失败不掩盖执行结果——台账是加速器，事实来源始终是会话文件。
+        const produced = new Map<string, StageExecutorRecordView>()
+        for (const record of session.records) {
+          const summary: StageExecutorRecordView = {
+            seq: record.seq, caseId: record.caseId, status: record.status,
+            evidenceRefs: record.evidenceRefs, durationMs: record.durationMs,
+          }
+          produced.set(summary.caseId, summary)
+          const entry = keys.get(summary.caseId)
+          if (entry === undefined) continue
+          try {
+            await ledger.run<StageExecutorRecordView>({
+              namespace: invocationNamespace,
+              key: entry.key,
+              fingerprint: entry.fingerprint,
+              produce: async () => summary,
+            })
+          } catch {
+            // 有意忽略：台账写不进去只会让下一次重试再执行一遍，不会让本次结果失真。
+          }
+        }
+
         // 只给 agent 记录摘要（caseId/status/evidenceRefs/真实时长），不暴露实现细节
         return {
-          records: session.records.map((r) => ({
-            seq: r.seq, caseId: r.caseId, status: r.status, evidenceRefs: r.evidenceRefs, durationMs: r.durationMs,
-          })),
+          records: (selectedIds as string[])
+            .map(id => produced.get(id) ?? replayable.get(id))
+            .filter((record): record is StageExecutorRecordView => record !== undefined),
+          ...(replayable.size === 0 ? {} : { replayedCaseIds: (selectedIds as string[]).filter(id => replayable.has(id)) }),
         } as never
       } catch (error) {
         return { error: error instanceof Error ? error.message : String(error) }

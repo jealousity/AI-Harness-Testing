@@ -19,10 +19,17 @@
  * @module platform-pipeline/runtime/platform-tools
  */
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve as resolvePath } from 'node:path'
 
 import { artifactPath, loadCheckpoint } from '../checkpoint.ts'
+import {
+  IDEMPOTENCY_NAMESPACES,
+  fileIdempotencyLedger,
+  idempotencyDir,
+  idempotencyFingerprint,
+  idempotencyKey,
+} from '../idempotency.ts'
 import {
   DEFAULT_DOCUMENT_LIMITS,
   DOCUMENT_DIAGNOSTIC_CODES,
@@ -655,6 +662,40 @@ interface ExecutorRunArgs {
 interface ExecutorRunResult {
   readonly records?: readonly unknown[]
   readonly error?: string
+  /** 本次**没有真正执行**、直接重放首次记录的用例 id（docs/10 §6.3 M2-3）。 */
+  readonly replayedCaseIds?: readonly string[]
+}
+
+/** 幂等台账里存的执行记录摘要：与回给 agent 的形状一致，重放时原样返回。 */
+interface ExecutorInvocationResult {
+  readonly seq: number
+  readonly caseId: string
+  readonly status: string
+  readonly evidenceRefs: readonly string[]
+  readonly durationMs: number
+}
+
+/**
+ * 单个用例的执行输入摘要（docs/10 §6.3 M2-3 里的 `inputDigest`）。
+ *
+ * 输入 = 用例定义（由 design 产物决定 → 用产物 digest 代表）+ 被测服务基址。
+ * `targetBaseUrl` 必须进摘要：换一个被测服务再跑同一用例是**不同的执行**，
+ * 不能被上一轮针对另一个环境的记录顶替。
+ */
+function executorInputDigest(pipelineId: string, caseId: string, designDigest: string, baseUrl: string): string {
+  return idempotencyKey(IDEMPOTENCY_NAMESPACES.executorCaseInput, [pipelineId, caseId, designDigest, baseUrl])
+}
+
+/** 去重且保持首次出现顺序：同一次调用里重复传同一个 caseId 不该被执行两次。 */
+function dedupeStrings(values: readonly string[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const value of values) {
+    if (seen.has(value)) continue
+    seen.add(value)
+    out.push(value)
+  }
+  return out
 }
 
 /**
@@ -663,17 +704,25 @@ interface ExecutorRunResult {
  * - 用例定义**由 executor 自读** `artifacts/<pipelineId>/design.json`，不采信调用方传入的步骤内容；
  * - 证据落 `executor/<pipelineId>/evidence/`（execute 阶段 agent 无写权）；
  * - 会话按 seq/prevHash 续接而非覆盖：executor_run 会被分批多次调用，覆盖会让先前批次
- *   的记录消失，门禁 R4-08 随即把它们判成"漏跑"（Harness 侧实测踩到过）。
+ *   的记录消失，门禁 R4-08 随即把它们判成"漏跑"（Harness 侧实测踩到过）；
+ * - 幂等（docs/10 §6.3 M2-3）：键 = `pipelineId/caseId/inputDigest`。同一批用例在**同一
+ *   design 产物 + 同一被测基址**下重复投递（重试、进程被杀后重来）直接重放首次记录，
+ *   不再执行第二遍——否则会话里会多出一条同用例记录，被 R4-08 判成
+ *   `unexecuted record seq N is unreferenced (多余执行)`，整条流水线卡在门禁上。
+ *   设计变更后 `designDigest` 变了 → 键变了 → 是**新的一轮执行**，正常重跑。
  */
 function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunArgs, ExecutorRunResult> {
   const artifacts = new FsArtifactStore(ctx.artifactsRoot)
   const sessionPath = executorSessionPath(ctx.projectRoot, ctx.pipelineId)
   const evidenceDir = executorEvidenceDir(ctx.projectRoot, ctx.pipelineId)
+  const ledger = fileIdempotencyLedger(idempotencyDir(ctx.projectRoot))
+  const invocationNamespace = IDEMPOTENCY_NAMESPACES.executorInvocation
   return {
     name: 'executor_run',
     description:
       '对被测系统真实执行指定用例并返回真实执行记录（只传 caseIds，用例定义由 executor 自读 design 产物）。'
-      + '不传 caseIds 表示执行 design 中的全部用例。',
+      + '不传 caseIds 表示执行 design 中的全部用例。'
+      + '同一用例在相同输入下重复调用会重放既有记录，不会重复执行。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -706,7 +755,9 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
       if (designCases.length === 0) {
         return { error: 'design 产物中没有任何带 id 的用例（testCases/reusedCases 均为空）。' }
       }
-      const requestedIds = args?.caseIds === undefined ? designCases.map(entry => entry.id) : stringArray(args.caseIds)
+      const requestedIds = dedupeStrings(
+        args?.caseIds === undefined ? designCases.map(entry => entry.id) : stringArray(args.caseIds),
+      )
       if (requestedIds.length === 0) return { error: 'caseIds 必须是非空字符串数组' }
       const known = new Set(designCases.map(entry => entry.id))
       const unknown = requestedIds.filter(id => !known.has(id))
@@ -714,6 +765,24 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
         // 不在 design 里的用例无法执行：显式失败，避免产出一条"凭空 pass"的记录。
         return { error: `caseIds 不在 design 产物中：${unknown.join(', ')}` }
       }
+
+      // ── 幂等分流：命中台账的用例直接重放，只有未命中的才真正执行 ──────────────
+      const replayable = new Map<string, ExecutorInvocationResult>()
+      const pending: string[] = []
+      const keys = new Map<string, { readonly key: string; readonly fingerprint: string }>()
+      for (const caseId of requestedIds) {
+        const fields = [ctx.pipelineId, caseId, executorInputDigest(ctx.pipelineId, caseId, design.digest, baseUrl)]
+        const key = idempotencyKey(invocationNamespace, fields)
+        keys.set(caseId, { key, fingerprint: idempotencyFingerprint(invocationNamespace, fields) })
+        const record = await ledger.lookup<ExecutorInvocationResult>(invocationNamespace, key)
+        if (record === null) pending.push(caseId)
+        else replayable.set(caseId, record.result)
+      }
+      if (pending.length === 0) {
+        // 全部命中：一个用例都不执行，会话文件一个字节都不改。
+        return { records: requestedIds.map(id => replayable.get(id)!), replayedCaseIds: requestedIds }
+      }
+
       const executor = new HttpExecutor({
         resolveCase: async (id) => {
           const found = designCases.find(entry => entry.id === id)
@@ -731,7 +800,7 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
       })
       const prior = await readSessionFile(sessionPath)
       const last = prior?.records[prior.records.length - 1]
-      const session = await executor.run(requestedIds, {
+      const session = await executor.run(pending, {
         designArtifactPath: artifactPath(ctx.pipelineId, 'design'),
         evidenceDir,
         invocationId: `inv-${Date.now()}`,
@@ -745,14 +814,45 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
         records: [...(prior?.records ?? []), ...session.records],
         evidence: [...(prior?.evidence ?? []), ...session.evidence],
       }
+      // 原子写（tmp → rename）：会话文件是 R4-08/09/10 的对账依据，半截写入等于把真实
+      // 执行数据变成"不可对账"——正是 §6.4 要避免的状态。
       await mkdir(dirname(sessionPath), { recursive: true })
-      await writeFile(sessionPath, JSON.stringify(merged, null, 2), 'utf8')
+      const tmpPath = `${sessionPath}.tmp-${process.pid}`
+      await writeFile(tmpPath, JSON.stringify(merged, null, 2), 'utf8')
+      await rename(tmpPath, sessionPath)
+
+      // 登记台账：记录已在会话里落盘，这里的 produce 是**纯返回**，不产生副作用。
+      // 登记失败不掩盖执行结果——台账是加速器，事实来源始终是会话文件。
+      const produced = new Map<string, ExecutorInvocationResult>()
+      for (const record of session.records) {
+        const summary: ExecutorInvocationResult = {
+          seq: record.seq,
+          caseId: record.caseId,
+          status: record.status,
+          evidenceRefs: record.evidenceRefs,
+          durationMs: record.durationMs,
+        }
+        produced.set(summary.caseId, summary)
+        const entry = keys.get(summary.caseId)
+        if (entry === undefined) continue
+        try {
+          await ledger.run<ExecutorInvocationResult>({
+            namespace: invocationNamespace,
+            key: entry.key,
+            fingerprint: entry.fingerprint,
+            produce: async () => summary,
+          })
+        } catch {
+          // 有意忽略：台账写不进去只会让下一次重试再执行一遍，不会让本次结果失真。
+        }
+      }
+
       // 只回给 agent 记录摘要（不暴露链内部字段），完整记录由宿主供门禁对账。
       return {
-        records: session.records.map(record => ({
-          seq: record.seq, caseId: record.caseId, status: record.status,
-          evidenceRefs: record.evidenceRefs, durationMs: record.durationMs,
-        })),
+        records: requestedIds
+          .map(id => produced.get(id) ?? replayable.get(id))
+          .filter((record): record is ExecutorInvocationResult => record !== undefined),
+        ...(replayable.size === 0 ? {} : { replayedCaseIds: requestedIds.filter(id => replayable.has(id)) }),
       }
     },
   }

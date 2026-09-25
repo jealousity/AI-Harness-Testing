@@ -217,8 +217,8 @@ async function withApp(
 /**
  * 创建流水线；同一 `pipelineId` 已存在时按「复用」处理。
  *
- * 重复创建必须是冲突（验收 1 断言了 409），因此这里不吞掉失败，只是把
- * `conflict` 认作"已经建过了"——多个断言段落共用同一条流水线时不必各自记账。
+ * 两种情况都算"已经建好了"：202（首次创建）与 409（磁盘上已存在但台账里没有本次
+ * 请求的记录，见 docs/10 §6.3 M2-3）。多个断言段落共用同一条流水线时不必各自记账。
  */
 async function createPipeline(app: WebApp): Promise<void> {
   const created = await app.request('POST', `/api/projects/${PROJECT_ID}/pipelines`, { pipelineId: PIPELINE_ID })
@@ -297,10 +297,22 @@ test('验收1：创建流水线返回 202，响应里没有任何 provider 凭�
     // 不回显服务器部署布局。
     assert.equal(JSON.stringify(view.body).includes(app.dir), false)
 
-    // 同一 pipelineId 重复创建必须冲突，而不是静默复用。
+    // 同一 pipelineId 的**同一请求**重复投递走幂等重放：返回首次的 202 结果，
+    // 不再报冲突（docs/10 §6.3 M2-3 / §6.4「重试不产生副作用」）。
     const again = await app.request('POST', `/api/projects/${PROJECT_ID}/pipelines`, { pipelineId: PIPELINE_ID })
-    assert.equal(again.status, 409)
-    assert.equal(again.body.error.code, 'conflict')
+    assert.equal(again.status, 202)
+    assert.equal(again.body.pipelineId, PIPELINE_ID)
+    assert.equal(again.body.status, 'queued')
+
+    // §5.3「绝不静默复用」仍然成立：换了内容的同 id 创建必须冲突。
+    // 键字段（tenantId/projectId/pipelineId）相同，但 rulesetVersion 会写进初始检查点，
+    // 属于创建内容的一部分——指纹不一致即拒。
+    const divergent = await app.request('POST', `/api/projects/${PROJECT_ID}/pipelines`, {
+      pipelineId: PIPELINE_ID,
+      rulesetVersion: 'v2',
+    })
+    assert.equal(divergent.status, 409)
+    assert.equal(divergent.body.error.code, 'conflict')
 
     // 前端页面不得包含任何凭据输入控件（§5.1：浏览器不再上传 key）。
     const page = await fetch(`${app.baseUrl}/`)

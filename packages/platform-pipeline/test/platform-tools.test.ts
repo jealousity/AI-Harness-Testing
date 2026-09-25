@@ -41,12 +41,18 @@ function tool(context: PlatformToolContext, name: string): ToolDefinition {
   return found
 }
 
-async function writeDesign(content: unknown): Promise<void> {
+/**
+ * 写 design 产物。
+ *
+ * `digest` 可显式指定：executor 的幂等键里包含 design 产物 digest（docs/10 §6.3 M2-3），
+ * 因此"设计变了"这件事在测试里必须真的体现在 digest 上，否则重跑会被判成重复投递。
+ */
+async function writeDesign(content: unknown, digest = 'd'): Promise<void> {
   await mkdir(join(dir, 'artifacts', PIPELINE), { recursive: true })
   await writeFile(
     join(dir, 'artifacts', PIPELINE, 'design.json'),
     JSON.stringify({
-      pipelineId: PIPELINE, stageId: 'design', version: 1, digest: 'd', inputs: {},
+      pipelineId: PIPELINE, stageId: 'design', version: 1, digest, inputs: {},
       path: `artifacts/${PIPELINE}/design.json`, content,
     }),
     'utf8',
@@ -470,7 +476,16 @@ test('executor_run really executes cases, writes evidence and a resumable sessio
     const evidenceFiles = await readdir(executorEvidenceDir(dir, PIPELINE))
     assert.equal(evidenceFiles.length, 2)
 
-    // 第二次调用续接链尾，而不是覆盖（覆盖会让先前批次被判"漏跑"）
+    // 第二次调用续接链尾，而不是覆盖（覆盖会让先前批次被判"漏跑"）。
+    // 先推进 design 产物 digest：`inputDigest` 变了才算**新的一轮执行**，
+    // 否则同一批用例会被幂等台账判成重复投递而重放（见下面 executor_run 幂等用例）。
+    await writeDesign({
+      testCases: [
+        { id: 'c1', steps: [{ action: 'GET /health', expected: ['200'] }] },
+        { id: 'c2', steps: [{ action: 'GET /nope', expected: ['200'] }] },
+        { id: 'c3', steps: [{ action: 'GET /health', expected: ['200'] }] },
+      ],
+    }, 'd2')
     const second = await entry.execute({ caseIds: ['c1'] }, ctx) as { records: Array<{ seq: number }> }
     assert.equal(second.records[0]!.seq, 3)
     const merged = JSON.parse(await readFile(executorSessionPath(dir, PIPELINE), 'utf8')) as { records: unknown[] }
@@ -481,6 +496,144 @@ test('executor_run really executes cases, writes evidence and a resumable sessio
     assert.equal(loaded?.evidenceDir, executorEvidenceDir(dir, PIPELINE))
   } finally {
     await server.close()
+  }
+})
+
+// ── executor_run 幂等（docs/10 §6.3 M2-3 / §6.4）──────────────────────────────
+
+/** 起一个本地被测服务并写一份两用例的 design 产物。 */
+async function executorFixture() {
+  const server = await startServer((url) => {
+    if (url === '/health') return { status: 200, body: 'ok' }
+    return { status: 404, body: 'missing' }
+  })
+  await writeDesign({
+    testCases: [
+      { id: 'c1', steps: [{ action: 'GET /health', expected: ['200'] }] },
+      { id: 'c2', steps: [{ action: 'GET /nope', expected: ['200'] }] },
+    ],
+  })
+  return {
+    server,
+    context: baseContext({ targetBaseUrl: server.baseUrl }),
+    sessionFile: executorSessionPath(dir, PIPELINE),
+    evidenceDir: executorEvidenceDir(dir, PIPELINE),
+  }
+}
+
+test('executor_run 幂等：同一批用例重复投递重放首次记录，不重复执行、不改会话', async () => {
+  const fixture = await executorFixture()
+  try {
+    const entry = tool(fixture.context, 'executor_run')
+    const first = await entry.execute({}, ctx) as {
+      records: Array<{ seq: number; caseId: string; status: string; evidenceRefs: string[] }>
+      replayedCaseIds?: string[]
+    }
+    assert.equal(first.replayedCaseIds, undefined)
+    const sessionAfterFirst = await readFile(fixture.sessionFile, 'utf8')
+    const evidenceAfterFirst = (await readdir(fixture.evidenceDir)).length
+
+    // §6.4「同一 executor invocation 重试不会重复产生不可对账记录」。
+    const again = await entry.execute({}, ctx) as typeof first
+    assert.deepEqual(again.records, first.records)
+    assert.deepEqual(again.replayedCaseIds, ['c1', 'c2'])
+    // 会话与证据一个字节都没变：没有第二条 c1/c2 记录 → R4-08 不会判"多余执行"。
+    assert.equal(await readFile(fixture.sessionFile, 'utf8'), sessionAfterFirst)
+    assert.equal((await readdir(fixture.evidenceDir)).length, evidenceAfterFirst)
+
+    // 会话里确实只有两条记录，且 seq 仍是 1、2（没有续接出新记录）。
+    const session = JSON.parse(sessionAfterFirst) as { records: Array<{ seq: number; caseId: string }> }
+    assert.deepEqual(session.records.map(record => [record.seq, record.caseId]), [[1, 'c1'], [2, 'c2']])
+  } finally {
+    await fixture.server.close()
+  }
+})
+
+test('executor_run 幂等只对"同一输入"生效：design 产物 digest 变了就重新执行', async () => {
+  const fixture = await executorFixture()
+  try {
+    const entry = tool(fixture.context, 'executor_run')
+    await entry.execute({ caseIds: ['c1'] }, ctx)
+    await writeDesign({
+      testCases: [
+        { id: 'c1', steps: [{ action: 'GET /health', expected: ['200'] }] },
+        { id: 'c2', steps: [{ action: 'GET /nope', expected: ['200'] }] },
+      ],
+    }, 'd2')
+
+    const rerun = await entry.execute({ caseIds: ['c1'] }, ctx) as { records: Array<{ seq: number }>; replayedCaseIds?: string[] }
+    assert.equal(rerun.replayedCaseIds, undefined)
+    // 续接链尾：新记录 seq = 2，会话累计 2 条——说明确实重新执行了。
+    assert.equal(rerun.records[0]!.seq, 2)
+    const session = JSON.parse(await readFile(fixture.sessionFile, 'utf8')) as { records: unknown[] }
+    assert.equal(session.records.length, 2)
+  } finally {
+    await fixture.server.close()
+  }
+})
+
+test('executor_run 幂等把被测基址算进输入：换了 targetBaseUrl 就是新的一轮执行', async () => {
+  const fixture = await executorFixture()
+  const other = await startServer(() => ({ status: 200, body: 'ok' }))
+  try {
+    await tool(fixture.context, 'executor_run').execute({ caseIds: ['c1'] }, ctx)
+    // 同一用例、同一 design、但打向另一个被测服务 → 不能复用上一轮记录。
+    const moved = await tool(baseContext({ targetBaseUrl: other.baseUrl }), 'executor_run')
+      .execute({ caseIds: ['c1'] }, ctx) as { records: Array<{ seq: number }>; replayedCaseIds?: string[] }
+    assert.equal(moved.replayedCaseIds, undefined)
+    assert.equal(moved.records[0]!.seq, 2)
+  } finally {
+    await other.close()
+    await fixture.server.close()
+  }
+})
+
+test('executor_run 混合批次：只执行未命中的用例，命中项按请求顺序重放', async () => {
+  const fixture = await executorFixture()
+  try {
+    const entry = tool(fixture.context, 'executor_run')
+    await entry.execute({ caseIds: ['c1'] }, ctx)
+    const evidenceBefore = (await readdir(fixture.evidenceDir)).length
+
+    // c1 命中（重放），c2 未命中（执行）；顺序按请求给的顺序回。
+    const mixed = await entry.execute({ caseIds: ['c1', 'c2'] }, ctx) as {
+      records: Array<{ seq: number; caseId: string }>
+      replayedCaseIds?: string[]
+    }
+    assert.deepEqual(mixed.records.map(record => record.caseId), ['c1', 'c2'])
+    assert.deepEqual(mixed.replayedCaseIds, ['c1'])
+    // c1 重放的是 seq 1 的旧记录；c2 是新执行的 seq 2。
+    assert.equal(mixed.records[0]!.seq, 1)
+    assert.equal(mixed.records[1]!.seq, 2)
+    // 只新增了 c2 的证据。
+    assert.equal((await readdir(fixture.evidenceDir)).length, evidenceBefore + 1)
+  } finally {
+    await fixture.server.close()
+  }
+})
+
+test('executor_run 对重复的 caseId 去重：同一次调用里同一个用例不会执行两次', async () => {
+  const fixture = await executorFixture()
+  try {
+    const result = await tool(fixture.context, 'executor_run').execute({ caseIds: ['c1', 'c1', 'c2'] }, ctx) as {
+      records: Array<{ caseId: string }>
+    }
+    assert.deepEqual(result.records.map(record => record.caseId), ['c1', 'c2'])
+    const session = JSON.parse(await readFile(fixture.sessionFile, 'utf8')) as { records: unknown[] }
+    assert.equal(session.records.length, 2)
+  } finally {
+    await fixture.server.close()
+  }
+})
+
+test('executor_run 会话落盘是原子写：目录里不残留 tmp 文件', async () => {
+  const fixture = await executorFixture()
+  try {
+    await tool(fixture.context, 'executor_run').execute({}, ctx)
+    const entries = await readdir(join(dir, 'executor', PIPELINE))
+    assert.deepEqual(entries.filter(name => name.includes('.tmp')), [])
+  } finally {
+    await fixture.server.close()
   }
 })
 

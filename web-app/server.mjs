@@ -377,7 +377,9 @@ const ROUTES = [
       gateTaskId,
       // action 必须显式传入：不存在"缺省即批准"（docs/10 §5.3）。
       action: requiredString(body.action, 'action'),
-      ...optionalFields(body, ['note']),
+      // decisionId 由页面生成、重试沿用同一个：带上它以后重复投递会重放首次裁决结果，
+      // 不会二次驱动门（docs/10 §6.3 M2-3、§6.4）。
+      ...optionalFields(body, ['note', 'decisionId']),
       ...optionalNumbers(body, ['expectedUpdatedAt']),
     }, actorOf(req)))
   }],

@@ -15,6 +15,8 @@
 | `types.ts` | 流水线配置 / 检查点 / 产物核心类型；STAGE_ORDER / STAGE_UPSTREAMS | 02 |
 | `config.ts` | pipeline.yaml/json → PipelineConfig（默认预算/门/规则/交叉检查；规则范围展开） | 02 |
 | `checkpoint.ts` | 检查点原子读写（tmp→rename） | 02/03 |
+| `checkpoint-lock.ts` | 跨进程运行互斥锁：`mkdir` 独占目录 + `owner.json`（`ownerId`/`generation`/`pid`/`host`/`acquiredAt`/`heartbeatAt`）；自动续租；release/renew 同时校验 `ownerId`+`generation`；stale 恢复双判据（同主机 pid 已死 → `dead-holder` 立即接管；否则看 `heartbeatAt` 超期）；抢占走「确认→原子改名→再确认→才删除」并落 `pipeline-lock-audit.jsonl` | 10 §6.3 M2-1 |
+| `idempotency.ts` | 稳定幂等键（`sha256(namespace + 规范化字段)`）与文件幂等台账：命中即重放首次结果、同键不同内容 → `conflict`、`wx` 独占写实现"先写者胜"、损坏记录不锁死键 | 10 §6.3 M2-3 |
 | `acl.ts` + `tool-catalog.ts` | 生效 ACL（平台标准 + 项目 delta）+ 工具目录；校验未知工具/降级标准 deny | 06 |
 | `gates/` | 机器门禁引擎：JSON Schema 子集校验器 + G-01~08 规则（含 G-08 摘要锁） | 01 |
 | `driver.ts` | PipelineDriver 编排核心：恢复续跑 / 门禁重试 / 人工门 / 交叉检查 / 重入级联 | 09/03 |
@@ -94,7 +96,7 @@ await ctx.plugin(platformPipelineHost, {
 ## 状态
 
 - 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）+ 1 份 ADR（docs/adr/0001 文档解析库选型）
-- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **493 项测试全绿**
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **553 项测试全绿**
   - 注：在受限沙箱里跑全量 `node --test` 时，`test/fs-tools.test.ts` 的清理步骤可能被宿主 `safe-delete` 批量删除守卫拦下（按「每轮删除次数 > 阈值」判定，与代码无关）。单独运行该文件即通过。
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
 - Web 运行服务（M0 契约层）：`platform-pipeline/web` 提供无 HTTP 框架依赖的 `PipelineRunService`，覆盖 create/get/list/run/reenter 与人工门 list/claim/decide/cancel，以及 `getStageArtifact`/`listEvents`/`scanPipelineIndex`；Web 状态与阶段视图全部由检查点、产物与人工门任务重建，服务层不复制阶段逻辑。
@@ -102,7 +104,14 @@ await ctx.plugin(platformPipelineHost, {
   - **凭据边界**：API Key 只由服务端按配置里的 `apiKeyEnv` 从环境变量注入，浏览器既不上传也读不到；`configRef` 是服务端白名单逻辑引用（否则等于开放任意文件读取）。
   - **身份边界**：默认**不信任**任何请求头（`PLATFORM_TRUST_ACTOR_HEADERS=1` 才读 `x-actor-*`，且缺 `x-actor-id` 即 401）；后台运行身份**刻意不声明 roles**，因此「后台不得替人裁决」是机器保证而非约定。
   - 接口：`GET /health`、`GET/POST /api/pipelines*`（create `202`、`run`/`cancel` `202`、`gates`、`events`、`stages/:id/artifact`（无产物 `404`）、`reenter`）、`POST /api/gates/:id/{claim,decide,cancel}`、`POST /api/admin/recover`。
-- **文档解析（P0-A1 完成）**：`documents/` 已提供注册表 + 统一中间表示 + **PDF/DOCX/XLSX/Markdown 四类必支持格式** + 文本族与分隔符表格解析器；`parse_doc` 走注册表，返回 `status`/`confidence`/`sections`/`tables`/`plainText`/`sourceRefs`/`diagnostics`/`limits`，并按 §5.6.8 不回传原始字节。`.doc`/`.xls` 按 ADR-0001 §9 显式 `unsupported` 并给出定向转换提示。
+- **并发安全与幂等（P0-C 完成，docs/10 §6）**：`checkpoint-lock.ts` 从 best-effort 目录锁升级为可审计、可恢复、不会误删他人锁的运行互斥。
+  - **锁路径唯一**：`pipelineLockPath(checkpointRoot, pipelineId)` = `checkpoints/<pipelineId>/.pipeline.lock`，CLI / Web / Harness 三个入口共用同一函数——此前 Web 传 per-pipeline 目录、Harness 传 checkpoints 根，拼出的路径不同，等于没锁（§6.2 第 5 条）。
+  - **不会被误抢**：stale 判定**只看 `heartbeatAt`**（不看 `acquiredAt`），锁按 `staleMs/3` 自动续租，因此跑 7 小时的流水线不会被判成死锁；`kill -9` 则由「同主机 + `pid` 不存在」判据立即接管，不必等 6 小时。
+  - **不会误删**：release/renew 同时校验 `ownerId` + `generation`（`generation` 落盘在锁目录**外面**，释放后不归零，同一 ownerId 的两次持有也能区分）；抢占不做 `rm -rf`，而是「读→确认→原子改名到唯一墓碑→再确认→才递归删除」，发现对方刚续租就把墓碑改名放回并记 `stale-refused`。
+  - **幂等键（§6.3 M2-3）**：`pipeline create` = `tenantId/projectId/pipelineId`、`human gate decision` = `gateTaskId/decisionId`、`executor invocation` = `pipelineId/caseId/inputDigest`。重复投递返回**首次结果**而不是报错或重复执行；同一把键换了内容则以 `conflict` 拒绝（§5.3「绝不静默复用」仍然成立）。`executor_run` 的 `inputDigest` 含 design 产物摘要与 `targetBaseUrl`，因此"设计变了/换了被测服务"是新一轮执行，而重试是重放。
+  - **不产生不可对账记录**：executor 会话与幂等台账均原子落盘（tmp→rename）；重复执行同一批用例不再往会话里追加第二条同用例记录（那会被 R4-08 判成 `unexecuted record ... (多余执行)`）。
+  - 双进程与 kill/restart 由 `test/concurrency.test.ts` 用**真实子进程**守卫（互斥、SIGKILL 后立即接管、跨进程抢占、release 不误删他人锁、无 `.stale-*` 残留）。
+- 文档解析（P0-A1 完成）：`documents/` 已提供注册表 + 统一中间表示 + **PDF/DOCX/XLSX/Markdown 四类必支持格式** + 文本族与分隔符表格解析器；`parse_doc` 走注册表，返回 `status`/`confidence`/`sections`/`tables`/`plainText`/`sourceRefs`/`diagnostics`/`limits`，并按 §5.6.8 不回传原始字节。`.doc`/`.xls` 按 ADR-0001 §9 显式 `unsupported` 并给出定向转换提示。
   - `sourceRef` 四级可追溯：`requirements.pdf#page=3`、`spec.docx#heading=1.1,table=1,row=2`、`cases.xlsx#sheet=接口!A2:F20`、`cases.csv#table=1,row=2`。
   - 不伪装：无文本层 → `partial` + `NO_TEXT_LAYER`；无缓存公式值 → `FORMULA_VALUE_UNAVAILABLE` 且**绝不自行计算**；无解析器 → `unsupported`；二进制族 magic 不匹配 → **绝不退回按文本读**。
   - 安全：OOXML 走白名单解包（不读的字节不可能造成危害）+ 逐块实际字节硬上限（不信任 ZIP 声明值）+ 路径穿越即拒绝 + 全内存不落盘；自研 XML 分词器不做实体扩展，XXE 与实体爆炸**构造上不可能**；宏/嵌入对象/ActiveX/外链在解包阶段出局。
