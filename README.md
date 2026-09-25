@@ -6,6 +6,12 @@
 
 > 契约定边界、门禁管产物、ACL 管动作、executor 保执行可信、检查点保恢复、人工门保责任、agent 只管自己那一阶段。
 
+## M0-M4 审计状态
+
+M0-M4 已完成阶段的代码与测试审计见 [`docs/11-m0-m4-audit-and-remediation-plan.md`](docs/11-m0-m4-audit-and-remediation-plan.md)。当前不能把所有 M0-M4 标记为完整正确完成：M0/M3/M4-A 主体完成；M1/M2 仍有参数持久化、权限、人工门 digest、CAS、恢复和 exactly-once 缺口；M4-B 目前是 PostgreSQL/Object Store 接口层与 ADR，尚未有可运行外部 adapter；M5 发布验收尚未收口。
+
+交给 DeepSeek 执行后续整改时，使用 [`docs/prompts/deepseek-m0-m5-execution-constraints.md`](docs/prompts/deepseek-m0-m5-execution-constraints.md)，不得把接口层、测试夹具或文档声明冒充生产实现。
+
 ## Web 应用（通用 runtime 的 HTTP 外壳）
 
 `web-app/` 是浏览器可用的控制台：不依赖 Electron、桌面端配置或本地模型。
