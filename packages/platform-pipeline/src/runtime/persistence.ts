@@ -1,7 +1,13 @@
 import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { StageId } from '../types.ts'
+import {
+  StorageCorruptError,
+  StorageUnavailableError,
+  checkAndStripSchemaVersion,
+  withSchemaVersion,
+} from '../storage/ports.ts'
 
 export type TaskStatus = 'queued' | 'running' | 'waiting-human' | 'retrying' | 'completed' | 'failed' | 'cancelled' | 'expired'
 export type HumanGateTaskStatus = 'pending' | 'claimed' | 'approved' | 'changes-needed' | 'rejected' | 'expired' | 'cancelled'
@@ -96,10 +102,10 @@ export class FileTaskStore implements TaskStore {
     return task
   }
 
-  async get(taskId: string): Promise<TaskRecord | null> { return readJson(this.path(taskId)) }
+  async get(taskId: string): Promise<TaskRecord | null> { return readJson(this.path(taskId), 'task') }
 
   async list(filter: { projectId?: string; pipelineId?: string; status?: TaskStatus } = {}): Promise<readonly TaskRecord[]> {
-    const values = await readAll<TaskRecord>(this.dir)
+    const values = await readAll<TaskRecord>(this.dir, 'task')
     return values.filter(task => (filter.projectId === undefined || task.projectId === filter.projectId)
       && (filter.pipelineId === undefined || task.pipelineId === filter.pipelineId)
       && (filter.status === undefined || task.status === filter.status))
@@ -157,10 +163,10 @@ export class FileHumanGateTaskStore implements HumanGateTaskStore {
     return task
   }
 
-  async get(gateTaskId: string): Promise<HumanGateTask | null> { return readJson(this.path(gateTaskId)) }
+  async get(gateTaskId: string): Promise<HumanGateTask | null> { return readJson(this.path(gateTaskId), 'gate-task') }
 
   async list(filter: { projectId?: string; pipelineId?: string; status?: HumanGateTaskStatus } = {}): Promise<readonly HumanGateTask[]> {
-    const values = await readAll<HumanGateTask>(this.dir)
+    const values = await readAll<HumanGateTask>(this.dir, 'gate-task')
     return values.filter(task => (filter.projectId === undefined || task.projectId === filter.projectId)
       && (filter.pipelineId === undefined || task.pipelineId === filter.pipelineId)
       && (filter.status === undefined || task.status === filter.status))
@@ -215,12 +221,12 @@ export class FileHumanGateTaskStore implements HumanGateTaskStore {
 
 export function newTaskId(prefix = 'task'): string { return `${prefix}-${randomUUID()}` }
 
-async function readAll<T>(dir: string): Promise<T[]> {
+async function readAll<T>(dir: string, kind: 'task' | 'gate-task'): Promise<T[]> {
   try {
     const files = (await readdir(dir)).filter(file => file.endsWith('.json'))
     const values: T[] = []
     for (const file of files) {
-      const value = await readJson<T>(join(dir, file))
+      const value = await readJson<T>(join(dir, file), kind)
       if (value !== null) values.push(value)
     }
     return values
@@ -230,18 +236,49 @@ async function readAll<T>(dir: string): Promise<T[]> {
   }
 }
 
-async function readJson<T>(path: string): Promise<T | null> {
-  try { return JSON.parse(await readFile(path, 'utf8')) as T } catch (error) {
+/**
+ * 读一条 JSON 记录。
+ *
+ * 三种结果必须区分开（docs/10 §8.3 M4-A）：
+ * - 文件不存在 → `null`（正常）；
+ * - JSON 非法 / 形状不符 → 抛 {@link StorageCorruptError}。**绝不返回 null**：
+ *   把"读坏了"当成"没有这条"会让任务/门任务凭空消失，而调用方会据此创建新记录，
+ *   等于用新数据覆盖现场；
+ * - IO/权限错误 → 抛 {@link StorageUnavailableError}。
+ *
+ * 另外先校验并剥掉 `schemaVersion` 存储信封：版本更高的记录必须显式失败，
+ * 且这个纯存储字段不能漏进 `TaskRecord` / `HumanGateTask` 的对外形状。
+ */
+async function readJson<T>(path: string, kind: 'task' | 'gate-task' = 'task'): Promise<T | null> {
+  let raw: string
+  try {
+    raw = await readFile(path, 'utf8')
+  } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-    throw error
+    throw new StorageUnavailableError('file', `read ${basename(path)}`, errorMessageOf(error), { cause: error })
   }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error) {
+    throw new StorageCorruptError(basename(path), kind, `不是合法 JSON（${errorMessageOf(error)}）`)
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new StorageCorruptError(basename(path), kind, '顶层不是对象')
+  }
+  return checkAndStripSchemaVersion(basename(path), kind, parsed as Record<string, unknown>) as unknown as T
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
   await mkdir(join(path, '..'), { recursive: true })
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`
-  await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
+  // 落盘带 `schemaVersion`（docs/10 §8.3 M4-A）；读侧会剥掉，端口形状不变。
+  await writeFile(temp, `${JSON.stringify(withSchemaVersion(value as Record<string, unknown>), null, 2)}\n`, 'utf8')
   await rename(temp, path)
+}
+
+function errorMessageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 async function requireValue<T>(value: Promise<T | null>, message: string): Promise<T> {

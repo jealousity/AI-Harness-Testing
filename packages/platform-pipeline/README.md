@@ -35,6 +35,12 @@
 | `documents/xml.ts` + `documents/zip-reader.ts` | OOXML 的唯一 XML 与 ZIP 入口：自研分词器不做实体扩展（XXE 与实体爆炸**构造上不可能**）；白名单解包使不读的字节不可能造成危害；不信任 ZIP 声明值，按逐块实际字节执行硬上限 | 10 §5.6.5 / ADR-0001 |
 | `runtime/` | 无 Harness 的 StageRunner / LlmClient / ToolRegistry / HumanGate 端口、ScriptedStageRunner、OpenAICompatibleClient、OpenAIStageRunner、TaskStore 与 HumanGateTaskStore、平台标准工具集（`parse_doc`/`kb_*`/`case_*`/`executor_run`/`env_diag`/`req_pull`/`gate_check`） | 方案一 |
 | `usage.ts` | 预算计量与运行遥测：`UsageEvent`（字段集封闭）/ `UsageStore` + append-only JSONL 文件实现（`usage/<pipelineId>.jsonl`，损坏行**显式**返回 `skipped`）/ `UsageRecorder`（补 scope、`eventId`、由两侧时间戳算 `durationMs`）/ `StageBudgetExceededError` / `summarizeUsage` 纯函数（按阶段分组 + `exceeded` 与 `budgetFailures` 双来源 + `tokensAvailable`）。**强制约束发生在内存，落盘只是尽力而为的观测**（`recordUsage` 吞异常） | 10 §7 |
+| `storage/ports.ts` | **存储端口统一面**：9 个端口（`ArtifactStore`/`CheckpointPort`/`TaskStore`/`HumanGateTaskStore`/`UsageStore`/`AuditEventStore`/`KnowledgeStore`/`CaseStore`/`PipelineLock`）+ `StorageBackend`（端口/版本/体检/迁移）+ 记录信封（`STORAGE_SCHEMA_VERSION`、`withSchemaVersion`/`checkAndStripSchemaVersion`）+ 两类存储错误（`StorageUnavailableError` = 基础设施故障、`StorageCorruptError` = 这份数据不能用了）+ `StorageDiagnostic` 六种诊断码 + `assertBackendPorts` 装配校验。核心规则只依赖这里，不依赖任何具体后端 | 10 §8.2 |
+| `storage/file/` | 文件后端装配：`createFileStorageBackend()` + `diagnose()`（六种诊断码，产物只扫 `<artifactsRoot>/artifacts/**`，不从项目根递归）+ `migrate()`（先备份到 `backups/migration-<ts>/`、幂等、逐条报告、损坏只跳过）+ `fileAuditStore()`（append-only `audit.jsonl`，文本脱敏 + 敏感字段名整体丢弃）。**产物/知识条目/JSONL 日志不迁移**（各有明确理由，写在 `migrate()` 的 doc 里） | 10 §8.3 M4-A |
+| `storage/memory/` | 内存后端：**不是测试替身而是真后端**（底下是"键 → JSON 文本"的原始层，端口在其上做解析→版本校验→形状校验），因此 `diagnose`/`migrate`/损坏语义与文件后端同构。用途：证明端口可替换、单元测试、本地演示。**不作为生产后端**（进程结束即丢数据，锁只在进程内有效） | 10 §8.4 |
+| `storage/compose.ts` | `composeStorageBackends()`：把 records（PostgreSQL）与 objects（对象存储）拼成一个完整后端。做四件必须有唯一落点的事：版本一致性校验、端口冲突显式化（不替宿主猜优先级）、能力声明合并、装配即校验必需端口；`portOrigins` 用于排障（"这个端口是谁提供的"） | 10 §8.3 M4-B / ADR-0002 |
+| `storage/postgres/` | PostgreSQL **接口层**（不引 SDK、不建连）：`PostgresClient` 接缝（`query`/`transaction`，SDK 无关）、`postgresSchemaDdl()` 表结构（8 张表，含 CAS 用的 `revision` 与 `generation`）、`POSTGRES_PORT_TABLES` 端口↔表映射、`POSTGRES_TRANSACTION_BOUNDARIES` 事务边界（含"产物先写、检查点后写"的跨存储顺序论证）、`classifyPostgresError()` 按 SQLSTATE 分类。未配置时 `requirePostgresClient()` **明确抛 `StorageUnavailableError`，绝不降级到文件后端** | 10 §8.3 M4-B / ADR-0002 |
+| `storage/object-store/` | 对象存储 **接口层**（不引 SDK、不建连）：`ObjectStoreClient` 接缝、**对象键约定**（`artifacts/`·`evidence/`·`knowledge/`·`cases/`，构造函数而非文档散文）、键安全校验（`..`/绝对路径/空段/未知根前缀/跨项目一律拒绝——对象存储没有目录树，只能自己拦）、`classifyObjectStoreError()`。**不承担**需要 CAS 的端口（检查点/任务/门任务/用量/审计/锁），那些必须在 PostgreSQL 里 | 10 §8.3 M4-B / ADR-0002 |
 | `web/` | 无 HTTP 框架依赖的 `PipelineRunService`：作用域/身份校验、配置装载与缓存、宿主装配、检查点与人工门驱动的 create/get/list/run/reenter/gate-*/artifact/events/usage；Web 状态与阶段视图（12 字段）全部由持久化事实重建。另有 `pipeline-run-registry.ts`（进程内运行句柄，**刻意不导出状态查询**，只存句柄与取消信号）与 `async-runner.ts`（触发/取消/进程重启后的恢复扫描，`decideRecovery` 为纯函数） | 10 §4/§5 |
 
 ## 使用
@@ -68,12 +74,12 @@ export PLATFORM_LLM_API_KEY=...
 
 | 层 | 运行时依赖 | 说明 |
 |---|---|---|
-| 核心（`.`、`/runtime`、`/documents`、`/web`） | `yaml` + `fflate` + `pdfjs-dist` | 不引用任何 `@deepseek-ai/*`；根入口的公开类型面也不含 cordis 类型 |
+| 核心（`.`、`/runtime`、`/documents`、`/web`、`/storage`） | `yaml` + `fflate` + `pdfjs-dist` | 不引用任何 `@deepseek-ai/*`；根入口的公开类型面也不含 cordis 类型 |
 | Harness 适配层（`/harness`、`/harness-plugin`） | `@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-timeout` + 类型级 cordis/dsh-agent/dsh-llm/dsh-subagent/dsh-user-questions | 声明为 **optional peerDependencies**，harness-free 消费者不会被强制安装 |
 
 两个文档解析依赖的许可证与体积已按 docs/10 §5.6.9 记录在 `docs/adr/0001-document-parsing-libraries.md`：`fflate`（MIT，零依赖）与 `pdfjs-dist`（Apache-2.0，零依赖，解压约 33 MiB 且**懒加载**——只有真的解析 PDF 时才 `import()`，markdown/csv 路径不受影响）。
 
-因此：`import 'platform-pipeline'`、`platform-pipeline/runtime`、`platform-pipeline/documents`、`platform-pipeline/web` 在任何环境都可直接使用；只有 `platform-pipeline/harness` 与 `platform-pipeline/harness-plugin` 需要宿主自行安装上表的 Harness 包。这四条不变量由 `test/harness-isolation.test.ts` 持续守卫（核心零引用、peer 声明与实际引用一致、`src/e2e` 不进发布物）。
+因此：`import 'platform-pipeline'`、`platform-pipeline/runtime`、`platform-pipeline/documents`、`platform-pipeline/web`、`platform-pipeline/storage` 在任何环境都可直接使用；只有 `platform-pipeline/harness` 与 `platform-pipeline/harness-plugin` 需要宿主自行安装上表的 Harness 包。这四条不变量由 `test/harness-isolation.test.ts` 持续守卫（核心零引用、peer 声明与实际引用一致、`src/e2e` 不进发布物）。
 
 ## 宿主接线（已完成）
 
@@ -99,8 +105,8 @@ await ctx.plugin(platformPipelineHost, {
 
 ## 状态
 
-- 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）+ 1 份 ADR（docs/adr/0001 文档解析库选型）
-- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **599 项测试全绿**
+- 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）+ 2 份 ADR（docs/adr/0001 文档解析库选型、docs/adr/0002 存储后端选型与事务边界）
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **707 项测试全绿**
   - 注：在受限沙箱里跑全量 `node --test` 时，`test/fs-tools.test.ts` 的清理步骤可能被宿主 `safe-delete` 批量删除守卫拦下（按「每轮删除次数 > 阈值」判定，与代码无关）。单独运行该文件即通过。
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
 - Web 运行服务（M0 契约层）：`platform-pipeline/web` 提供无 HTTP 框架依赖的 `PipelineRunService`，覆盖 create/get/list/run/reenter 与人工门 list/claim/decide/cancel，以及 `getStageArtifact`/`listEvents`/`scanPipelineIndex`；Web 状态与阶段视图全部由检查点、产物与人工门任务重建，服务层不复制阶段逻辑。
@@ -126,6 +132,16 @@ await ctx.plugin(platformPipelineHost, {
   - **两个超限来源并存**：`exceeded`（读日志重算的口径，如一次响应批量调 30 个工具）与 `budgetFailures`（driver 当场停止落盘的权威事实）可能只出现其一，页面要都显示。`wallClockMs` 是**最早开始到最晚结束的跨度**，不是时长之和；`tokensAvailable = llmCalls > 0 && llmCallsWithUsage === llmCalls`（provider 未返回 usage 时不得当成 0 用量）。
   - **隐私边界**：用量事件只记计量数字与标识，**绝不写 API Key、完整 prompt、模型响应正文**；`usageErrorCode` 只映射固定枚举，**绝不返回 `error.message`**。
   - 接口：Web `GET /api/pipelines/:id/usage`、CLI `usage --config <yaml> --data-root <dir> --pipeline-id <id>`（只读、不需要 API Key；检查点缺失时重试事实按 0 计并返回 `checkpointFound: false`）。
+- **存储端口与后端契约（P1-B 完成，docs/10 §8）**：持久化从"文件实现"提升为**可替换的端口**，核心规则只依赖 `src/storage/ports.ts` 的接口。
+  - **端口可替换是被测出来的，不是声称的**：`test/storage-contract.ts` 是一份**后端无关**的参数化契约套件，被三个后端各跑一遍——`file`（31 项）、`memory`（32 项）、`compose`（44 项）。契约只断言"写入后能读回 / 缺失返回 null / 损坏显式失败 / 版本更高必须拒绝"这类语义，**不**断言目录名、文件名、原子 rename、JSONL 行号。只测一个后端时，任何偷偷依赖 fs 语义的实现都会在换后端那天才暴露。
+  - **损坏与缺失是两个概念**：读不到（`ENOENT`）→ `null`（正常）；读坏了（JSON 非法 / 形状不符）→ **抛错**。混淆的后果很具体：检查点被当成"还没开始"而重跑并覆盖现场；用例记录被当成"没有历史版本"而被 archive 覆盖（静默丢数据）。这条修在 `loadCheckpoint` / `readJson` / `MarkdownKnowledgeStore` / `MarkdownCaseStore` 四处。
+  - **两类存储错误分开**：`StorageUnavailableError`（连不上/没权限/磁盘满）与 `StorageCorruptError`（这份数据不能用了）。前者**绝不能**被 driver 归成门禁违规去让 agent 重做（重做一百次也写不进只读盘），也绝不能触发自动批准；Web 层映射成 `storage-unavailable`(503) 而不是 `run-failed`(500)，且走**类型判据**不走中文报错文本匹配（换后端时文本匹配会静默失效）。
+  - **记录信封**：平台自有 JSON 记录带 `schemaVersion`。缺失 = 历史遗留 v1（可迁移）；等于当前 = OK；**低于**当前 = 可迁移；**高于**当前 = 必须显式失败（`StorageSchemaVersionError`），**绝不降级解析**。强制顺序是"先校验并剥掉版本 → 再做形状校验"——版本更高的记录字段可能全变了，先按当前版本解构会得到一堆 `undefined`，把"读不懂"伪装成"空数据"。
+  - **体检与迁移**：`diagnose()` 返回六种诊断码（`missing`/`corrupt-json`/`schema-invalid`/`unsupported-version`/`migration-needed`/`unreadable`），**不抛异常**（单个坏文件不能打断整次体检）；`migrate()` 先备份（`backups/migration-<ts>/`）→ 失败不破坏原件 → 逐条报告（`skipped` 必带原因）→ **幂等**。产物/知识条目/JSONL 日志**不迁移**（改写产物等于篡改 agent 输出；知识元数据行本身就是领域条目；append-only 日志改写会破坏不可篡改）。
+  - **审计与用量分离**：用量是**计量**（高频、可丢、写失败被吞）；审计是**责任链**（低频、必须可查、写失败上抛）。审计 append-only JSONL，读侧损坏行**显式返回** `skipped: [{line, reason}]`；脱敏双保险——文本里 `sk(?:k|-)`/`Bearer-` 形态的 token 替换为 `[redacted]`，字段名命中 `api_key|authorization|bearer|token|secret|password|credential` 整体丢弃。
+  - **外部后端本阶段只交付接口层 + ADR**（`docs/10` §10 P1-B 第 3 条明确允许）：`storage/postgres/` 与 `storage/object-store/` 不引入任何数据库/对象存储 SDK、不做真实连接；交付的是接缝（`PostgresClient`/`ObjectStoreClient`）、表结构与索引、端口↔表/键映射、事务边界、错误分类。未配置时 `requirePostgresClient()` / `requireObjectStoreClient()` **明确抛 `StorageUnavailableError`**——**绝不静默降级到文件后端**（静默降级会让"数据到底写到哪了"变成无法回答的问题）。选型理由、迁移与回滚、以及 6 条**必须在端口层解决**的跨后端待对齐项见 `docs/adr/0002-storage-backends.md`。
+  - **组合是必须的**：PostgreSQL 管不住 MB 级产物，对象存储给不了条件写（检查点/租约/门裁决/锁全是"读改写原子"）。`composeStorageBackends()` 把两者拼成一个后端，并在装配时就拒绝"端口冲突""版本不一致""缺必需端口"——不替宿主猜优先级。
+  - **可重试语义有端到端证据**（§8.4）：产物写成功但检查点写失败时，driver **明确失败、不宣称阶段完成、不调用人工门**；存储恢复后重试能跑完六个阶段。顺序固定为"先写产物、后写检查点"——反过来会得到"声称完成但没有产物"，那才是不可恢复的。
 - 文档解析（P0-A1 完成）：`documents/` 已提供注册表 + 统一中间表示 + **PDF/DOCX/XLSX/Markdown 四类必支持格式** + 文本族与分隔符表格解析器；`parse_doc` 走注册表，返回 `status`/`confidence`/`sections`/`tables`/`plainText`/`sourceRefs`/`diagnostics`/`limits`，并按 §5.6.8 不回传原始字节。`.doc`/`.xls` 按 ADR-0001 §9 显式 `unsupported` 并给出定向转换提示。
   - `sourceRef` 四级可追溯：`requirements.pdf#page=3`、`spec.docx#heading=1.1,table=1,row=2`、`cases.xlsx#sheet=接口!A2:F20`、`cases.csv#table=1,row=2`。
   - 不伪装：无文本层 → `partial` + `NO_TEXT_LAYER`；无缓存公式值 → `FORMULA_VALUE_UNAVAILABLE` 且**绝不自行计算**；无解析器 → `unsupported`；二进制族 magic 不匹配 → **绝不退回按文本读**。

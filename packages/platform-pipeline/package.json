@@ -16,6 +16,7 @@
     "./runtime": "./dist/runtime/index.js",
     "./documents": "./dist/documents/index.js",
     "./web": "./dist/web/index.js",
+    "./storage": "./dist/storage/index.js",
     "./harness": "./dist/harness/index.js",
     "./harness-plugin": "./dist/harness/host-plugin.js",
     "./*.js": "./dist/*.js",

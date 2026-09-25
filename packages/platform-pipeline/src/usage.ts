@@ -27,6 +27,7 @@ import { appendFile, mkdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { STAGE_ORDER, type StageBudget, type StageId } from './types.ts'
+import { checkAndStripSchemaVersion, withSchemaVersion } from './storage/ports.ts'
 
 /** 用量事件的类别（docs/10 §7.2）。 */
 export type UsageKind = 'llm' | 'tool' | 'review' | 'executor' | 'gate' | 'checkpoint'
@@ -148,7 +149,9 @@ export function fileUsageStore(dir: string): UsageStore {
   return {
     async append(event: UsageEvent): Promise<void> {
       await mkdir(dir, { recursive: true })
-      await appendFile(usageLogPath(dir, event.pipelineId), `${JSON.stringify(event)}\n`, 'utf8')
+      // 落盘时带 `schemaVersion`（docs/10 §8.3 M4-A「增加迁移版本字段」）；
+      // 读路径会把它剥掉，因此端口对外的 `UsageEvent` 形状不变。
+      await appendFile(usageLogPath(dir, event.pipelineId), `${JSON.stringify(withSchemaVersion(event as unknown as Record<string, unknown>))}\n`, 'utf8')
     },
     async read(pipelineId: string): Promise<UsageLogRead> {
       const path = usageLogPath(dir, pipelineId)
@@ -168,8 +171,14 @@ export function fileUsageStore(dir: string): UsageStore {
         if (line === '') continue
         try {
           const parsed = JSON.parse(line) as unknown
-          if (!isUsageEvent(parsed)) throw new Error('用量事件字段缺失或类型不符')
-          events.push(parsed)
+          if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new Error('用量事件必须是 JSON 对象')
+          }
+          // 先校验并剥掉存储信封，再校验业务字段：版本更高的行必须被明确拒绝，
+          // 不能"按当前版本硬解"得到一堆 undefined 然后当成一条残缺事件。
+          const body = checkAndStripSchemaVersion(`usage/${pipelineId}.jsonl#L${index + 1}`, 'usage-event', parsed as Record<string, unknown>)
+          if (!isUsageEvent(body)) throw new Error('用量事件字段缺失或类型不符')
+          events.push(body)
         } catch (error) {
           skipped.push({ line: index + 1, reason: errorMessageOf(error) })
         }

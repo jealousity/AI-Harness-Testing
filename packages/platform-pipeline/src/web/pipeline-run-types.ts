@@ -16,6 +16,7 @@
  */
 
 import type { HumanGateTaskStatus } from '../runtime/persistence.ts'
+import { isStorageInfrastructureError, type StorageUnavailableError } from '../storage/ports.ts'
 import type { CheckpointStatus, InputLocks, ReentryRecord, StageId } from '../types.ts'
 
 // ── 作用域与身份（docs/10 §10 P0-A「明确 actor/tenant/project/pipeline scope 类型」）──
@@ -400,6 +401,14 @@ export type PipelineRunErrorCode =
   | 'config-invalid'
   /** 配置声明的 provider 无法解析（缺环境变量、能力不满足）。 */
   | 'provider-unavailable'
+  /**
+   * 存储后端不可用（基础设施故障）。
+   *
+   * 与 `run-failed` 分开的理由（docs/10 §8.4）：这不是"流水线跑失败了"，
+   * 而是"这台存储用不了了"。运维动作完全不同（前者看产物与规则，后者修基础设施），
+   * 而且它**绝不能**被解读成"阶段需要人工批准"。
+   */
+  | 'storage-unavailable'
   /** 其他未归类的运行期异常。 */
   | 'run-failed'
 
@@ -416,6 +425,7 @@ export const PIPELINE_RUN_ERROR_HTTP_STATUS: Readonly<Record<PipelineRunErrorCod
   'gate-consumed': 409,
   'config-invalid': 422,
   'provider-unavailable': 503,
+  'storage-unavailable': 503,
   'run-failed': 500,
 }
 
@@ -501,6 +511,12 @@ export function errorMessageOf(error: unknown): string {
  */
 export function toPipelineRunError(error: unknown, fallback: PipelineRunErrorCode = 'run-failed'): PipelineRunError {
   if (error instanceof PipelineRunError) return error
+  // 存储基础设施故障走**类型判据**而不是文本匹配：它是跨后端的语义（file 是磁盘、
+  // postgres 是连接池），靠中文报错文本去认会在换后端时静默失效。
+  if (isStorageInfrastructureError(error)) {
+    const storage = error as StorageUnavailableError
+    return new PipelineRunError('storage-unavailable', errorMessageOf(error), { backend: storage.backend, operation: storage.operation })
+  }
   const message = errorMessageOf(error)
   const code = classifyMessage(message, fallback)
   return new PipelineRunError(code, message)

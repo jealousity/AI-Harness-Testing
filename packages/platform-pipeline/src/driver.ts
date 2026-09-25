@@ -11,6 +11,7 @@ import { initialCheckpoint } from './checkpoint.ts'
 import { stageRunContext, type SpawnedRun, type StageSpawner } from './stage-spawner.ts'
 import { MachineGateEngine, computeArtifactDigest, type JudgeResult } from './gates/machine.ts'
 import { StageBudgetExceededError, recordUsage, usageErrorCode, type UsageRecordInput, type UsageSink } from './usage.ts'
+import { isStorageInfrastructureError, type ArtifactStore, type CheckpointPort } from './storage/ports.ts'
 import type { ExecutionSession } from './executor/executor.ts'
 import {
   STAGE_ORDER,
@@ -36,21 +37,12 @@ export interface HumanGatePort {
   gateFailed(stageId: StageId, gate: JudgeResult): Promise<void>
 }
 
+/** 产物与检查点端口的声明已迁至 `storage/ports.ts`（docs/10 §8.2），此处再导出以保持既有 import 不变。 */
+export type { ArtifactStore, CheckpointPort }
+
 /** 交叉检查端口（docs/03 第 7 节）：宿主实现为独立审核 agent spawn。 */
 export interface ReviewRunner {
   run(stageId: StageId, artifact: StageArtifact, gate: JudgeResult): Promise<ReviewOutcome>
-}
-
-/** 产物读写端口（宿主实现为 fs）。 */
-export interface ArtifactStore {
-  read(path: string): Promise<StageArtifact | null>
-  /** 可选：将宿主补全后的 wrapper 元数据持久化，保证重启后 digest/inputs 不漂移。 */
-  write?(artifact: StageArtifact): Promise<void>
-}
-
-export interface CheckpointPort {
-  load(root: string): Promise<Checkpoint | null>
-  save(root: string, checkpoint: Checkpoint): Promise<void>
 }
 
 /** executor 执行数据加载（R4-08/09/10 用；宿主从 executor 写入的记录/证据文件读取）。 */
@@ -182,6 +174,10 @@ export class PipelineDriver {
       try {
         artifact = await this.options.artifacts.read(spawned.artifactPath)
       } catch (error) {
+        // 存储**不可用**（基础设施故障）与"产物写坏了"必须分开（docs/10 §8.4）：
+        // 后者是 agent 的输出问题，回喂重跑是对的；前者重跑一百次也写不进一个只读的盘，
+        // 而且继续走 gate-failed → 人工门升级，等于把"存储坏了"包装成"待批准"。
+        if (isStorageInfrastructureError(error)) throw error
         unreadable = error instanceof Error ? error.message : String(error)
       }
       if (artifact === null || unreadable !== undefined) {

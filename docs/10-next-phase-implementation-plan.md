@@ -927,11 +927,18 @@ export interface UsageEvent {
 
 ```text
 packages/platform-pipeline/src/storage/
-  ports.ts
-  file/
-  postgres/
-  object-store/
+  ports.ts          # 端口统一面（9 个端口 + 信封 + 诊断 + 两类存储错误）
+  index.ts          # 子路径出口 platform-pipeline/storage
+  file/             # 文件后端（生产可用）
+  memory/           # 内存后端（契约验证用，不作为生产后端）
+  compose.ts        # 把 records 与 objects 拼成一个完整后端
+  postgres/         # PostgreSQL（本阶段：接口层 + DDL + 事务边界）
+  object-store/     # 对象存储（本阶段：接口层 + 对象键约定）
 ```
+
+`compose.ts` 与 `memory/` 是实作时补上的：PostgreSQL 管不住大对象、对象存储给不了
+条件写，所以真实部署是两者的**组合**，而"组合"必须有唯一落点；`memory/` 则是让
+"同一套契约跑第二个后端"这件事在没有外部基础设施时也能被验证。
 
 不要把数据库连接初始化塞入 `PipelineDriver`。
 
@@ -1055,9 +1062,9 @@ NODE_OPTIONS="--max-old-space-size=6144" ./node_modules/.bin/tsc -p tsconfig.bui
 
 ### P1-B：M4 存储
 
-- [ ] 抽取 storage ports 和 file contract tests。
-- [ ] 文件后端补 schema version、损坏文件诊断、迁移策略。
-- [ ] 评估并实现 PostgreSQL/object-store adapter；若本阶段不部署外部后端，至少交付接口和 ADR。
+- [x] 抽取 storage ports 和 file contract tests。
+- [x] 文件后端补 schema version、损坏文件诊断、迁移策略。
+- [x] 评估并实现 PostgreSQL/object-store adapter；若本阶段不部署外部后端，至少交付接口和 ADR。
 
 ### P0-D：M5 发布
 
@@ -1087,7 +1094,7 @@ NODE_OPTIONS="--max-old-space-size=6144" ./node_modules/.bin/tsc -p tsconfig.bui
 2. ✅ `feat: wire web api to persistent pipeline runtime`
 3. ✅ `fix: harden pipeline lease and idempotency`
 4. ✅ `feat: add usage accounting and budget enforcement`
-5. ⬜ `refactor: extract storage ports and backend contracts`
+5. ✅ `refactor: extract storage ports and backend contracts`
 6. ⬜ `docs: add deployment and recovery runbook`
 
 每个提交都应独立可回滚；不要在未通过 M1 测试前开始 M4 的数据库实现。
