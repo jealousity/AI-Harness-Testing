@@ -32,6 +32,7 @@ import { LlmProviderRegistry, type ResolvedLlmProvider } from '../provider-regis
 import { FsArtifactStore, FsCheckpointPort } from '../stores/fs.ts'
 import { toolById } from '../tool-catalog.ts'
 import { STAGE_ORDER, type PipelineConfig, type StageId } from '../types.ts'
+import { UsageRecorder, fileUsageStore, usageDir } from '../usage.ts'
 import type { DiagSpec } from '../executor/env-diag.ts'
 import { fsReadTool, fsWriteTool } from './fs-tools.ts'
 import { OpenAICompatibleClient } from './openai-client.ts'
@@ -99,11 +100,23 @@ export interface PlatformHost {
   readonly tasks: FileTaskStore
   readonly gate: PersistentHumanGate
   readonly driver: PipelineDriver
+  /** 用量落点（docs/10 §7.3）：`<projectRoot>/usage/<pipelineId>.jsonl`。 */
+  readonly usage: UsageRecorder
 }
 
 /** 人工门任务目录约定（CLI 与宿主共用，避免两处拼路径漂移）。 */
 export function gateTaskStoreDir(projectRoot: string): string {
   return join(projectRoot, 'gates')
+}
+
+/**
+ * 用量日志目录约定（CLI / Web / Harness 三入口共用，避免两处拼路径漂移）。
+ *
+ * 与锁路径分裂（docs/10 §6.2 第 5 条）是同一类错误：各自拼路径会让"预算查询"
+ * 在不同入口给出不同答案。
+ */
+export function usageLogDir(projectRoot: string): string {
+  return usageDir(projectRoot)
 }
 
 /** 通用任务目录约定。 */
@@ -142,15 +155,25 @@ export function createPlatformHost(options: PlatformHostOptions): PlatformHost {
 
   const artifacts = new FsArtifactStore(roots.artifactsRoot)
   const gates = buildGateEngine(config)
-  const tools = buildToolRegistry(roots, options, checkpointRoot)
+  // 用量记录器绑定 (tenant, project, pipeline)：调用点只描述"发生了什么"，
+  // 不自己编 scope 与时长（口径分裂会让 Web 与 CLI 的汇总对不上）。
+  const usage = new UsageRecorder({
+    store: fileUsageStore(usageLogDir(roots.projectRoot)),
+    scope: {
+      tenantId: config.scope?.tenantId ?? 'default',
+      projectId: config.projectId,
+      pipelineId: options.pipelineId,
+    },
+  })
+  const tools = buildToolRegistry(roots, options, checkpointRoot, usage)
   const signal = options.signal
 
   const stageRunner = new OpenAIStageRunner({
-    llm, tools, artifacts, model: provider.model,
+    llm, tools, artifacts, model: provider.model, usage,
     ...(signal === undefined ? {} : { signal }),
   })
   const review = new OpenAIReviewRunner({
-    llm, tools, model: provider.model,
+    llm, tools, model: provider.model, usage,
     ...(signal === undefined ? {} : { signal }),
   })
 
@@ -184,10 +207,11 @@ export function createPlatformHost(options: PlatformHostOptions): PlatformHost {
     execution: createExecutionLoader(roots.projectRoot, options.pipelineId),
     ...(options.receiveInput === undefined ? {} : { receiveInput: options.receiveInput }),
     ...(options.maxGateRetries === undefined ? {} : { maxGateRetries: options.maxGateRetries }),
+    usage,
     ...(signal === undefined ? {} : { signal }),
   })
 
-  return { roots, checkpointRoot, provider, llm, tools, artifacts, gateTasks, tasks, gate, driver }
+  return { roots, checkpointRoot, provider, llm, tools, artifacts, gateTasks, tasks, gate, driver, usage }
 }
 
 /**
@@ -254,6 +278,7 @@ function buildToolRegistry(
   roots: PlatformStorageRoots,
   options: PlatformHostOptions,
   checkpointRoot: string,
+  usage: UsageRecorder,
 ): ToolRegistry {
   const registry = new InMemoryToolRegistry()
   registry.register(fsReadTool({ root: roots.projectRoot }))
@@ -271,6 +296,7 @@ function buildToolRegistry(
     ...(options.diagProbes === undefined ? {} : { diagProbes: options.diagProbes }),
     ...(options.diagTimeoutMs === undefined ? {} : { diagTimeoutMs: options.diagTimeoutMs }),
     ...(options.env === undefined ? {} : { env: options.env }),
+    usage,
   })) {
     registry.register(tool)
   }

@@ -1008,48 +1008,50 @@ NODE_OPTIONS="--max-old-space-size=6144" ./node_modules/.bin/tsc -p tsconfig.bui
 
 以下清单可以直接逐项交给实现模型。每完成一项，都要先补测试再改实现，并保持小提交。
 
+进度：P0-A / P0-A1 / P0-B / P0-C / P1-A **已完成**（对应提交见 §12）；P1-B、P0-D **待做**。状态细节以 `packages/platform-pipeline/README.md` 的「状态」节为准。
+
 ### P0-A：M0 契约
 
-- [ ] 阅读并确认 `driver.ts`、`runtime/ports.ts`、`platform-host.ts`、`persistence.ts`、`platform-tools.ts`。
-- [ ] 新增 `PipelineRunService` 类型和错误映射，不接 HTTP。
-- [ ] 用 ScriptedStageRunner 写 service contract tests。
-- [ ] 明确 actor/tenant/project/pipeline scope 类型。
+- [x] 阅读并确认 `driver.ts`、`runtime/ports.ts`、`platform-host.ts`、`persistence.ts`、`platform-tools.ts`。
+- [x] 新增 `PipelineRunService` 类型和错误映射，不接 HTTP。
+- [x] 用 ScriptedStageRunner 写 service contract tests。
+- [x] 明确 actor/tenant/project/pipeline scope 类型。
 
 ### P0-A1：文档解析与知识库导入
 
-- [ ] 新增 `documents/` 解析器注册表和 `ParsedDocument` 统一中间表示。
-- [ ] 实现 PDF、DOCX/可选 DOC、XLSX/可选 XLS、Markdown、CSV/TSV、TXT/YAML/JSON 解析器。
-- [ ] PDF 保留页码，Word 保留章节/表格，Excel 保留 sheet/range，Markdown 保留 heading/table/code block。
-- [ ] 所有解析器实现文件大小、页数、sheet 数、行数、字符数、解压大小和超时限制。
-- [ ] 禁止宏、PDF JavaScript、外链下载、XML 外部实体、OLE/嵌入对象和任意代码执行。
-- [ ] `.doc`/`.xls` 如果没有安全解析器必须返回 `unsupported`，不能按文本读取或假装支持。
-- [ ] `parse_doc` 返回 `status`、`confidence`、`sections`、`tables`、`plainText`、`diagnostics`、`limits` 和 `sourceRefs`。
-- [ ] 文档解析只生成 `draft` 知识条目；active 写入仍走机器校验、人工门、冲突治理和回读验证。
-- [ ] 增加正常、损坏、加密、超限、恶意压缩、路径越界、AbortSignal、重复导入和 sourceRef 回读测试。
-- [ ] 写 ADR 记录解析库、Node 兼容性、许可证、沙箱方式、失败降级和 `.doc`/`.xls` 支持策略。
+- [x] 新增 `documents/` 解析器注册表和 `ParsedDocument` 统一中间表示。
+- [x] 实现 PDF、DOCX/可选 DOC、XLSX/可选 XLS、Markdown、CSV/TSV、TXT/YAML/JSON 解析器。
+- [x] PDF 保留页码，Word 保留章节/表格，Excel 保留 sheet/range，Markdown 保留 heading/table/code block。
+- [x] 所有解析器实现文件大小、页数、sheet 数、行数、字符数、解压大小和超时限制。
+- [x] 禁止宏、PDF JavaScript、外链下载、XML 外部实体、OLE/嵌入对象和任意代码执行。
+- [x] `.doc`/`.xls` 如果没有安全解析器必须返回 `unsupported`，不能按文本读取或假装支持。
+- [x] `parse_doc` 返回 `status`、`confidence`、`sections`、`tables`、`plainText`、`diagnostics`、`limits` 和 `sourceRefs`。
+- [x] 文档解析只生成 `draft` 知识条目；active 写入仍走机器校验、人工门、冲突治理和回读验证。
+- [x] 增加正常、损坏、加密、超限、恶意压缩、路径越界、AbortSignal、重复导入和 sourceRef 回读测试。
+- [x] 写 ADR 记录解析库、Node 兼容性、许可证、沙箱方式、失败降级和 `.doc`/`.xls` 支持策略。
 
 ### P0-B：M1 Web 接入
 
-- [ ] 把 Web API Key 输入改为服务端 provider 配置；浏览器不再上传 key。
-- [ ] 新增 Web service，所有运行通过 `createPlatformHost` + `PipelineDriver`。
-- [ ] 删除或停用 Web 自建 `promptFor`、`callModel`、`runPipeline`。
-- [ ] 新增 create/get/run/gates/claim/decide/cancel/reenter API。
-- [ ] 前端显示真实阶段状态、人工门任务、机器违规和审核 findings。
-- [ ] 增加 Web 进程重启后的恢复测试。
+- [x] 把 Web API Key 输入改为服务端 provider 配置；浏览器不再上传 key。
+- [x] 新增 Web service，所有运行通过 `createPlatformHost` + `PipelineDriver`。
+- [x] 删除或停用 Web 自建 `promptFor`、`callModel`、`runPipeline`。
+- [x] 新增 create/get/run/gates/claim/decide/cancel/reenter API。
+- [x] 前端显示真实阶段状态、人工门任务、机器违规和审核 findings。
+- [x] 增加 Web 进程重启后的恢复测试。
 
 ### P0-C：M2 并发
 
-- [ ] 强化 `checkpoint-lock.ts` 的 owner/generation/heartbeat/stale recovery。
-- [ ] CLI 与 Web 复用相同 lock 路径和 acquire/release 逻辑。
-- [ ] 为 pipeline create、gate decision、executor invocation 增加幂等键。
-- [ ] 增加双进程和 kill/restart 测试。
+- [x] 强化 `checkpoint-lock.ts` 的 owner/generation/heartbeat/stale recovery。
+- [x] CLI 与 Web 复用相同 lock 路径和 acquire/release 逻辑。
+- [x] 为 pipeline create、gate decision、executor invocation 增加幂等键。
+- [x] 增加双进程和 kill/restart 测试。
 
 ### P1-A：M3 预算
 
-- [ ] 新增 UsageEvent/UsageStore 和文件实现。
-- [ ] 接入 LLM usage、tool steps、review、executor、耗时。
-- [ ] 超限时写 checkpoint failure，不自动进入人工批准。
-- [ ] Web/CLI 提供 usage 查询。
+- [x] 新增 UsageEvent/UsageStore 和文件实现。
+- [x] 接入 LLM usage、tool steps、review、executor、耗时。
+- [x] 超限时写 checkpoint failure，不自动进入人工批准。
+- [x] Web/CLI 提供 usage 查询。
 
 ### P1-B：M4 存储
 
@@ -1081,12 +1083,12 @@ NODE_OPTIONS="--max-old-space-size=6144" ./node_modules/.bin/tsc -p tsconfig.bui
 
 建议不要把所有里程碑合并成一个大提交：
 
-1. `feat: add framework-neutral web pipeline service`
-2. `feat: wire web api to persistent pipeline runtime`
-3. `fix: harden pipeline lease and idempotency`
-4. `feat: add usage accounting and budget enforcement`
-5. `refactor: extract storage ports and backend contracts`
-6. `docs: add deployment and recovery runbook`
+1. ✅ `feat: add framework-neutral web pipeline service`
+2. ✅ `feat: wire web api to persistent pipeline runtime`
+3. ✅ `fix: harden pipeline lease and idempotency`
+4. ✅ `feat: add usage accounting and budget enforcement`
+5. ⬜ `refactor: extract storage ports and backend contracts`
+6. ⬜ `docs: add deployment and recovery runbook`
 
 每个提交都应独立可回滚；不要在未通过 M1 测试前开始 M4 的数据库实现。
 

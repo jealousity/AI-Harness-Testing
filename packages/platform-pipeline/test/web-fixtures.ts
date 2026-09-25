@@ -27,6 +27,15 @@ import { OpenAICompatibleClient } from '../src/runtime/openai-client.ts'
 import type { ResolvedLlmProvider } from '../src/provider-registry.ts'
 import { FsArtifactStore, FsCheckpointPort } from '../src/stores/fs.ts'
 import type { SpawnRequest, SpawnedRun, StageSpawner } from '../src/stage-spawner.ts'
+import {
+  StageBudgetExceededError,
+  UsageRecorder,
+  fileUsageStore,
+  recordUsage,
+  usageDir,
+  type UsageLimitKind,
+  type UsageSink,
+} from '../src/usage.ts'
 import type { PlatformHostFactory } from '../src/web/pipeline-run-service.ts'
 import type { ActorContext, CreatePipelineRunInput } from '../src/web/pipeline-run-types.ts'
 
@@ -90,6 +99,21 @@ export interface ScriptedHostOptions {
    * 可以"等另一个进程的信号"的，而不是只能等一个固定时长。
    */
   readonly beforeStage?: (request: SpawnRequest) => Promise<void>
+  /**
+   * 每次 spawn 写入的用量事件条数（脚本化宿主的用量替身）。
+   *
+   * 真实阶段会发起多次模型调用与工具调用，脚本化运行器没有这些动作，
+   * 因此由这里"声明"它代表多少消耗——测试要断言 `used/limit/exceeded` 时才有事实可算。
+   * 缺省 `{ llm: 1, tool: 1 }`。
+   */
+  readonly usagePerStage?: { readonly llm?: number; readonly tool?: number }
+  /**
+   * 这些阶段在 spawn 时直接抛预算超限（验证 docs/10 §7.3 的失败路径：
+   * 阶段失败 + 检查点可恢复 + 不进入人工批准）。
+   */
+  readonly budgetExceededStages?: readonly StageId[]
+  /** 超限维度；缺省 `max-steps`。 */
+  readonly budgetExceededKind?: UsageLimitKind
 }
 
 /** 记录 spawn 调用的脚本化运行器：用于断言"已批准阶段不重生成"。 */
@@ -97,11 +121,19 @@ export class RecordingSpawner implements StageSpawner {
   readonly stages: StageId[] = []
   private readonly inner: ScriptedStageRunner
   private readonly beforeStage: ((request: SpawnRequest) => Promise<void>) | undefined
+  private readonly usage: UsageSink | undefined
+  private readonly usagePerStage: { readonly llm: number; readonly tool: number }
+  private readonly budgetExceededStages: ReadonlySet<StageId>
+  private readonly budgetExceededKind: UsageLimitKind
   private call: number
 
-  constructor(artifacts: ArtifactStore, options: ScriptedHostOptions = {}) {
+  constructor(artifacts: ArtifactStore, options: ScriptedHostOptions = {}, usage?: UsageSink) {
     this.call = options.initialCall ?? 0
     this.beforeStage = options.beforeStage
+    this.usage = usage
+    this.usagePerStage = { llm: options.usagePerStage?.llm ?? 1, tool: options.usagePerStage?.tool ?? 1 }
+    this.budgetExceededStages = new Set(options.budgetExceededStages ?? [])
+    this.budgetExceededKind = options.budgetExceededKind ?? 'max-steps'
     this.inner = new ScriptedStageRunner(artifacts, ({ request }) => {
       this.call += 1
       const call = this.call
@@ -115,7 +147,35 @@ export class RecordingSpawner implements StageSpawner {
   async runStage(request: SpawnRequest, cfg: PipelineConfig): Promise<SpawnedRun> {
     this.stages.push(request.stageId)
     if (this.beforeStage !== undefined) await this.beforeStage(request)
-    return await this.inner.runStage(request, cfg)
+    if (this.budgetExceededStages.has(request.stageId)) {
+      const budget = cfg.stages[request.stageId].budget
+      const limit = this.budgetExceededKind === 'timeout' ? budget.timeoutMs : budget.maxSteps
+      throw new StageBudgetExceededError(request.stageId, {
+        kind: this.budgetExceededKind,
+        used: limit + 1,
+        limit,
+      })
+    }
+    const spawned = await this.inner.runStage(request, cfg)
+    await this.emitUsage(request.stageId)
+    return spawned
+  }
+
+  /** 每次 spawn 记一组用量事件（`llm` + `tool`），代表这个阶段"确实跑了活"。 */
+  private async emitUsage(stageId: StageId): Promise<void> {
+    if (this.usage === undefined) return
+    const at = Date.now()
+    for (let index = 0; index < this.usagePerStage.llm; index += 1) {
+      await recordUsage(this.usage, {
+        stageId, kind: 'llm', startedAt: at, finishedAt: at, success: true,
+        inputTokens: 10, outputTokens: 5,
+      })
+    }
+    for (let index = 0; index < this.usagePerStage.tool; index += 1) {
+      await recordUsage(this.usage, {
+        stageId, kind: 'tool', startedAt: at, finishedAt: at, success: true, toolName: 'fs_read',
+      })
+    }
   }
 }
 
@@ -146,7 +206,17 @@ export class ScriptedHost {
     const roots = resolvePlatformRoots(options.dataRoot, options.config)
     const checkpointRoot = join(roots.checkpointRoot, options.pipelineId)
     const artifacts = new FsArtifactStore(roots.artifactsRoot)
-    this.spawner ??= new RecordingSpawner(artifacts, this.options)
+    // 用量记录器与生产同源（同一份 `usageDir` + `UsageRecorder`），否则"预算查询"
+    // 在测试里走的是另一套路径，等于没验证 docs/10 §7.3。
+    const usage = new UsageRecorder({
+      store: fileUsageStore(usageDir(roots.projectRoot)),
+      scope: {
+        tenantId: options.config.scope?.tenantId ?? 'default',
+        projectId: options.config.projectId,
+        pipelineId: options.pipelineId,
+      },
+    })
+    this.spawner ??= new RecordingSpawner(artifacts, this.options, usage)
     const spawner = this.spawner
     const gateTasks = new FileHumanGateTaskStore(gateTaskStoreDir(roots.projectRoot))
     const tasks = new FileTaskStore(taskStoreDir(roots.projectRoot))
@@ -178,6 +248,7 @@ export class ScriptedHost {
       human: gate,
       artifacts,
       checkpoint: new FsCheckpointPort(),
+      usage,
     })
     return {
       roots,
@@ -195,6 +266,7 @@ export class ScriptedHost {
       tasks,
       gate,
       driver,
+      usage,
     }
   }
 }

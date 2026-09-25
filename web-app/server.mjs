@@ -331,6 +331,12 @@ const ROUTES = [
     json(res, 200, { events: await service.listEvents(pipelineId, actorOf(req)) })
   }],
 
+  ['GET', /^\/api\/pipelines\/([^/]+)\/usage$/, async (req, res, pipelineId) => {
+    // 用量与预算（docs/10 §7.3）：事实来自持久化用量日志 + 检查点重试事实，
+    // 因此 Web 与 CLI 对同一条流水线给出一致的 used/limit/exceeded。
+    json(res, 200, await service.getUsage(pipelineId, actorOf(req)))
+  }],
+
   ['GET', /^\/api\/pipelines\/([^/]+)\/stages\/([^/]+)\/artifact$/, async (req, res, pipelineId, stageId) => {
     const artifact = await service.getStageArtifact(pipelineId, stageId, actorOf(req))
     if (artifact === null) {

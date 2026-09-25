@@ -728,3 +728,44 @@ test('错误映射：configRef 白名单、未知流水线 404、非法裁决 40
     assert.equal(cross.body.error.code, 'not-found')
   })
 })
+
+// ── 验收 9：用量与预算查询（docs/10 §7.3 / §7.4）─────────────────────────────
+
+test('验收9：Web 与 CLI 都能查询用量与预算，读的是同一份持久化日志', async () => {
+  await withApp(async app => {
+    await createPipeline(app)
+    await app.request('POST', `/api/pipelines/${PIPELINE_ID}/run`)
+    const view = await app.settle()
+    assert.equal(view.status, 'waiting-human')
+
+    const res = await app.request('GET', `/api/pipelines/${PIPELINE_ID}/usage`)
+    assert.equal(res.status, 200, `usage 查询失败：${JSON.stringify(res.body)}`)
+    assert.equal(res.body.pipelineId, PIPELINE_ID)
+    // 六个阶段全部出现（未跑过的阶段 used 为 0，budget 仍如实回显）。
+    assert.deepEqual(
+      res.body.stages.map((stage: any) => stage.stageId),
+      ['receive', 'analyze', 'design', 'execute', 'report', 'archive'],
+    )
+    const receive = res.body.stages.find((stage: any) => stage.stageId === 'receive')
+    assert.ok(receive.totals.llmCalls >= 1, `receive 应记录到模型调用：${JSON.stringify(receive.totals)}`)
+    assert.ok(receive.totals.toolSteps >= 1)
+    assert.equal(receive.budget.maxSteps, 20)
+    assert.equal(receive.budget.timeoutMs, 600_000)
+    assert.equal(res.body.skippedLines, 0)
+    assert.equal(res.body.budgetFailures, 0)
+    // 预算查询不得带出任何 provider 凭据。
+    assert.equal(JSON.stringify(res.body).includes('sk-'), false)
+
+    // CLI 走只读通道（不需要 API Key），读到与 Web 完全一致的 used/limit。
+    const cliUsage = await cliJson(app, 'usage')
+    assert.deepEqual(cliUsage.stages, res.body.stages)
+    assert.deepEqual(cliUsage.totals, res.body.totals)
+    assert.equal(cliUsage.pipelineId, PIPELINE_ID)
+    assert.equal(cliUsage.checkpointFound, true)
+    assert.ok(cliUsage.events >= 1)
+
+    // 未登记的流水线：404，而不是返回一份"用量为 0"的假报告。
+    const missing = await app.request('GET', '/api/pipelines/nope/usage')
+    assert.equal(missing.status, 404, JSON.stringify(missing.body))
+  })
+})

@@ -16,6 +16,7 @@ import { assembleReviewPrompt } from '../prompt/review.ts'
 import type { ReviewOutcome, ReviewRunner } from '../driver.ts'
 import type { JudgeResult } from '../gates/machine.ts'
 import type { StageArtifact, StageId } from '../types.ts'
+import { recordUsage, type UsageRecordInput, type UsageSink } from '../usage.ts'
 import type { LlmClient, LlmMessage, LlmResponse, ToolDefinition, ToolRegistry } from './ports.ts'
 
 /** 审核默认只能用的工具（盲审只读；docs/03 第 7 节）。 */
@@ -32,13 +33,25 @@ export interface OpenAIReviewRunnerOptions {
   readonly systemPrompt?: string
   readonly maxToolSteps?: number
   readonly signal?: AbortSignal
+  /**
+   * 用量落点（docs/10 §7.3「review 使用独立预算，不能吞掉 stage 主预算」）。
+   *
+   * 审核的模型调用与工具调用一律记成 `kind: 'review'`（工具调用额外带 `toolName`），
+   * **不记成 `llm`/`tool`**：汇总层据此把审核消耗与阶段主预算分开统计，
+   * 否则一次昂贵的盲审会让阶段看起来"步数用尽"。
+   */
+  readonly usage?: UsageSink
+  /** 时钟注入（测试用）。 */
+  readonly now?: () => number
 }
 
 export class OpenAIReviewRunner implements ReviewRunner {
   private readonly options: OpenAIReviewRunnerOptions
+  private readonly now: () => number
 
   constructor(options: OpenAIReviewRunnerOptions) {
     this.options = options
+    this.now = options.now ?? (() => Date.now())
   }
 
   async run(stageId: StageId, artifact: StageArtifact, gate: JudgeResult): Promise<ReviewOutcome> {
@@ -69,25 +82,55 @@ export class OpenAIReviewRunner implements ReviewRunner {
       { role: 'user', content: prompt },
     ]
     const maxSteps = this.options.maxToolSteps ?? DEFAULT_MAX_REVIEW_STEPS
+    const record = (input: UsageRecordInput): Promise<void> => recordUsage(this.options.usage, input)
 
     let response: LlmResponse | undefined
     for (let step = 0; step < maxSteps; step += 1) {
-      response = await this.options.llm.complete({
-        model: this.options.model,
-        messages,
-        ...(tools.length === 0 ? {} : { tools }),
-        responseFormat: { type: 'json_object' },
-        signal: this.options.signal,
-      })
+      const callStartedAt = this.now()
+      try {
+        response = await this.options.llm.complete({
+          model: this.options.model,
+          messages,
+          ...(tools.length === 0 ? {} : { tools }),
+          responseFormat: { type: 'json_object' },
+          signal: this.options.signal,
+        })
+        await record({
+          stageId,
+          kind: 'review',
+          startedAt: callStartedAt,
+          finishedAt: this.now(),
+          success: true,
+          ...(response.usage?.inputTokens === undefined ? {} : { inputTokens: response.usage.inputTokens }),
+          ...(response.usage?.outputTokens === undefined ? {} : { outputTokens: response.usage.outputTokens }),
+        })
+      } catch (error) {
+        await record({
+          stageId,
+          kind: 'review',
+          startedAt: callStartedAt,
+          finishedAt: this.now(),
+          success: false,
+          errorCode: error instanceof Error ? (error.name === 'Error' ? 'review-failed' : error.name) : 'unknown-error',
+        })
+        throw error
+      }
       if (response.toolCalls === undefined || response.toolCalls.length === 0) break
       messages.push({ role: 'assistant', content: response.content, toolCalls: response.toolCalls })
       for (const call of response.toolCalls) {
-        messages.push({
-          role: 'tool',
-          toolCallId: call.id,
+        const toolStartedAt = this.now()
+        const content = await runReviewTool(tools.find(candidate => candidate.name === call.name), call, stageId, artifact.pipelineId, this.options.signal)
+        await record({
+          stageId,
+          kind: 'review',
+          startedAt: toolStartedAt,
+          finishedAt: this.now(),
+          // 审核工具不可用/失败时 `runReviewTool` 返回结构化 error 而不是抛异常，
+          // 因此这里按"没有抛"记 success；失败细节仍在回喂给模型的内容里。
+          success: true,
           toolName: call.name,
-          content: await runReviewTool(tools.find(candidate => candidate.name === call.name), call, stageId, artifact.pipelineId, this.options.signal),
         })
+        messages.push({ role: 'tool', toolCallId: call.id, toolName: call.name, content })
       }
     }
 

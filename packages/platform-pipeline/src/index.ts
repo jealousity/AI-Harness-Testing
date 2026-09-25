@@ -94,6 +94,33 @@ export {
 } from './idempotency.ts'
 
 export {
+  UsageRecorder,
+  StageBudgetExceededError,
+  budgetFailuresOf,
+  fileUsageStore,
+  nullUsageSink,
+  recordUsage,
+  retryFactsOf,
+  summarizeUsage,
+  usageDir,
+  usageErrorCode,
+  usageLogPath,
+  type StageRetryFacts,
+  type StageUsageSummary,
+  type SummarizeUsageOptions,
+  type UsageEvent,
+  type UsageKind,
+  type UsageLimitExceeded,
+  type UsageLimitKind,
+  type UsageLogRead,
+  type UsageRecordInput,
+  type UsageSink,
+  type UsageStore,
+  type UsageSummary,
+  type UsageTotals,
+} from './usage.ts'
+
+export {
   LlmProviderRegistry,
   providerRegistry,
   type ProviderCapabilityRequirement,

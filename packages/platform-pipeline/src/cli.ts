@@ -4,7 +4,7 @@
  * 两条通道：
  * - **无 Harness 运行通道**：`run` / `reenter` / `gate-*` 由本 CLI 自己装配宿主
  *   （`createPlatformHost`），不再要求外部注入 spawner/human。
- * - **只读检查通道**：`validate` / `status` / `knowledge-import`，不需要 API Key。
+ * - **只读检查通道**：`validate` / `status` / `usage` / `knowledge-import`，不需要 API Key。
  *
  * 人工门是**挂起式**的：`run` 遇到门且 `--wait-ms` 内无人裁决时打印待办并退出（退出码 3），
  * 裁决后再执行一次 `run` 即从该门续跑（产物不重生成、审核不重跑）。
@@ -19,6 +19,7 @@ import { acquirePipelineLock, fileLockAudit, lockAuditPath } from './checkpoint-
 import { loadPipelineConfig } from './config.ts'
 import { validatePipelineAcl } from './acl.ts'
 import { STAGE_ORDER, type StageId } from './types.ts'
+import { budgetFailuresOf, fileUsageStore, retryFactsOf, summarizeUsage, usageDir } from './usage.ts'
 import { ingestKnowledgeFile } from './knowledge-import.ts'
 import { MarkdownKnowledgeStore } from './stores/markdown.ts'
 import { resolvePlatformRoots } from './platform-roots.ts'
@@ -132,6 +133,33 @@ async function status(args: readonly string[]): Promise<void> {
     reentries: checkpoint.reentries.length,
     stages,
   })
+}
+
+/**
+ * 用量与预算查询（docs/10 §7.3「预算超限可在 Web/CLI 查询」）。
+ *
+ * 只读通道：读磁盘上的用量日志 + 检查点，**不需要 API Key**——运维同学要在没有模型凭据的
+ * 机器上查"这个阶段为什么被判超预算"。
+ *
+ * 检查点缺失时仍然返回用量（附 `checkpointFound: false`）：日志可能来自已被删除的
+ * 检查点，此时把重试事实按 0 计并显式声明，而不是编一个状态出来。
+ */
+async function usage(args: readonly string[]): Promise<void> {
+  const pipelineId = requireArg(args, '--pipeline-id')
+  const cfg = await loadPipelineConfig(requireArg(args, '--config'))
+  const roots = resolvePlatformRoots(requireArg(args, '--data-root'), cfg)
+  const checkpoint = await loadCheckpoint(join(roots.checkpointRoot, pipelineId))
+  const read = await fileUsageStore(usageDir(roots.projectRoot)).read(pipelineId)
+  const summary = summarizeUsage(read.events, {
+    pipelineId,
+    budgetOf: stageId => cfg.stages[stageId]!.budget,
+    retriesOf: stageId => checkpoint === null
+      ? { gateRetries: 0, reviewRetries: 0 }
+      : retryFactsOf(checkpoint.stageStates[stageId]!),
+    budgetFailuresOf: stageId => checkpoint === null ? 0 : budgetFailuresOf(checkpoint.stageStates[stageId]!),
+    skippedLines: read.skipped.length,
+  })
+  printJson({ ...summary, checkpointFound: checkpoint !== null, events: read.events.length })
 }
 
 // ── 无 Harness 运行通道 ─────────────────────────────────────────────────────
@@ -316,6 +344,7 @@ const USAGE = [
   '  node src/cli.ts run --config <pipeline.yaml> --data-root <dir> --pipeline-id <id> [--input <file>] [--wait-ms <n>] [--provider <name>] [--target-base-url <url>] [--diag-credential <ENV_VAR,...>]',
   '  node src/cli.ts status --config <pipeline.yaml> --data-root <dir> --pipeline-id <id>',
   '  node src/cli.ts status --checkpoint-root <dir> --pipeline-id <id>',
+  '  node src/cli.ts usage --config <pipeline.yaml> --data-root <dir> --pipeline-id <id>',
   '  node src/cli.ts reenter --config <pipeline.yaml> --data-root <dir> --pipeline-id <id> --stage <id> --by <actor> --reason <text>',
   '  node src/cli.ts gate-list --config <pipeline.yaml> --data-root <dir> [--pipeline-id <id>] [--status <s>] [--sweep]',
   '  node src/cli.ts gate-claim --config <pipeline.yaml> --data-root <dir> --task <id> --actor <actor> [--ttl-ms <n>]',
@@ -330,6 +359,7 @@ async function main(): Promise<void> {
   const command = args[0]
   if (command === 'validate') { await validate(requireArg(args, '--config')); return }
   if (command === 'status') { await status(args); return }
+  if (command === 'usage') { await usage(args); return }
   if (command === 'run') { await run(args); return }
   if (command === 'reenter') { await reenter(args); return }
   if (command === 'gate-list') { await gateList(args); return }

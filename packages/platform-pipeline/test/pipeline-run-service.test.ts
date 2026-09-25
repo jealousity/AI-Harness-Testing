@@ -947,3 +947,106 @@ test('run 在宿主装配失败时抛错，但锁一定被释放（不会把流�
   await assert.rejects(() => service.run('pipe-1', REVIEWER), /装配失败（测试注入）/)
   assert.equal(existsSync(lockPath), false, '异常路径也必须释放锁')
 })
+
+// ── M3：用量与预算查询（docs/10 §7.3 / §7.4）────────────────────────────────
+
+test('getUsage 返回持久化用量事实与配置预算（Web 与 CLI 读同一份日志）', async () => {
+  const { service } = await parkedAtReceiveGate()
+
+  const usage = await service.getUsage('pipe-1', REVIEWER)
+  assert.equal(usage.pipelineId, 'pipe-1')
+  assert.deepEqual(usage.stages.map(stage => stage.stageId), [...STAGE_ORDER])
+
+  const receive = usage.stages.find(stage => stage.stageId === 'receive')!
+  // 脚本化宿主每次 spawn 记 1 次 llm + 1 次 tool（真实宿主由 OpenAIStageRunner 记真实调用）。
+  assert.equal(receive.totals.llmCalls, 1)
+  assert.equal(receive.totals.toolSteps, 1)
+  assert.equal(receive.totals.tokensAvailable, true)
+  assert.equal(receive.totals.inputTokens, 10)
+  // budget 如实回显，页面才能算 used/limit。
+  assert.equal(receive.budget.maxSteps, 20)
+  assert.equal(receive.budget.timeoutMs, 600_000)
+  // 人工门等待计入运行耗时（脚本化门立即返回，因此只断言存在该桶）。
+  assert.ok(receive.totals.gateWaitMs >= 0)
+  assert.ok(usage.totals.wallClockMs >= 0)
+  assert.deepEqual(usage.exceeded, [])
+  assert.equal(usage.budgetFailures, 0)
+  assert.equal(usage.skippedLines, 0)
+
+  // 未跑过的阶段也要出现，且 used 为 0——"没跑过"与"跑了没超限"必须可区分。
+  const archive = usage.stages.find(stage => stage.stageId === 'archive')!
+  assert.equal(archive.totals.llmCalls, 0)
+  assert.equal(archive.budget.maxSteps, 20)
+})
+
+test('getUsage 在没有任何用量记录时返回全 0 与正确 pipelineId，而不是报错或空对象', async () => {
+  const service = serviceOf(new ScriptedHost())
+  await service.create(CREATE, REVIEWER)
+
+  const usage = await service.getUsage('pipe-1', REVIEWER)
+  assert.equal(usage.pipelineId, 'pipe-1')
+  assert.equal(usage.totals.llmCalls, 0)
+  assert.equal(usage.totals.toolSteps, 0)
+  assert.equal(usage.totals.tokensAvailable, false)
+  assert.equal(usage.stages.length, STAGE_ORDER.length)
+  assert.deepEqual(usage.exceeded, [])
+})
+
+test('getUsage 的作用域校验与 get 同源：未登记 / 作用域外一律拒绝', async () => {
+  const service = serviceOf(new ScriptedHost())
+  await service.create(CREATE, REVIEWER)
+
+  await assert.rejects(() => service.getUsage('nope', REVIEWER), isCode('not-found'))
+  await assert.rejects(
+    () => service.getUsage('pipe-1', { actorId: 'bob', tenantId: 'other', roles: ['reviewer'] }),
+    isCode('scope-mismatch'),
+  )
+  await assert.rejects(() => service.getUsage('pipe-1', { actorId: '' }), isCode('unauthenticated'))
+  await assert.rejects(() => service.getUsage('../etc', REVIEWER), isCode('invalid-request'))
+})
+
+test('预算超限：run 以 gate-failed 结束，getUsage 报告 budgetFailures 且阶段未进人工门', async () => {
+  const host = new ScriptedHost({ budgetExceededStages: ['receive'] })
+  const service = serviceOf(host)
+  await service.create(CREATE, REVIEWER)
+
+  const result = await service.run('pipe-1', REVIEWER)
+  assert.equal(result.outcome, 'gate-failed')
+  if (result.outcome !== 'gate-failed') throw new Error('unreachable')
+  assert.equal(result.stageId, 'receive')
+  // 视图层同样看到失败原因（来自检查点，不是进程内存）。
+  assert.equal(result.view.status, 'gate-failed')
+  assert.match(result.view.failure?.detail ?? '', /R-BUDGET-EXCEEDED/)
+
+  const usage = await service.getUsage('pipe-1', REVIEWER)
+  const receive = usage.stages.find(stage => stage.stageId === 'receive')!
+  // `budgetFailures` 是运行器当场停止的**权威事实**（来自检查点）。
+  assert.equal(receive.budgetFailures, 1)
+  assert.equal(usage.budgetFailures, 1)
+  // 脚本化宿主在超限时还没写任何用量事件，因此 `exceeded`（按日志重算的口径）为空——
+  // 两个来源本就可能只出现其一，页面要都显示。
+  assert.deepEqual(usage.exceeded, [])
+
+  // 不自动进入人工批准：没有待裁决的阶段门任务。
+  const tasks = await service.listGateTasks(SCOPE, REVIEWER)
+  assert.equal(
+    tasks.some(task => task.artifactPath !== '' && (task.status === 'pending' || task.status === 'claimed')), false,
+    '预算超限不得留下可批准的阶段门任务',
+  )
+})
+
+test('用量查询跨进程重启读到同一份事实（新 service 实例、同一 dataRoot）', async () => {
+  const { service } = await parkedAtReceiveGate()
+  const before = await service.getUsage('pipe-1', REVIEWER)
+
+  const restarted = serviceOf(new ScriptedHost())
+  const after = await restarted.getUsage('pipe-1', REVIEWER)
+  assert.deepEqual(after, before)
+})
+
+test('用量查询不泄露 provider 凭据', async () => {
+  const { service } = await parkedAtReceiveGate()
+  const serialized = JSON.stringify(await service.getUsage('pipe-1', REVIEWER))
+  assert.equal(serialized.includes(API_KEY), false)
+  assert.equal(/api[-_]?key/i.test(serialized), false)
+})

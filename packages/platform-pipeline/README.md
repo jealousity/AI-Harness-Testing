@@ -34,7 +34,8 @@
 | `documents/` | 文档解析注册表与统一中间表示：格式检测（magic bytes 优先）/ 限额与超时 / 安全解包（白名单 + 逐块硬上限 + 路径穿越即拒绝）/ **PDF**（`pdfjs-dist`，按页 `#page=N`，不产出表格）/ **DOCX**（标题三级判据、列表、表格、合并单元格不复制内容、页眉页脚不并入正文、宏与嵌入对象不解压）/ **XLSX**（两趟解包、日期/布尔/错误/公式按缓存值、隐藏 sheet 默认不读、`#sheet=接口!A2:F20`）/ Markdown·CSV·TSV·TXT·YAML·JSON 解析器 / `ParsedDocument` → draft 知识投影。CLI、Web、Harness 三入口共用 `defaultParserRegistry()` | 10 §5.6 |
 | `documents/xml.ts` + `documents/zip-reader.ts` | OOXML 的唯一 XML 与 ZIP 入口：自研分词器不做实体扩展（XXE 与实体爆炸**构造上不可能**）；白名单解包使不读的字节不可能造成危害；不信任 ZIP 声明值，按逐块实际字节执行硬上限 | 10 §5.6.5 / ADR-0001 |
 | `runtime/` | 无 Harness 的 StageRunner / LlmClient / ToolRegistry / HumanGate 端口、ScriptedStageRunner、OpenAICompatibleClient、OpenAIStageRunner、TaskStore 与 HumanGateTaskStore、平台标准工具集（`parse_doc`/`kb_*`/`case_*`/`executor_run`/`env_diag`/`req_pull`/`gate_check`） | 方案一 |
-| `web/` | 无 HTTP 框架依赖的 `PipelineRunService`：作用域/身份校验、配置装载与缓存、宿主装配、检查点与人工门驱动的 create/get/list/run/reenter/gate-*/artifact/events；Web 状态与阶段视图（12 字段）全部由持久化事实重建。另有 `pipeline-run-registry.ts`（进程内运行句柄，**刻意不导出状态查询**，只存句柄与取消信号）与 `async-runner.ts`（触发/取消/进程重启后的恢复扫描，`decideRecovery` 为纯函数） | 10 §4/§5 |
+| `usage.ts` | 预算计量与运行遥测：`UsageEvent`（字段集封闭）/ `UsageStore` + append-only JSONL 文件实现（`usage/<pipelineId>.jsonl`，损坏行**显式**返回 `skipped`）/ `UsageRecorder`（补 scope、`eventId`、由两侧时间戳算 `durationMs`）/ `StageBudgetExceededError` / `summarizeUsage` 纯函数（按阶段分组 + `exceeded` 与 `budgetFailures` 双来源 + `tokensAvailable`）。**强制约束发生在内存，落盘只是尽力而为的观测**（`recordUsage` 吞异常） | 10 §7 |
+| `web/` | 无 HTTP 框架依赖的 `PipelineRunService`：作用域/身份校验、配置装载与缓存、宿主装配、检查点与人工门驱动的 create/get/list/run/reenter/gate-*/artifact/events/usage；Web 状态与阶段视图（12 字段）全部由持久化事实重建。另有 `pipeline-run-registry.ts`（进程内运行句柄，**刻意不导出状态查询**，只存句柄与取消信号）与 `async-runner.ts`（触发/取消/进程重启后的恢复扫描，`decideRecovery` 为纯函数） | 10 §4/§5 |
 
 ## 使用
 
@@ -49,6 +50,9 @@ export PLATFORM_LLM_API_KEY=...
 # OpenAICompatibleClient 支持 tools、json_schema、超时和 429/5xx 重试
 npm run cli -- knowledge-import --input ./docs/project.md --store ./knowledge --project demo-project
 # CSV/TSV 同样支持，导入结果默认写为 draft 知识并携带 sourceRefs
+
+# 预算与运行遥测查询（只读，不需要 API Key；无记录时返回全 0 而非报错）
+npm run cli -- usage --config ../../examples/pipeline.yaml --data-root ../../data --pipeline-id demo-001
 
 # 当前阶段按源码构建和宿主部署，不生成或依赖 tgz 打包产物
 npm run build      # rm -rf dist && tsc -p tsconfig.build.json → dist/（不含 src/e2e）
@@ -96,14 +100,14 @@ await ctx.plugin(platformPipelineHost, {
 ## 状态
 
 - 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）+ 1 份 ADR（docs/adr/0001 文档解析库选型）
-- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **553 项测试全绿**
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **599 项测试全绿**
   - 注：在受限沙箱里跑全量 `node --test` 时，`test/fs-tools.test.ts` 的清理步骤可能被宿主 `safe-delete` 批量删除守卫拦下（按「每轮删除次数 > 阈值」判定，与代码无关）。单独运行该文件即通过。
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
 - Web 运行服务（M0 契约层）：`platform-pipeline/web` 提供无 HTTP 框架依赖的 `PipelineRunService`，覆盖 create/get/list/run/reenter 与人工门 list/claim/decide/cancel，以及 `getStageArtifact`/`listEvents`/`scanPipelineIndex`；Web 状态与阶段视图全部由检查点、产物与人工门任务重建，服务层不复制阶段逻辑。
 - **Web 接入（P0-B 完成，docs/10 §5）**：`web-app/` 是这套 runtime 的 **HTTP 外壳**（不再是独立的浏览器演示实现），按 §5.4「持久化状态 + 进程内触发器」工作——HTTP 触发立刻 `202`，后台跑 driver，人工门以 `waiting-human` 让出控制权，进程重启后由 `POST /api/admin/recover` 扫描恢复。
   - **凭据边界**：API Key 只由服务端按配置里的 `apiKeyEnv` 从环境变量注入，浏览器既不上传也读不到；`configRef` 是服务端白名单逻辑引用（否则等于开放任意文件读取）。
   - **身份边界**：默认**不信任**任何请求头（`PLATFORM_TRUST_ACTOR_HEADERS=1` 才读 `x-actor-*`，且缺 `x-actor-id` 即 401）；后台运行身份**刻意不声明 roles**，因此「后台不得替人裁决」是机器保证而非约定。
-  - 接口：`GET /health`、`GET/POST /api/pipelines*`（create `202`、`run`/`cancel` `202`、`gates`、`events`、`stages/:id/artifact`（无产物 `404`）、`reenter`）、`POST /api/gates/:id/{claim,decide,cancel}`、`POST /api/admin/recover`。
+  - 接口：`GET /health`、`GET/POST /api/pipelines*`（create `202`、`run`/`cancel` `202`、`gates`、`events`、`usage`、`stages/:id/artifact`（无产物 `404`）、`reenter`）、`POST /api/gates/:id/{claim,decide,cancel}`、`POST /api/admin/recover`。
 - **并发安全与幂等（P0-C 完成，docs/10 §6）**：`checkpoint-lock.ts` 从 best-effort 目录锁升级为可审计、可恢复、不会误删他人锁的运行互斥。
   - **锁路径唯一**：`pipelineLockPath(checkpointRoot, pipelineId)` = `checkpoints/<pipelineId>/.pipeline.lock`，CLI / Web / Harness 三个入口共用同一函数——此前 Web 传 per-pipeline 目录、Harness 传 checkpoints 根，拼出的路径不同，等于没锁（§6.2 第 5 条）。
   - **不会被误抢**：stale 判定**只看 `heartbeatAt`**（不看 `acquiredAt`），锁按 `staleMs/3` 自动续租，因此跑 7 小时的流水线不会被判成死锁；`kill -9` 则由「同主机 + `pid` 不存在」判据立即接管，不必等 6 小时。
@@ -111,6 +115,17 @@ await ctx.plugin(platformPipelineHost, {
   - **幂等键（§6.3 M2-3）**：`pipeline create` = `tenantId/projectId/pipelineId`、`human gate decision` = `gateTaskId/decisionId`、`executor invocation` = `pipelineId/caseId/inputDigest`。重复投递返回**首次结果**而不是报错或重复执行；同一把键换了内容则以 `conflict` 拒绝（§5.3「绝不静默复用」仍然成立）。`executor_run` 的 `inputDigest` 含 design 产物摘要与 `targetBaseUrl`，因此"设计变了/换了被测服务"是新一轮执行，而重试是重放。
   - **不产生不可对账记录**：executor 会话与幂等台账均原子落盘（tmp→rename）；重复执行同一批用例不再往会话里追加第二条同用例记录（那会被 R4-08 判成 `unexecuted record ... (多余执行)`）。
   - 双进程与 kill/restart 由 `test/concurrency.test.ts` 用**真实子进程**守卫（互斥、SIGKILL 后立即接管、跨进程抢占、release 不误删他人锁、无 `.stale-*` 残留）。
+- **预算计量与运行遥测（P1-A 完成，docs/10 §7）**：`usage.ts` 把「强制约束」与「可审计用量」分开——**预算在内存里拦，用量落盘只是尽力而为的观测**。
+  - **强制不依赖落盘**：运行器自己数工具步数、driver 自己数重试次数、阶段自己看墙钟；`recordUsage` 写盘失败被吞掉（磁盘问题不该把可观测性故障升级成业务故障），但也不"假装记上了"——失败即事件不存在，由 `skipped` 与日志本身判断计量是否完整。
+  - **四类预算维度**：`maxSteps`（阶段内工具步数硬停）、`timeoutMs`（阶段 deadline）、`maxTestCases`（计量与报告；用例数由 design 产物决定，阶段内不做硬中断）、`maxRetries`（重试上限）。
+  - **`maxSteps` 硬停的 `used` 口径**：循环用尽仍有未回喂工具调用时抛 `used = toolSteps + 1`——被拒绝那一刻模型**仍要求**再来一步；报 `toolSteps` 会得到 `used === limit`，与"超出预算"自相矛盾。
+  - **阶段 deadline 用派生信号**：`budget.timeoutMs > 0` 才创建 `AbortSignal.timeout(timeoutMs)`，不与宿主取消信号互相污染；`timeoutMs: 0` 保持"不设 deadline"语义（**绝不是立即超时**），在判据层与实现层双重保证。宿主信号也 aborted 时不归因于预算（那是"用户取消"）。
+  - **超限落盘复用 `gate-failed` 终态**：写 `failures[].kind='budget-exceeded'` + 机器违规 `R-BUDGET-EXCEEDED`（BLOCKING）并调 `human.gateFailed`——该升级任务 `artifactPath` 为空、`machineStatus=failed`，`findResumableTask` 永远不会把它当阶段门批准，因此「**绝不自动进入人工批准**」是机器保证而非约定。**不重试**（同一份预算再跑一遍只会再烧一次模型）。
+  - **`maxRetries` 成为真实约束**：`gateRetryLimit = min(maxGateRetries ?? 2, budget.maxRetries)`、`reviewRetryLimit = min(1, budget.maxRetries)`——配置只能**收紧**部署方的全局兜底，不能放宽。
+  - **review 独立预算**：审核的模型与工具调用一律记 `kind: 'review'`（工具调用另带 `toolName`），不记成 `llm`/`tool`，因此一次昂贵盲审不会让阶段看起来"步数用尽"。
+  - **两个超限来源并存**：`exceeded`（读日志重算的口径，如一次响应批量调 30 个工具）与 `budgetFailures`（driver 当场停止落盘的权威事实）可能只出现其一，页面要都显示。`wallClockMs` 是**最早开始到最晚结束的跨度**，不是时长之和；`tokensAvailable = llmCalls > 0 && llmCallsWithUsage === llmCalls`（provider 未返回 usage 时不得当成 0 用量）。
+  - **隐私边界**：用量事件只记计量数字与标识，**绝不写 API Key、完整 prompt、模型响应正文**；`usageErrorCode` 只映射固定枚举，**绝不返回 `error.message`**。
+  - 接口：Web `GET /api/pipelines/:id/usage`、CLI `usage --config <yaml> --data-root <dir> --pipeline-id <id>`（只读、不需要 API Key；检查点缺失时重试事实按 0 计并返回 `checkpointFound: false`）。
 - 文档解析（P0-A1 完成）：`documents/` 已提供注册表 + 统一中间表示 + **PDF/DOCX/XLSX/Markdown 四类必支持格式** + 文本族与分隔符表格解析器；`parse_doc` 走注册表，返回 `status`/`confidence`/`sections`/`tables`/`plainText`/`sourceRefs`/`diagnostics`/`limits`，并按 §5.6.8 不回传原始字节。`.doc`/`.xls` 按 ADR-0001 §9 显式 `unsupported` 并给出定向转换提示。
   - `sourceRef` 四级可追溯：`requirements.pdf#page=3`、`spec.docx#heading=1.1,table=1,row=2`、`cases.xlsx#sheet=接口!A2:F20`、`cases.csv#table=1,row=2`。
   - 不伪装：无文本层 → `partial` + `NO_TEXT_LAYER`；无缓存公式值 → `FORMULA_VALUE_UNAVAILABLE` 且**绝不自行计算**；无解析器 → `unsupported`；二进制族 magic 不匹配 → **绝不退回按文本读**。

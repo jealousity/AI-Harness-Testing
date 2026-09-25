@@ -40,6 +40,22 @@ export {
 } from './async-runner.ts'
 
 export {
+  UsageRecorder,
+  budgetFailuresOf,
+  fileUsageStore,
+  retryFactsOf,
+  summarizeUsage,
+  usageDir,
+  type StageUsageSummary,
+  type UsageEvent,
+  type UsageLimitExceeded,
+  type UsageSink,
+  type UsageStore,
+  type UsageSummary,
+  type UsageTotals,
+} from '../usage.ts'
+
+export {
   PIPELINE_RUN_ERROR_HTTP_STATUS,
   PipelineRunError,
   errorMessageOf,

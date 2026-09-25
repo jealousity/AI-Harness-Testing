@@ -60,6 +60,7 @@ import {
   type VersionedCase,
 } from '../stores/markdown.ts'
 import { WorkspaceScope } from './fs-tools.ts'
+import { recordUsage, type UsageSink } from '../usage.ts'
 import type { ToolDefinition } from './ports.ts'
 
 /** `parse_doc` 默认单文档字节上限（与 documents 模块的 `maxFileBytes` 默认值同源）。 */
@@ -108,6 +109,14 @@ export interface PlatformToolContext {
    * （docs/10 §5.6.11 第 9 条），因此这里只在显式注入时才偏离默认。
    */
   readonly documentRegistry?: DocumentParserRegistry
+  /**
+   * 用量落点（docs/10 §7.3「executor 的 case 数量、失败数量和证据数写入 usage」）。
+   *
+   * 缺省 = 不计量。事件归属的阶段取 `ToolExecutionContext.stageId`；
+   * 该字段缺失时**不记事件**（无法归属的事件违反 §7.4「与 pipelineId/stageId 一一绑定」），
+   * 而不是编一个阶段名出来。
+   */
+  readonly usage?: UsageSink
 }
 
 /** 执行会话落盘路径约定（`executor_run` 与 `ExecutionLoader` 共用）。 */
@@ -733,17 +742,54 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
     },
     async execute(args, context) {
       assertNotAborted(context.signal)
+      const startedAt = Date.now()
+      /**
+       * 记一条 `executor` 用量事件并返回原结果。
+       *
+       * `caseCount` 只数**本次真正执行**的用例（重放的不算）：重放用例的消耗已经记在
+       * 首次调用那条事件里，再记一次会让 `maxTestCases` 汇总重复计数。
+       */
+      const finish = async (
+        result: ExecutorRunResult,
+        usage: {
+          readonly success: boolean
+          readonly errorCode?: string
+          readonly caseCount?: number
+          readonly failureCount?: number
+          readonly evidenceCount?: number
+        },
+      ): Promise<ExecutorRunResult> => {
+        if (context.stageId !== undefined) {
+          await recordUsage(ctx.usage, {
+            stageId: context.stageId,
+            kind: 'executor',
+            startedAt,
+            finishedAt: Date.now(),
+            ...usage,
+          })
+        }
+        return result
+      }
       const baseUrl = ctx.targetBaseUrl
       if (baseUrl === undefined || baseUrl.trim() === '') {
-        return { error: '宿主未配置被测服务基址（targetBaseUrl）：拒绝伪造执行记录，execute 阶段的 R4-08/09/10 将无法通过。' }
+        return await finish(
+          { error: '宿主未配置被测服务基址（targetBaseUrl）：拒绝伪造执行记录，execute 阶段的 R4-08/09/10 将无法通过。' },
+          { success: false, errorCode: 'executor-unavailable' },
+        )
       }
       const requested = isNonEmptyString(args?.pipelineId) ? String(args.pipelineId) : ctx.pipelineId
       if (requested !== ctx.pipelineId) {
-        return { error: `pipelineId 不匹配：本次运行绑定 ${ctx.pipelineId}，拒绝执行 ${requested}（防止跨流水线串读用例）` }
+        return await finish(
+          { error: `pipelineId 不匹配：本次运行绑定 ${ctx.pipelineId}，拒绝执行 ${requested}（防止跨流水线串读用例）` },
+          { success: false, errorCode: 'pipeline-mismatch' },
+        )
       }
       const design = await artifacts.read(artifactPath(ctx.pipelineId, 'design'))
       if (design === null) {
-        return { error: `未找到 design 产物（artifacts/${ctx.pipelineId}/design.json）：design 阶段尚未完成。` }
+        return await finish(
+          { error: `未找到 design 产物（artifacts/${ctx.pipelineId}/design.json）：design 阶段尚未完成。` },
+          { success: false, errorCode: 'design-missing' },
+        )
       }
       const content = design.content as {
         readonly testCases?: readonly Record<string, unknown>[]
@@ -753,17 +799,25 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
         .map(raw => ({ id: String((raw as Record<string, unknown>).id ?? ''), steps: Array.isArray((raw as Record<string, unknown>).steps) ? (raw as { steps: readonly Record<string, unknown>[] }).steps : [] }))
         .filter(entry => entry.id !== '')
       if (designCases.length === 0) {
-        return { error: 'design 产物中没有任何带 id 的用例（testCases/reusedCases 均为空）。' }
+        return await finish(
+          { error: 'design 产物中没有任何带 id 的用例（testCases/reusedCases 均为空）。' },
+          { success: false, errorCode: 'design-empty' },
+        )
       }
       const requestedIds = dedupeStrings(
         args?.caseIds === undefined ? designCases.map(entry => entry.id) : stringArray(args.caseIds),
       )
-      if (requestedIds.length === 0) return { error: 'caseIds 必须是非空字符串数组' }
+      if (requestedIds.length === 0) {
+        return await finish({ error: 'caseIds 必须是非空字符串数组' }, { success: false, errorCode: 'invalid-case-ids' })
+      }
       const known = new Set(designCases.map(entry => entry.id))
       const unknown = requestedIds.filter(id => !known.has(id))
       if (unknown.length > 0) {
         // 不在 design 里的用例无法执行：显式失败，避免产出一条"凭空 pass"的记录。
-        return { error: `caseIds 不在 design 产物中：${unknown.join(', ')}` }
+        return await finish(
+          { error: `caseIds 不在 design 产物中：${unknown.join(', ')}` },
+          { success: false, errorCode: 'unknown-case-ids' },
+        )
       }
 
       // ── 幂等分流：命中台账的用例直接重放，只有未命中的才真正执行 ──────────────
@@ -780,7 +834,11 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
       }
       if (pending.length === 0) {
         // 全部命中：一个用例都不执行，会话文件一个字节都不改。
-        return { records: requestedIds.map(id => replayable.get(id)!), replayedCaseIds: requestedIds }
+        return await finish(
+          { records: requestedIds.map(id => replayable.get(id)!), replayedCaseIds: requestedIds },
+          // 重放 = 没有真实执行，因此 caseCount 为 0：重放用例的消耗已记在首次调用那条事件里。
+          { success: true, caseCount: 0, failureCount: 0, evidenceCount: 0 },
+        )
       }
 
       const executor = new HttpExecutor({
@@ -848,12 +906,20 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
       }
 
       // 只回给 agent 记录摘要（不暴露链内部字段），完整记录由宿主供门禁对账。
-      return {
-        records: requestedIds
-          .map(id => produced.get(id) ?? replayable.get(id))
-          .filter((record): record is ExecutorInvocationResult => record !== undefined),
-        ...(replayable.size === 0 ? {} : { replayedCaseIds: requestedIds.filter(id => replayable.has(id)) }),
-      }
+      return await finish(
+        {
+          records: requestedIds
+            .map(id => produced.get(id) ?? replayable.get(id))
+            .filter((record): record is ExecutorInvocationResult => record !== undefined),
+          ...(replayable.size === 0 ? {} : { replayedCaseIds: requestedIds.filter(id => replayable.has(id)) }),
+        },
+        {
+          success: true,
+          caseCount: session.records.length,
+          failureCount: session.records.filter(record => record.status !== 'pass').length,
+          evidenceCount: session.evidence.length,
+        },
+      )
     },
   }
 }

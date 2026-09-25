@@ -15,11 +15,13 @@
  * - **不在 service 层复制阶段逻辑**。
  *
  * 明确不做（分别属于后续里程碑，见 docs/10 §3）：
- * - 预算与阶段耗时遥测 → M3 / P1-A；
+ * - 外部存储后端（PostgreSQL / object store）→ M4 / P1-B；
  * - 后台调度与进程内运行句柄 → M1 的 `async-runner.ts` / `pipeline-run-registry.ts`。
  *
  * 幂等（docs/10 §6.3 M2-3）：`create` 与 `decideGate` 走 `idempotency.ts` 的台账；
  * 运行锁在 `run`/`reenter` 内落地（`checkpoint-lock.ts`）。
+ * 用量与预算（docs/10 §7.3 M3）：`getUsage` 读 `usage.ts` 的持久化日志，
+ * 预算强制在运行器 / driver 内存里完成（不依赖日志写盘成功）。
  *
  * @module platform-pipeline/web/pipeline-run-service
  */
@@ -49,6 +51,14 @@ import {
 import { resolvePlatformRoots, type PlatformStorageRoots } from '../platform-roots.ts'
 import { assertScopeMatch } from '../platform-scope.ts'
 import { FsArtifactStore, FsCheckpointPort } from '../stores/fs.ts'
+import {
+  budgetFailuresOf,
+  fileUsageStore,
+  retryFactsOf,
+  summarizeUsage,
+  usageDir,
+  type UsageSummary,
+} from '../usage.ts'
 import type { ArtifactStore } from '../driver.ts'
 import { STAGE_ORDER, type Checkpoint, type PipelineConfig, type StageId, type StageState } from '../types.ts'
 import {
@@ -172,6 +182,14 @@ export interface PipelineRunService {
    * 不生成"服务器看到请求的时刻"这类非事实事件。
    */
   listEvents(pipelineId: string, actor: ActorContext): Promise<readonly PipelineEventView[]>
+  /**
+   * 用量与预算查询（`GET /api/pipelines/:pipelineId/usage`，docs/10 §7.3）。
+   *
+   * 事实来源是**持久化用量日志**（`<projectRoot>/usage/<pipelineId>.jsonl`）加检查点里的
+   * 重试事实，因此同一份数据在 Web、CLI、重启后读出的 `used/limit/exceeded` 完全一致。
+   * 作用域校验与 `get` 同源：查不到他人项目的用量。
+   */
+  getUsage(pipelineId: string, actor: ActorContext): Promise<UsageSummary>
   reenter(input: ReenterInput, actor: ActorContext): Promise<Checkpoint>
   listGateTasks(filter: GateTaskFilter, actor: ActorContext): Promise<readonly HumanGateTask[]>
   claimGate(input: GateClaimInput, actor: ActorContext): Promise<HumanGateTask>
@@ -409,6 +427,30 @@ export class FilePipelineRunService implements PipelineRunService {
     const roots = resolvePlatformRoots(this.options.dataRoot, config)
     const tasks = await new FileHumanGateTaskStore(gateTaskStoreDir(roots.projectRoot)).list({ pipelineId })
     return buildEventTimeline(checkpoint, tasks)
+  }
+
+  /**
+   * 用量与预算查询（docs/10 §7.3「预算超限可在 Web/CLI 查询」）。
+   *
+   * 读的是**磁盘上的用量日志**而不是进程内存：这条流水线可能是别的进程（CLI / 另一个
+   * Web 实例 / 重启前的自己）跑的，只有日志是共同事实。
+   *
+   * 日志缺失 = 尚无用量记录（不是错误），此时各阶段 `used` 全为 0，
+   * 而 `budget` 仍然如实回显——页面能区分"没跑过"与"跑过但没超限"。
+   */
+  async getUsage(pipelineId: string, actor: ActorContext): Promise<UsageSummary> {
+    assertActor(actor)
+    assertSafeIdentifier(pipelineId, 'pipelineId')
+    const { config, checkpoint } = await this.loadRun(pipelineId, actor)
+    const roots = resolvePlatformRoots(this.options.dataRoot, config)
+    const read = await fileUsageStore(usageDir(roots.projectRoot)).read(pipelineId)
+    return summarizeUsage(read.events, {
+      pipelineId,
+      budgetOf: stageId => config.stages[stageId]!.budget,
+      retriesOf: stageId => retryFactsOf(checkpoint.stageStates[stageId]!),
+      budgetFailuresOf: stageId => budgetFailuresOf(checkpoint.stageStates[stageId]!),
+      skippedLines: read.skipped.length,
+    })
   }
 
   async run(pipelineId: string, actor: ActorContext, options: RunCallOptions = {}): Promise<RunResult> {

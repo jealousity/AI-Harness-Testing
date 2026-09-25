@@ -10,6 +10,7 @@
 import { initialCheckpoint } from './checkpoint.ts'
 import { stageRunContext, type SpawnedRun, type StageSpawner } from './stage-spawner.ts'
 import { MachineGateEngine, computeArtifactDigest, type JudgeResult } from './gates/machine.ts'
+import { StageBudgetExceededError, recordUsage, usageErrorCode, type UsageRecordInput, type UsageSink } from './usage.ts'
 import type { ExecutionSession } from './executor/executor.ts'
 import {
   STAGE_ORDER,
@@ -72,10 +73,19 @@ export interface DriverOptions {
   readonly execution?: ExecutionLoader
   /** receive 阶段的输入文件路径（降级链末级；传给 receive agent 读取）。 */
   readonly receiveInput?: string
-  /** 门禁语义重试次数（docs/01 ET-01：默认 2）。 */
+  /** 门禁语义重试次数（docs/01 ET-01：默认 2）。作为阶段重试预算的**上限**，实际取 `min(本值, budget.maxRetries)`。 */
   readonly maxGateRetries?: number
   /** 取消信号（供后台可续跑等待复用 child 时观察；docs/09 验证点 5）。 */
   readonly signal?: AbortSignal
+  /**
+   * 用量落点（docs/10 §7.3）。缺省 = 不计量。
+   *
+   * driver 负责三类事件的落盘：`gate`（人工门等待时长，不计入模型预算但要计入运行耗时）、
+   * `checkpoint`（每次检查点保存耗时）、以及预算超限时的失败事实（写进检查点，不写用量日志）。
+   */
+  readonly usage?: UsageSink
+  /** 时钟注入（测试要断言确定性的时长）。 */
+  readonly now?: () => number
 }
 
 export type RunOutcome =
@@ -85,14 +95,27 @@ export type RunOutcome =
 const MAX_GATE_RETRIES = 2
 const MAX_REVIEW_RETRIES = 1
 
+/**
+ * 预算超限时写入检查点的机器规则 id（docs/10 §7.3「超过 budget.maxSteps 立即停止并写入
+ * budget-exceeded」）。
+ *
+ * 复用 `gate-failed` 这条既有终态路径而不是新造状态：它已经把「阶段失败」表达成
+ * **不可当阶段门批准**的升级任务（`PersistentHumanGate.gateFailed` 开出的任务
+ * `artifactPath` 为空、`machineStatus=failed`，不满足 `findResumableTask`），
+ * 因此"不自动进入人工批准"是机器保证，不靠自觉。
+ */
+const BUDGET_EXCEEDED_RULE = 'R-BUDGET-EXCEEDED'
+
 /** 编排核心。 */
 export class PipelineDriver {
   private readonly options: DriverOptions
   private readonly maxGateRetries: number
+  private readonly now: () => number
 
   constructor(options: DriverOptions) {
     this.options = options
     this.maxGateRetries = options.maxGateRetries ?? MAX_GATE_RETRIES
+    this.now = options.now ?? (() => Date.now())
   }
 
   async run(): Promise<RunOutcome> {
@@ -104,7 +127,7 @@ export class PipelineDriver {
       let state = cp.stageStates[stageId]!
 
       if (state.status === 'done') {
-        cp = await this.advance(cp)
+        cp = await this.advance(cp, stageId)
         continue
       }
 
@@ -117,28 +140,37 @@ export class PipelineDriver {
       // 重复消耗模型预算、并把已被真人审核过的产物覆盖成新版本（审核对象与批准对象错位）。
       const parked = await this.resumableAtGate(state)
       let spawned: SpawnedRun
-      if (parked) {
-        spawned = { stageId, artifactPath: state.artifact }
-      } else if (state.childSessionId !== undefined && this.options.spawn.waitContinuable !== undefined
-          && !this.isReSpawnState(state.status)) {
-        // 恢复续跑（docs/09 验证点 5）：复用既有后台 child，不重复 spawn。
-        await this.options.spawn.waitContinuable(state.childSessionId, this.options.signal)
-        spawned = { stageId, artifactPath: state.artifact, childId: state.childSessionId }
-      } else {
-        spawned = await this.options.spawn.runStage({
-          stageId,
-          pipelineId: this.options.pipelineId,
-          inputPaths,
-          inputDigests,
-          artifactPath: state.artifact,
-          mode: stageId === 'execute' ? 'continuable' : 'oneshot',
-          ...(runCtx.extra === undefined ? {} : { extraContext: runCtx.extra }),
-          previousViolations: state.gate.machine.violations.length === 0 ? undefined : state.gate.machine.violations,
-        }, this.options.cfg)
-        if (spawned.childId !== undefined) {
-          cp = await this.update(cp, stageId, { childSessionId: spawned.childId })
-          state = cp.stageStates[stageId]!
+      try {
+        if (parked) {
+          spawned = { stageId, artifactPath: state.artifact }
+        } else if (state.childSessionId !== undefined && this.options.spawn.waitContinuable !== undefined
+            && !this.isReSpawnState(state.status)) {
+          // 恢复续跑（docs/09 验证点 5）：复用既有后台 child，不重复 spawn。
+          await this.options.spawn.waitContinuable(state.childSessionId, this.options.signal)
+          spawned = { stageId, artifactPath: state.artifact, childId: state.childSessionId }
+        } else {
+          spawned = await this.options.spawn.runStage({
+            stageId,
+            pipelineId: this.options.pipelineId,
+            inputPaths,
+            inputDigests,
+            artifactPath: state.artifact,
+            mode: stageId === 'execute' ? 'continuable' : 'oneshot',
+            ...(runCtx.extra === undefined ? {} : { extraContext: runCtx.extra }),
+            previousViolations: state.gate.machine.violations.length === 0 ? undefined : state.gate.machine.violations,
+          }, this.options.cfg)
+          if (spawned.childId !== undefined) {
+            cp = await this.update(cp, stageId, { childSessionId: spawned.childId })
+            state = cp.stageStates[stageId]!
+          }
         }
+      } catch (error) {
+        // 预算超限（docs/10 §7.3）：立即停止、落盘成 `budget-exceeded`，**不重试**
+        // ——同一份预算再跑一遍只会再烧一次模型；也绝不自动进入人工批准。
+        if (error instanceof StageBudgetExceededError) {
+          return await this.failOnBudgetExceeded(cp, stageId, error)
+        }
+        throw error
       }
 
       // 读取产物。损坏（非法 JSON）与缺失都按「阶段失败」处理，走与机器门禁失败
@@ -164,7 +196,7 @@ export class PipelineDriver {
           violations: [violation],
           attempts: state.gate.machine.attempts + 1,
         }
-        if (state.gate.machine.attempts < this.maxGateRetries) {
+        if (state.gate.machine.attempts < this.gateRetryLimit(stageId)) {
           cp = await this.update(cp, stageId, { status: 'needs-fix', gate: { ...state.gate, machine } })
           continue // 违规清单经 stageRunContext 回喂重跑
         }
@@ -196,7 +228,7 @@ export class PipelineDriver {
         ruleIds,
       )
       if (gate.status === 'failed') {
-        if (state.gate.machine.attempts < this.maxGateRetries) {
+        if (state.gate.machine.attempts < this.gateRetryLimit(stageId)) {
           cp = await this.update(cp, stageId, {
             status: 'needs-fix',
             gate: { ...state.gate, machine: { ...gate, attempts: state.gate.machine.attempts + 1 } },
@@ -219,7 +251,7 @@ export class PipelineDriver {
         review = await this.options.review.run(stageId, artifact, gate)
         if (review.verdict === 'fail') {
           const retried = state.failures.filter(f => f.kind === 'review-fail').length
-          if (retried < MAX_REVIEW_RETRIES) {
+          if (retried < this.reviewRetryLimit(stageId)) {
             cp = await this.update(cp, stageId, {
               status: 'needs-fix',
               failures: [
@@ -240,7 +272,17 @@ export class PipelineDriver {
       // 3. 人工门（block；D-01 二次机器判定由宿主 human 实现）
       cp = await this.update(cp, stageId, { status: 'awaiting-gate' })
       state = cp.stageStates[stageId]!
-      const decision = await this.options.human.gate(stageId, artifact, gate, review)
+      // 等待时长单独计量（docs/10 §7.2）：人工门等待**不计入模型预算**，但要计入运行耗时，
+      // 因此它记成 `kind: 'gate'` 而不是混进 llm/tool。
+      const gateStartedAt = this.now()
+      let decision: HumanDecision
+      try {
+        decision = await this.options.human.gate(stageId, artifact, gate, review)
+      } catch (error) {
+        await this.record({ stageId, kind: 'gate', startedAt: gateStartedAt, finishedAt: this.now(), success: false, errorCode: usageErrorCode(error) })
+        throw error
+      }
+      await this.record({ stageId, kind: 'gate', startedAt: gateStartedAt, finishedAt: this.now(), success: true })
       if (decision === 'rejected') return { outcome: 'rejected', stageId } // 状态保留 awaiting-gate（产物保留，可重入）
       if (decision === 'changes-needed') {
         cp = await this.update(cp, stageId, {
@@ -258,7 +300,7 @@ export class PipelineDriver {
         reviewDegraded: state.reviewDegraded,
         gate: { ...state.gate, human: { state: 'approved', records: state.gate.human.records } },
       })
-      cp = await this.advance(cp)
+      cp = await this.advance(cp, stageId)
     }
     return { outcome: 'completed' }
   }
@@ -377,14 +419,90 @@ export class PipelineDriver {
         [stageId]: { ...cp.stageStates[stageId]!, ...patch },
       },
     }
-    await this.options.checkpoint.save(this.options.root, next)
+    await this.save(next, stageId)
     return next
   }
 
-  private async advance(cp: Checkpoint): Promise<Checkpoint> {
+  private async advance(cp: Checkpoint, stageId: StageId): Promise<Checkpoint> {
     const next: Checkpoint = { ...cp, cursor: cp.cursor + 1 }
-    await this.options.checkpoint.save(this.options.root, next)
+    await this.save(next, stageId)
     return next
+  }
+
+  /**
+   * 保存检查点并记一条 `checkpoint` 用量事件。
+   *
+   * 落盘失败照常抛出（检查点是唯一事实，写不进去必须让调用方知道），
+   * 但失败事件先记下来——否则"检查点保存很慢/一直失败"在用量视图里完全不可见。
+   */
+  private async save(cp: Checkpoint, stageId: StageId): Promise<void> {
+    const startedAt = this.now()
+    try {
+      await this.options.checkpoint.save(this.options.root, cp)
+      await this.record({ stageId, kind: 'checkpoint', startedAt, finishedAt: this.now(), success: true })
+    } catch (error) {
+      await this.record({ stageId, kind: 'checkpoint', startedAt, finishedAt: this.now(), success: false, errorCode: usageErrorCode(error) })
+      throw error
+    }
+  }
+
+  /** 记一条用量事件；未注入 sink 时是空操作（计量是尽力而为的观测）。 */
+  private async record(input: UsageRecordInput): Promise<void> {
+    await recordUsage(this.options.usage, input)
+  }
+
+  /**
+   * 该阶段的门禁重试上限 = `min(全局上限, budget.maxRetries)`（docs/10 §7.1：把
+   * `maxRetries` 从"只写进 prompt"变成真实运行约束）。
+   *
+   * 取 `min` 而不是直接替换：全局上限表达部署方的兜底意图，配置只能**收紧**它。
+   */
+  private gateRetryLimit(stageId: StageId): number {
+    return Math.min(this.maxGateRetries, this.options.cfg.stages[stageId]!.budget.maxRetries)
+  }
+
+  /** 该阶段的审核重试上限，同样受 `budget.maxRetries` 约束（docs/10 §7.3 独立预算）。 */
+  private reviewRetryLimit(stageId: StageId): number {
+    return Math.min(MAX_REVIEW_RETRIES, this.options.cfg.stages[stageId]!.budget.maxRetries)
+  }
+
+  /**
+   * 预算超限的落盘（docs/10 §7.3）。
+   *
+   * 三个硬约束：
+   * 1. **不重试**——同一份预算再跑一遍只会再烧一次模型；
+   * 2. **不进入人工批准**——置 `gate-failed` 并走 `human.gateFailed` 开升级任务，
+   *    该任务的 `artifactPath` 为空、`machineStatus=failed`，`findResumableTask`
+   *    永远不会把它当阶段门批准（`persistent-human-gate.ts` 的既有保证）；
+   * 3. **检查点可恢复**——失败事实（`failures[].kind='budget-exceeded'` + 机器违规）
+   *    在返回前已落盘，因此进程重启后 `status`/CLI 仍能看到原因，运维可用
+   *    `reenter` 调整预算后重跑。
+   */
+  private async failOnBudgetExceeded(
+    cp: Checkpoint,
+    stageId: StageId,
+    error: StageBudgetExceededError,
+  ): Promise<RunOutcome> {
+    const current = cp.stageStates[stageId]!
+    const at = this.now()
+    const detail = error.message
+    const violation = { rule: BUDGET_EXCEEDED_RULE, level: 'BLOCKING' as const, detail, at }
+    const machine = {
+      ...current.gate.machine,
+      status: 'failed' as const,
+      violations: [violation],
+      attempts: current.gate.machine.attempts + 1,
+    }
+    await this.update(cp, stageId, {
+      status: 'gate-failed',
+      gate: { ...current.gate, machine },
+      failures: [
+        ...current.failures,
+        { kind: 'budget-exceeded', rule: BUDGET_EXCEEDED_RULE, detail, at },
+      ],
+    })
+    await this.options.human.gateFailed(stageId, machine)
+    return { outcome: 'gate-failed', stageId }
   }
 
   /** 需要重新 spawn（而非复用既有 child）的状态：门禁回喂 / 人工重入 = 全新生命周期。 */

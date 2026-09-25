@@ -5,6 +5,7 @@ import { MachineGateEngine, computeArtifactDigest, platformGenericRules, type Ga
 import { initialCheckpoint } from '../src/checkpoint.ts'
 import { normalizeConfig } from '../src/config.ts'
 import { resolveStageAcl, type SpawnRequest, type SpawnedRun, type StageSpawner } from '../src/stage-spawner.ts'
+import { StageBudgetExceededError, type UsageRecordInput, type UsageSink } from '../src/usage.ts'
 import { STAGE_ORDER, type Checkpoint, type PipelineConfig, type StageArtifact, type StageId } from '../src/types.ts'
 
 const BASE = {
@@ -701,4 +702,185 @@ test('门等待中重启但产物已丢失：回退到重新生成', async () =>
     spawn.calls.filter(c => c.stageId === 'report').length, 2,
     '产物不可读时必须回退到重新 spawn，而不是拿空产物过门禁',
   )
+})
+
+// ── M3：预算超限落盘与运行耗时计量（docs/10 §7.3 / §7.4）───────────────────────
+
+/** 在指定阶段抛预算超限的 spawn（其余阶段照常产出产物）。 */
+class BudgetExceededSpawn extends MockSpawn {
+  private readonly stage: StageId
+  private readonly kind: 'max-steps' | 'timeout'
+
+  constructor(artifacts: MemoryArtifacts, stage: StageId, kind: 'max-steps' | 'timeout' = 'max-steps') {
+    super(artifacts)
+    this.stage = stage
+    this.kind = kind
+  }
+
+  override async runStage(request: SpawnRequest, cfg: PipelineConfig): Promise<SpawnedRun> {
+    if (request.stageId === this.stage) {
+      this.calls.push({ stageId: request.stageId })
+      throw new StageBudgetExceededError(request.stageId, {
+        kind: this.kind,
+        used: this.kind === 'timeout' ? 900_000 : 21,
+        limit: this.kind === 'timeout' ? 600_000 : 20,
+      })
+    }
+    return await super.runStage(request, cfg)
+  }
+}
+
+/** 收集用量输入的 sink（driver 侧只关心"记了什么"）。 */
+class UsageSpy implements UsageSink {
+  readonly inputs: UsageRecordInput[] = []
+  async record(input: UsageRecordInput): Promise<void> { this.inputs.push(input) }
+  of(kind: UsageRecordInput['kind']): readonly UsageRecordInput[] {
+    return this.inputs.filter(input => input.kind === kind)
+  }
+}
+
+function cfgWith(stages: Record<string, unknown>): PipelineConfig {
+  return normalizeConfig({ ...BASE, stages })
+}
+
+/**
+ * 组装一个可注入 usage / 门禁规则 / spawn 的 driver。
+ *
+ * `spawn` 是**工厂**而不是实例：产物库必须由本函数创建并同时交给 spawn 与 driver，
+ * 否则 spawn 写进 A、driver 从 B 读，第一个阶段就会以 `R-ARTIFACT-READABLE` 失败
+ * ——测的就不是预算逻辑了。
+ */
+function harnessWith<S extends StageSpawner>(options: {
+  readonly spawn: (artifacts: MemoryArtifacts) => S
+  readonly gates?: MachineGateEngine
+  readonly human?: ScriptedHuman
+  readonly usage?: UsageSink
+  readonly config?: PipelineConfig
+}): { driver: PipelineDriver; artifacts: MemoryArtifacts; spawn: S; human: ScriptedHuman; cp: MemoryCheckpoint } {
+  const artifacts = new MemoryArtifacts()
+  const spawn = options.spawn(artifacts)
+  const human = options.human ?? new ScriptedHuman()
+  const cp = new MemoryCheckpoint()
+  const driver = new PipelineDriver({
+    cfg: options.config ?? cfg(),
+    pipelineId: 'pipe-1',
+    root: 'artifacts/pipe-1',
+    rulesetVersion: 'v1',
+    spawn,
+    gates: options.gates ?? engine(),
+    human,
+    artifacts,
+    checkpoint: cp,
+    ...(options.usage === undefined ? {} : { usage: options.usage }),
+  })
+  return { driver, artifacts, spawn, human, cp }
+}
+
+test('预算超限：落盘 budget-exceeded、置 gate-failed、开升级任务、不重试也不进人工批准', async () => {
+  const { driver, spawn, human, cp } = harnessWith({ spawn: artifacts => new BudgetExceededSpawn(artifacts, 'analyze') })
+
+  assert.deepEqual(await driver.run(), { outcome: 'gate-failed', stageId: 'analyze' })
+
+  const state = cp.value!.stageStates.analyze
+  assert.equal(state.status, 'gate-failed', '不得停在 awaiting-gate（那就是自动进入人工批准了）')
+  assert.deepEqual(state.failures.map(f => f.kind), ['budget-exceeded'])
+  assert.equal(state.failures[0]?.rule, 'R-BUDGET-EXCEEDED')
+  assert.match(state.failures[0]?.detail ?? '', /exceeded tool-call step budget/)
+  assert.deepEqual(state.gate.machine.violations.map(v => v.rule), ['R-BUDGET-EXCEEDED'])
+  assert.equal(state.gate.machine.violations[0]?.level, 'BLOCKING')
+  // 升级任务（gateFailed）走既有不可批准路径；人工门本身从未被调用。
+  assert.deepEqual(human.gateFailedCalls, ['analyze'])
+  // analyze 从未进入人工门（receive 是正常批准过的，不该被这条断言牵连）。
+  assert.equal(
+    human.calls.some(call => call.stageId === 'analyze'), false,
+    '预算超限的阶段不得走人工门（也不得被当成"等真人批准"）',
+  )
+  // 不重试：同一份预算再跑一遍只会再烧一次模型。
+  assert.equal(spawn.calls.filter(c => c.stageId === 'analyze').length, 1)
+  // 检查点可恢复：cursor 停在 analyze，运维可用 reenter 调整预算后重跑。
+  assert.equal(cp.value!.cursor, 1)
+  assert.equal(cp.value!.stageStates.receive.status, 'done')
+})
+
+test('阶段 deadline 超时同样落盘 budget-exceeded，不被误记为人工门取消', async () => {
+  const { driver, human, cp } = harnessWith({ spawn: artifacts => new BudgetExceededSpawn(artifacts, 'receive', 'timeout') })
+
+  assert.deepEqual(await driver.run(), { outcome: 'gate-failed', stageId: 'receive' })
+  const state = cp.value!.stageStates.receive
+  assert.equal(state.status, 'gate-failed')
+  assert.deepEqual(state.failures.map(f => f.kind), ['budget-exceeded'])
+  assert.match(state.failures[0]?.detail ?? '', /wall-clock deadline/)
+  assert.deepEqual(human.calls, [])
+  assert.deepEqual(human.gateFailedCalls, ['receive'])
+})
+
+test('人工门等待记 kind=gate 事件，检查点保存记 kind=checkpoint 事件', async () => {
+  const usage = new UsageSpy()
+  const { driver } = harnessWith({ spawn: artifacts => new MockSpawn(artifacts), usage })
+
+  assert.deepEqual(await driver.run(), { outcome: 'completed' })
+
+  // 六个阶段各等一次门（等待时长独立计量，不计入模型预算）。
+  const gates = usage.of('gate')
+  assert.equal(gates.length, STAGE_ORDER.length)
+  assert.deepEqual(gates.map(g => g.stageId), [...STAGE_ORDER])
+  assert.equal(gates.every(g => g.success), true)
+  assert.equal(gates.every(g => g.finishedAt >= g.startedAt), true)
+
+  // 检查点保存也被计量（否则"落盘很慢"在用量视图里完全不可见）。
+  const checkpoints = usage.of('checkpoint')
+  assert.ok(checkpoints.length >= STAGE_ORDER.length, `应至少每个阶段记一次，实际 ${checkpoints.length}`)
+  assert.equal(checkpoints.every(c => c.success), true)
+  assert.equal(checkpoints.every(c => c.stageId !== undefined), true)
+})
+
+test('人工门等待被中止时记 success=false 的 gate 事件并原样抛出（不吞异常）', async () => {
+  const usage = new UsageSpy()
+  const human = new ScriptedHuman()
+  human.gate = async () => {
+    const error = new Error('人工门等待超时')
+    error.name = 'HumanGateWaitAbortedError'
+    throw error
+  }
+  const { driver } = harnessWith({ spawn: artifacts => new MockSpawn(artifacts), human, usage })
+
+  await assert.rejects(() => driver.run(), /人工门等待超时/)
+  const gates = usage.of('gate')
+  assert.equal(gates.length, 1)
+  assert.equal(gates[0]?.success, false)
+  assert.equal(gates[0]?.errorCode, 'gate-wait-aborted')
+})
+
+test('budget.maxRetries 收紧阶段重试上限：maxRetries=0 时门禁失败不重试，直接 gate-failed', async () => {
+  const always: GateRule = {
+    id: 'R-always', level: 'BLOCKING', stages: ['analyze'],
+    judge: () => [{ rule: 'R-always', level: 'BLOCKING', detail: '永远失败', at: 1 }],
+  }
+  const { driver, spawn, cp } = harnessWith({
+    spawn: artifacts => new MockSpawn(artifacts),
+    gates: engine([always]),
+    config: cfgWith({ analyze: { budget: { maxRetries: 0 } } }),
+  })
+
+  assert.deepEqual(await driver.run(), { outcome: 'gate-failed', stageId: 'analyze' })
+  assert.equal(spawn.calls.filter(c => c.stageId === 'analyze').length, 1, 'maxRetries=0 表示不允许重试')
+  assert.equal(cp.value!.stageStates.analyze.gate.machine.attempts, 1)
+})
+
+test('maxRetries 只能收紧不能放宽全局上限（配置给 5 而全局为 2 → 仍只重试 2 次）', async () => {
+  const always: GateRule = {
+    id: 'R-always', level: 'BLOCKING', stages: ['analyze'],
+    judge: () => [{ rule: 'R-always', level: 'BLOCKING', detail: '永远失败', at: 1 }],
+  }
+  const { driver, spawn, cp } = harnessWith({
+    spawn: artifacts => new MockSpawn(artifacts),
+    gates: engine([always]),
+    config: cfgWith({ analyze: { budget: { maxRetries: 5 } } }),
+  })
+
+  assert.deepEqual(await driver.run(), { outcome: 'gate-failed', stageId: 'analyze' })
+  // 1 次初跑 + 2 次重试 = 3；配置里的 5 不能突破部署方的全局兜底。
+  assert.equal(spawn.calls.filter(c => c.stageId === 'analyze').length, 3)
+  // attempts 记的是**累计失败次数**（含最终那次），因此是 3 而不是 2。
+  assert.equal(cp.value!.stageStates.analyze.gate.machine.attempts, 3)
 })

@@ -13,6 +13,7 @@ export type {
 } from './ports.ts'
 
 export { InMemoryToolRegistry, ToolAccessError, executeTool } from './tool-registry.ts'
+export type { UsageSink } from '../usage.ts'
 export { OpenAICompatibleClient, OpenAICompatibleError, type OpenAICompatibleClientOptions } from './openai-client.ts'
 export { OpenAIStageRunner, type OpenAIStageRunnerOptions } from './openai-stage-runner.ts'
 export {
@@ -77,6 +78,7 @@ export {
   createPlatformHost,
   gateTaskStoreDir,
   taskStoreDir,
+  usageLogDir,
   validateApprovalCoverage,
   type CheckpointHost,
   type CheckpointHostOptions,
