@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
 import { acquirePipelineLock, pipelineLockPath } from '../src/checkpoint-lock.ts'
+import { computeArtifactDigest } from '../src/gates/machine.ts'
 import { resolvePlatformRoots } from '../src/platform-roots.ts'
 import { STAGE_ORDER, type PipelineConfig, type StageId } from '../src/types.ts'
 import { DEFAULT_RULESET_VERSION } from '../src/runtime/platform-host.ts'
@@ -556,6 +557,58 @@ test('reenter 拒绝未知阶段与空 reason', async () => {
   )
 })
 
+// ── P1-03：reenter 的检查点与 digest 读取必须在锁内（docs/11）─────────────────
+
+test('reenter 在锁内读取检查点与 digest：别人持锁时报 conflict，而不是基于锁外快照报 not-found', async () => {
+  const { service } = await parkedAtOpenGate()
+  const roots = resolvePlatformRoots(dir, config)
+  const checkpointFile = join(roots.checkpointRoot, 'pipe-1', 'checkpoint.json')
+
+  // 删掉检查点：如果 reenter 在**拿锁之前**读检查点，它会先撞上"流水线不存在"（not-found）。
+  // 正确顺序是先抢锁，因此必须先报"别人正在跑"（conflict）——这是"锁外读到的快照
+  // 不能作为锁内写入依据"最直接的观测面。
+  await rm(checkpointFile)
+  const held = await acquirePipelineLock(roots.checkpointRoot, 'pipe-1', { ownerId: 'other-owner', heartbeatMs: 0 })
+  try {
+    await assert.rejects(
+      () => service.reenter({ ...SCOPE, stageId: 'receive', reason: '并发登记' }, REVIEWER),
+      isCode('conflict'),
+    )
+  } finally {
+    await held.release()
+  }
+  assert.equal(existsSync(checkpointFile), false, '别人持锁时不得写入任何事实（也不能借重入重建检查点）')
+})
+
+test('reenter 用磁盘上的最新产物 digest 做乐观校验：旧 digest 被拒且报出真实值', async () => {
+  const { service } = await parkedAtReceiveGate()
+  const stale = (await service.get('pipe-1', REVIEWER)).stages[0]!.digest
+  assert.notEqual(stale, '', '停在人工门时视图 digest 应来自产物回读')
+
+  // 模拟"另一个进程重写了同一路径上的产物"：路径不变、内容变、**摘要按真实写入者的
+  // 方式重算**（只改 content 而保留旧 digest 字段等于伪造一个自相矛盾的产物）。
+  const roots = resolvePlatformRoots(dir, config)
+  const artifactFile = join(roots.artifactsRoot, 'artifacts', 'pipe-1', 'receive.json')
+  const raw = JSON.parse(await readFile(artifactFile, 'utf8')) as { content: Record<string, unknown> }
+  const rewritten = { ...raw, content: { ...raw.content, rewrittenBy: 'other-process' }, digest: '' }
+  await writeFile(
+    artifactFile,
+    JSON.stringify({ ...rewritten, digest: computeArtifactDigest(rewritten as never) }, null, 2),
+    'utf8',
+  )
+  const fresh = (await service.get('pipe-1', REVIEWER)).stages[0]!.digest
+  assert.notEqual(fresh, stale, '产物内容变了，digest 必须跟着变')
+
+  await assert.rejects(
+    () => service.reenter({ ...SCOPE, stageId: 'receive', reason: '用旧 digest 登记', expectedCurrentDigest: stale }, REVIEWER),
+    (error: unknown) => {
+      assert.ok(isCode('conflict')(error), `期望 conflict，实际 ${(error as PipelineRunError)?.code}`)
+      assert.equal((error as PipelineRunError).details.actual, fresh, '冲突必须报出磁盘上的真实 digest')
+      return true
+    },
+  )
+})
+
 test('reenter 不需要 API Key（只动检查点）', async () => {
   const service = serviceOf(new ScriptedHost())
   await service.create(CREATE, REVIEWER)
@@ -653,7 +706,19 @@ test('流水线索引与检查点落在 dataRoot 下的租户/项目目录内', 
   await service.create(CREATE, REVIEWER)
 
   const index = JSON.parse(await readFile(join(pipelineIndexDir(dir), 'pipe-1.json'), 'utf8')) as Record<string, unknown>
-  assert.deepEqual(index, { pipelineId: 'pipe-1', tenantId: 'acme', projectId: 'demo', configRef: 'pipeline.yaml' })
+  // 索引就是运行清单（同一次原子写，docs/11 P1-01）：作用域四个字段必须逐字正确。
+  assert.deepEqual(
+    {
+      pipelineId: index.pipelineId,
+      tenantId: index.tenantId,
+      projectId: index.projectId,
+      configRef: index.configRef,
+    },
+    { pipelineId: 'pipe-1', tenantId: 'acme', projectId: 'demo', configRef: 'pipeline.yaml' },
+  )
+  // 创建时固定下来的版本与时间戳也必须在盘上：重启后无法从别处恢复它们。
+  assert.equal(index.rulesetVersion, DEFAULT_RULESET_VERSION)
+  assert.equal(typeof index.createdAt, 'number')
   assert.ok(pipelineIndexDir(dir).startsWith(dir))
 })
 

@@ -17,6 +17,7 @@ export {
   scanPipelineIndex,
   type PipelineIndexEntry,
   type PipelineIndexScan,
+  type PipelineRunManifest,
   type PipelineRunService,
   type PipelineRunServiceOptions,
   type PlatformHostFactory,
@@ -58,6 +59,9 @@ export {
 export {
   PIPELINE_RUN_ERROR_HTTP_STATUS,
   PipelineRunError,
+  assertAdminRole,
+  assertGateRole,
+  assertOperatorRole,
   errorMessageOf,
   redactSecrets,
   toPipelineRunError,

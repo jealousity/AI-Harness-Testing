@@ -106,7 +106,7 @@ await ctx.plugin(platformPipelineHost, {
 ## 状态
 
 - 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）+ 2 份 ADR（docs/adr/0001 文档解析库选型、docs/adr/0002 存储后端选型与事务边界）
-- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **707 项测试全绿**
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **729 项测试全绿**
   - 注：在受限沙箱里跑全量 `node --test` 时，`test/fs-tools.test.ts` 的清理步骤可能被宿主 `safe-delete` 批量删除守卫拦下（按「每轮删除次数 > 阈值」判定，与代码无关）。单独运行该文件即通过。
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
 - Web 运行服务（M0 契约层）：`platform-pipeline/web` 提供无 HTTP 框架依赖的 `PipelineRunService`，覆盖 create/get/list/run/reenter 与人工门 list/claim/decide/cancel，以及 `getStageArtifact`/`listEvents`/`scanPipelineIndex`；Web 状态与阶段视图全部由检查点、产物与人工门任务重建，服务层不复制阶段逻辑。
@@ -142,6 +142,15 @@ await ctx.plugin(platformPipelineHost, {
   - **外部后端本阶段只交付接口层 + ADR**（`docs/10` §10 P1-B 第 3 条明确允许）：`storage/postgres/` 与 `storage/object-store/` 不引入任何数据库/对象存储 SDK、不做真实连接；交付的是接缝（`PostgresClient`/`ObjectStoreClient`）、表结构与索引、端口↔表/键映射、事务边界、错误分类。未配置时 `requirePostgresClient()` / `requireObjectStoreClient()` **明确抛 `StorageUnavailableError`**——**绝不静默降级到文件后端**（静默降级会让"数据到底写到哪了"变成无法回答的问题）。选型理由、迁移与回滚、以及 6 条**必须在端口层解决**的跨后端待对齐项见 `docs/adr/0002-storage-backends.md`。
   - **组合是必须的**：PostgreSQL 管不住 MB 级产物，对象存储给不了条件写（检查点/租约/门裁决/锁全是"读改写原子"）。`composeStorageBackends()` 把两者拼成一个后端，并在装配时就拒绝"端口冲突""版本不一致""缺必需端口"——不替宿主猜优先级。
   - **可重试语义有端到端证据**（§8.4）：产物写成功但检查点写失败时，driver **明确失败、不宣称阶段完成、不调用人工门**；存储恢复后重试能跑完六个阶段。顺序固定为"先写产物、后写检查点"——反过来会得到"声称完成但没有产物"，那才是不可恢复的。
+- **审计整改批次 A 完成（docs/11 P1-01 / P1-02 / P1-03）**：
+  - **运行清单（P1-01）**：`create` 请求里所有影响运行行为的参数（`targetBaseUrl`、`providerName`、`requirementInput`、`maxGateRetries`、门等待/TTL、`diagCredentials`）现在落进**持久化清单**——清单与流水线索引是**同一份文件、同一次原子写**（分成两个文件就会有两次写，中间崩溃留下半成品）。此前这些字段只被校验、不被保存，于是真实 execute 永远拿不到 `targetBaseUrl`，而 Web e2e 用的是脚本化宿主，看不到这个缺口。
+    - 幂等指纹覆盖全部行为参数：同一 `pipelineId` 换了被测基址/provider/重试预算/探针就是另一次创建，返回 `conflict`(409) 而不是静默重放首次结果。
+    - `targetBaseUrl` **建连前再复核一次**：清单是磁盘文件，可能被篡改或来自旧版本；`executor_run` 在发出任何请求之前调用宿主注入的同一份判据。
+    - `diagCredentials` 只接受环境变量名（`/^[A-Za-z_][A-Za-z0-9_]{0,127}$/`），且**只存变量名、绝不存凭据值**。
+    - 清单字段类型不符时显式失败（`storage-unavailable`）：把 `maxGateRetries: "lots"` 当成"没写"会让一次磁盘损坏伪装成"用了默认参数"。
+  - **运维角色边界（P1-02）**：`assertGateRole` / `assertOperatorRole` / `assertAdminRole` 收敛到一处，service 与 HTTP 外壳共用。`reenter`、`cancelGate`、取消运行要求 `operator`/`admin`，`/api/admin/recover` 要求 `admin`。此前 `reenter`/`cancelGate` 只检查"actorId 非空"，任何只读调用者都能回退 cursor、取消门任务。判定**失败关闭**：未声明角色即拒绝。
+  - **重入的乐观并发进锁（P1-03）**：`reenter` 的顺序改为「取锁 → 读检查点 → 读产物算 digest → 比较 → 重入 → 释放锁」。此前 digest 校验在锁外，两个进程可以各自"校验通过"然后先后写入，后写的静默覆盖先写的。
+  - 剩余 P1/P2 项的状态见 `docs/11-m0-m4-audit-and-remediation-plan.md` 第 13 节（P1-04~P1-09、P2-02~P2-06 仍未修复）。
 - 文档解析（P0-A1 完成）：`documents/` 已提供注册表 + 统一中间表示 + **PDF/DOCX/XLSX/Markdown 四类必支持格式** + 文本族与分隔符表格解析器；`parse_doc` 走注册表，返回 `status`/`confidence`/`sections`/`tables`/`plainText`/`sourceRefs`/`diagnostics`/`limits`，并按 §5.6.8 不回传原始字节。`.doc`/`.xls` 按 ADR-0001 §9 显式 `unsupported` 并给出定向转换提示。
   - `sourceRef` 四级可追溯：`requirements.pdf#page=3`、`spec.docx#heading=1.1,table=1,row=2`、`cases.xlsx#sheet=接口!A2:F20`、`cases.csv#table=1,row=2`。
   - 不伪装：无文本层 → `partial` + `NO_TEXT_LAYER`；无缓存公式值 → `FORMULA_VALUE_UNAVAILABLE` 且**绝不自行计算**；无解析器 → `unsupported`；二进制族 magic 不匹配 → **绝不退回按文本读**。

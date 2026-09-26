@@ -31,6 +31,8 @@ import {
   AsyncPipelineRunner,
   FilePipelineRunService,
   PipelineRunError,
+  assertAdminRole,
+  assertOperatorRole,
   errorMessageOf,
   redactSecrets,
 } from '../packages/platform-pipeline/src/web/index.ts'
@@ -312,8 +314,12 @@ const ROUTES = [
   }],
 
   ['POST', /^\/api\/pipelines\/([^/]+)\/cancel$/, async (req, res, pipelineId) => {
-    // 先确认调用者有权看这条流水线，再取消（否则等于把取消变成探测接口）。
-    await service.get(pipelineId, actorOf(req))
+    const actor = actorOf(req)
+    // 取消运行是**运维动作**（docs/11 P1-02）：先按角色拒绝，再确认作用域。
+    // 顺序不能反——否则 403 与 404 的差别会把"这条流水线存在吗"泄露给无权限调用者。
+    assertOperatorRole(actor, '取消运行')
+    // 再确认调用者有权看这条流水线（否则等于把取消变成探测接口）。
+    await service.get(pipelineId, actor)
     json(res, 202, { pipelineId, cancelled: runner.cancel(pipelineId, 'cancelled via web api') })
   }],
 
@@ -401,6 +407,10 @@ const ROUTES = [
 
   ['POST', /^\/api\/admin\/recover$/, async (req, res) => {
     // docs/10 §5.4 第 7 步：进程重启后扫描 running/awaiting-gate 并恢复或标记可重入。
+    // 恢复会**启动后台运行**（消耗模型预算、推进检查点），因此是平台管理动作：
+    // 只允许 admin（docs/11 P1-02）。恢复本身仍用不声明角色的后台身份驱动，
+    // 所以它永远不会替真人裁决人工门。
+    assertAdminRole(actorOf(req), '恢复扫描')
     json(res, 200, { outcomes: await runner.recover() })
   }],
 ]

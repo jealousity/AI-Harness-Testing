@@ -435,6 +435,24 @@ test('executor_run refuses to run without a target base url (no forged execution
   assert.equal(result.records, undefined)
 })
 
+test('executor_run 在建连前再次校验 targetBaseUrl：清单被篡改成内网地址也不能发请求（docs/11 P1-01）', async () => {
+  await writeDesign({ testCases: [{ id: 'c1', steps: [{ action: 'GET /health' }] }] })
+  let sent = 0
+  const context = baseContext({
+    targetBaseUrl: 'http://127.0.0.1:9',
+    // 宿主注入的校验器：与 `assertTargetBaseUrlAllowed` 同一份判据，这里用受控替身
+    // 观察"是否真的在发请求前被调用过"。
+    assertTargetBaseUrl: url => {
+      sent += 1
+      throw new Error(`targetBaseUrl 不允许指向私有地址：${url}`)
+    },
+  })
+  const result = await tool(context, 'executor_run').execute({}, ctx) as { error?: string; records?: unknown[] }
+  assert.equal(sent, 1, '建连前必须调用一次宿主校验器')
+  assert.match(result.error ?? '', /不允许指向私有地址/)
+  assert.equal(result.records, undefined, '被拒时不得产出任何执行记录')
+})
+
 test('executor_run rejects a foreign pipelineId and an unknown caseId', async () => {
   await writeDesign({ testCases: [{ id: 'c1', steps: [{ action: 'GET /health' }] }] })
   const context = baseContext({ targetBaseUrl: 'http://127.0.0.1:1' })

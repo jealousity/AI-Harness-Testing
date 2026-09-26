@@ -72,6 +72,16 @@ export interface PlatformHostOptions {
    * 缺省时 `executor_run` 拒绝执行并报错——没有真实被测服务就不允许产出执行证据。
    */
   readonly targetBaseUrl?: string
+  /**
+   * `targetBaseUrl` 的**建连前复核**（docs/11 P1-01）。
+   *
+   * 为什么需要第二道校验：`targetBaseUrl` 在创建时校验过一次，但它随后以清单的形式
+   * 落在磁盘上——可能被篡改、可能来自旧版本、也可能来自另一个入口。executor 在发
+   * 请求前必须用**同一份判据**再校验一次，而不是信任上下文里的字符串。
+   *
+   * 由宿主注入（默认实现是 `assertTargetBaseUrlAllowed`）：runtime 层不反向依赖 web 层。
+   */
+  readonly assertTargetBaseUrl?: (url: string) => void
   /** `env_diag` 的固定探针白名单（模型不能自行指定目标）。 */
   readonly diagProbes?: readonly DiagSpec[]
   readonly diagTimeoutMs?: number
@@ -293,6 +303,7 @@ function buildToolRegistry(
     ...(options.receiveInput === undefined ? {} : { receiveInput: options.receiveInput }),
     checkpointRoot,
     ...(options.targetBaseUrl === undefined ? {} : { targetBaseUrl: options.targetBaseUrl }),
+    ...(options.assertTargetBaseUrl === undefined ? {} : { assertTargetBaseUrl: options.assertTargetBaseUrl }),
     ...(options.diagProbes === undefined ? {} : { diagProbes: options.diagProbes }),
     ...(options.diagTimeoutMs === undefined ? {} : { diagTimeoutMs: options.diagTimeoutMs }),
     ...(options.env === undefined ? {} : { env: options.env }),

@@ -533,3 +533,54 @@ function classifyMessage(message: string, fallback: PipelineRunErrorCode): Pipel
   if (/配置|config|templateVersion|未实现规则/i.test(message)) return 'config-invalid'
   return fallback
 }
+
+// ── 角色守卫（docs/10 §5.3、docs/11 P1-02）────────────────────────────────────
+
+/**
+ * 人工门裁决允许的角色。
+ *
+ * 与 `ActorRole` 的文档注释是同一条契约的两种写法：注释说明意图，这里的常量
+ * 是**唯一**的判定实现。此前 `reenter`/`cancelGate` 没有对应常量，于是它们
+ * 只检查了"actorId 非空"——任何只读调用者都能回退 cursor、取消门任务。
+ */
+const GATE_ROLES: readonly ActorRole[] = ['reviewer', 'admin']
+/** 运维动作（重入、取消运行、取消门任务）允许的角色。 */
+const OPERATOR_ROLES: readonly ActorRole[] = ['operator', 'admin']
+/** 平台管理动作（恢复扫描）允许的角色。 */
+const ADMIN_ROLES: readonly ActorRole[] = ['admin']
+
+/**
+ * 角色判定：**失败关闭**。
+ *
+ * 缺少 `roles` 一律视为无特权——绝不因为"字段没传"而放行，否则任何忘记声明角色的
+ * 调用方都会自动获得特权，而那正是最需要拦住的调用方（例如后台运行身份）。
+ */
+function requireRole(actor: ActorContext, allowed: readonly ActorRole[], action: string): void {
+  const roles = actor.roles ?? []
+  if (!roles.some(role => allowed.includes(role))) {
+    throw new PipelineRunError('forbidden', `${action}需要 ${allowed.join(' 或 ')} 角色`, {
+      actorId: actor.actorId,
+      required: [...allowed],
+    })
+  }
+}
+
+/** 人工门裁决（`claimGate` / `decideGate`）：reviewer 或 admin。 */
+export function assertGateRole(actor: ActorContext): void {
+  requireRole(actor, GATE_ROLES, '人工门裁决')
+}
+
+/**
+ * 运维动作（`reenter` / `cancelGate` / 取消运行）：operator 或 admin。
+ *
+ * `action` 由调用点给出，让 403 的文本直接说明**哪个**动作被拒
+ * （"流水线重入需要 operator 或 admin 角色"比"权限不足"有用得多）。
+ */
+export function assertOperatorRole(actor: ActorContext, action = '该运维动作'): void {
+  requireRole(actor, OPERATOR_ROLES, action)
+}
+
+/** 平台管理动作（`/api/admin/recover`）：admin。 */
+export function assertAdminRole(actor: ActorContext, action = '该平台管理动作'): void {
+  requireRole(actor, ADMIN_ROLES, action)
+}

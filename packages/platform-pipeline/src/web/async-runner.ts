@@ -209,6 +209,12 @@ export class AsyncPipelineRunner {
    * 否则运维会以为"全部已恢复"。
    *
    * 返回结果按 `pipelineId` 排序，便于日志对比与测试断言。
+   *
+   * **身份边界**（docs/11 P1-02）：恢复会启动后台运行（消耗模型预算、推进检查点），
+   * 属于平台管理动作，只允许 `admin`。本方法**不自己校验身份**——它是平台内部调度
+   * 入口，没有请求上下文；把关由调用它的宿主负责（Web 外壳在 `POST /api/admin/recover`
+   * 上调用 `assertAdminRole`）。后台运行本身仍用不声明角色的身份驱动，
+   * 因此恢复永远不会替真人裁决人工门。
    */
   async recover(): Promise<readonly RecoveryOutcome[]> {
     const scan = await scanPipelineIndex(this.options.dataRoot)

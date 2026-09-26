@@ -868,3 +868,28 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 > **DeepSeek 已完成 M0-M4 的大量主体代码和测试，但未完成所有 M0-M4 的正确性闭环。当前最准确的状态是：M0 主体完成、M1/M2 存在 P1 阻断项、M3 主体完成、M4-A 完成、M4-B 仅接口层完成、M5 未开始收口。**
 
 在 P1-01、P1-02、P1-03、P1-04、P1-05、P1-06、P1-07、P1-09 修复并通过新增验收前，不得对外宣称“平台化 M0-M4 全部完成”。
+
+---
+
+## 13. 修复进度
+
+> 本节由修复提交维护。**只有"代码 + 失败路径测试 + 全量验证"三者齐备才标记 ✅**；
+> 只交付接口或只更新文档的项一律保持 ⬜，并在备注里写明真实状态。
+
+| 编号 | 问题 | 状态 | 证据 |
+|---|---|---|---|
+| P1-01 | create 运行参数没有持久化 | ✅ 已修复 | `PipelineRunManifest`（= 流水线索引，同一份文件同一次原子写）；`hostOptions()` 全部从清单读取；幂等指纹覆盖全部行为参数；executor 建连前复核。测试：`test/web-run-manifest.test.ts`（10 项）+ `test/platform-tools.test.ts` 的建连前复核 |
+| P1-02 | viewer 可执行 reenter/cancel/recover | ✅ 已修复 | `assertGateRole` / `assertOperatorRole` / `assertAdminRole` 收敛到 `pipeline-run-types.ts`，service 与 HTTP 外壳共用。测试：`test/web-actor-roles.test.ts`（8 项）+ `test/web-http.test.ts` 的 viewer 403 |
+| P1-03 | reenter 的 digest 校验在锁外 | ✅ 已修复 | `reenter` 改为「取锁 → 读检查点 → 算 digest → 比较 → 重入」；观测面测试：别人持锁 + 检查点缺失时必须报 `conflict` 而不是锁外快照的 `not-found`。测试：`test/pipeline-run-service.test.ts` 的 2 项 |
+| P1-04 | 人工门不绑定 artifact digest | ⬜ 未修复 | 批次 B |
+| P1-05 | 文件 gate task 非 CAS | ⬜ 未修复 | 批次 B |
+| P1-06 | review-failed 未持久化终态 | ⬜ 未修复 | 批次 B |
+| P1-07 | executor 崩溃窗口可重复副作用 | ⬜ 未修复 | 批次 C |
+| P1-08 | 幂等台账与业务写入非同事务 | ⬜ 未修复 | 批次 C |
+| P1-09 | StorageBackend 未接入宿主装配 | ⬜ 未修复 | 批次 D |
+| P2-01 | `readIndex` 校验不统一 | 🟡 部分修复 | `readIndex` 已复用 `isIndexEntry` 并校验文件名一致性（P1-01 的"不静默降级"依赖它）；**checkpoint.pipelineId 交叉校验仍未做**，见批次 E |
+| P2-02 | parser 未在 readFile 前限制字节 | ⬜ 未修复 | 批次 E |
+| P2-03 | 压缩比策略未接入 zip reader | ⬜ 未修复 | 批次 E |
+| P2-04 | SSRF userinfo / mapped IPv6 | ⬜ 未修复 | 批次 E |
+| P2-05 | 更新 docs/10 旧基线 | ⬜ 未修复 | 批次 E |
+| P2-06 | 部署与恢复 runbook | ⬜ 未修复 | 批次 E |

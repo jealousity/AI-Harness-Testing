@@ -62,16 +62,22 @@ class WebApp {
   port = 0
   private child: ChildProcess | null = null
   private output = ''
+  /** 覆盖 `start()` 里的默认环境变量（例如把身份降级成 `viewer` 验证 403）。 */
+  private readonly envOverrides: Readonly<Record<string, string>>
 
-  private constructor(dir: string) {
+  private constructor(dir: string, envOverrides: Readonly<Record<string, string>> = {}) {
     this.dir = dir
     this.configPath = join(dir, 'pipeline.json')
     this.spawnLog = join(dir, 'spawns.log')
+    this.envOverrides = envOverrides
   }
 
-  static async create(configOverrides: Record<string, unknown> = {}): Promise<WebApp> {
+  static async create(
+    configOverrides: Record<string, unknown> = {},
+    envOverrides: Record<string, string> = {},
+  ): Promise<WebApp> {
     const dir = await mkdtemp(join(tmpdir(), 'pp-web-'))
-    const app = new WebApp(dir)
+    const app = new WebApp(dir, envOverrides)
     // 用 JSON 写配置：`loadPipelineConfig` 按扩展名判格式，JSON 不需要 YAML 转义。
     await writeFile(app.configPath, JSON.stringify(baseConfig(configOverrides), null, 2), 'utf8')
     await writeFile(app.spawnLog, '', 'utf8')
@@ -123,6 +129,7 @@ class WebApp {
         PLATFORM_GATE_WAIT_TIMEOUT_MS: '0',
         PLATFORM_HOST_MODULE: join(this.dir, 'scripted-host.mjs'),
         SPAWN_LOG: this.spawnLog,
+        ...this.envOverrides,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
@@ -203,8 +210,9 @@ class WebApp {
 async function withApp(
   run: (app: WebApp) => Promise<void>,
   configOverrides: Record<string, unknown> = {},
+  envOverrides: Record<string, string> = {},
 ): Promise<void> {
-  const app = await WebApp.create(configOverrides)
+  const app = await WebApp.create(configOverrides, envOverrides)
   try {
     await app.start()
     await run(app)
@@ -694,6 +702,30 @@ test('鉴权入口：默认不信任请求头，伪造身份头不产生任何�
     const claimed = await response.json()
     assert.equal(claimed.claimedBy, 'e2e-operator')
   })
+})
+
+test('运维动作的角色边界（docs/11 P1-02）：viewer 不能取消运行、不能触发恢复扫描，也不能重入', async () => {
+  // 服务端身份降级成 viewer：人工门裁决、重入、取消、恢复都必须被拒。
+  await withApp(async app => {
+    const created = await app.request('POST', `/api/projects/${PROJECT_ID}/pipelines`, { pipelineId: PIPELINE_ID })
+    assert.equal(created.status, 202, JSON.stringify(created.body))
+
+    const cancel = await app.request('POST', `/api/pipelines/${PIPELINE_ID}/cancel`)
+    assert.equal(cancel.status, 403, `viewer 不得取消运行：${JSON.stringify(cancel.body)}`)
+    assert.equal(cancel.body.error.code, 'forbidden')
+    assert.match(cancel.body.error.message, /取消运行需要 operator 或 admin 角色/)
+
+    const reenter = await app.request('POST', `/api/pipelines/${PIPELINE_ID}/reenter`, { stageId: 'receive', reason: '想回退' })
+    assert.equal(reenter.status, 403, `viewer 不得重入：${JSON.stringify(reenter.body)}`)
+    assert.match(reenter.body.error.message, /流水线重入需要 operator 或 admin 角色/)
+
+    const recover = await app.request('POST', '/api/admin/recover')
+    assert.equal(recover.status, 403, `viewer 不得触发恢复扫描：${JSON.stringify(recover.body)}`)
+    assert.match(recover.body.error.message, /恢复扫描需要 admin 角色/)
+
+    // 只读查询仍然可用（拒绝的是改变状态的动作，不是把这个身份一刀切封掉）。
+    assert.equal((await app.request('GET', `/api/pipelines/${PIPELINE_ID}`)).status, 200)
+  }, {}, { PLATFORM_ACTOR_ROLES: 'viewer' })
 })
 
 test('错误映射：configRef 白名单、未知流水线 404、非法裁决 400、未知阶段 400', async () => {

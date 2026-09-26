@@ -91,6 +91,14 @@ export interface PlatformToolContext {
    */
   readonly targetBaseUrl?: string
   /**
+   * `targetBaseUrl` 的**建连前复核**（docs/11 P1-01）。
+   *
+   * 宿主注入（生产是 `assertTargetBaseUrlAllowed`）。缺省 = 不复核，仅用于
+   * 不经过 Web/CLI 创建流程的测试；**真实宿主必须注入**，否则"创建时校验过一次"
+   * 会被当成永久有效，而清单是磁盘文件。
+   */
+  readonly assertTargetBaseUrl?: (url: string) => void
+  /**
    * `env_diag` 的固定探针白名单（docs/06：不授予任意命令执行权）。
    * 模型不能自行指定目标；缺省 = 探针未配置。
    */
@@ -776,6 +784,19 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
           { error: '宿主未配置被测服务基址（targetBaseUrl）：拒绝伪造执行记录，execute 阶段的 R4-08/09/10 将无法通过。' },
           { success: false, errorCode: 'executor-unavailable' },
         )
+      }
+      // 建连前复核（docs/11 P1-01）：`targetBaseUrl` 来自持久化清单，是磁盘文件，
+      // 可能被篡改或来自旧版本。创建时校验过一次不等于它现在仍然安全——
+      // 这里必须用同一份判据再看一眼，且**在发出任何请求之前**。
+      if (ctx.assertTargetBaseUrl !== undefined) {
+        try {
+          ctx.assertTargetBaseUrl(baseUrl)
+        } catch (error) {
+          return await finish(
+            { error: `被测服务基址未通过宿主复核，拒绝执行：${errorMessage(error)}` },
+            { success: false, errorCode: 'target-unavailable' },
+          )
+        }
       }
       const requested = isNonEmptyString(args?.pipelineId) ? String(args.pipelineId) : ctx.pipelineId
       if (requested !== ctx.pipelineId) {
