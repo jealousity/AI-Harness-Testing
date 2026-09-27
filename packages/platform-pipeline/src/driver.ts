@@ -244,19 +244,34 @@ export class PipelineDriver {
       //    重复审核既浪费一次盲审预算，也可能让「真人正在看的那份结论」被新结论替换。
       let review: ReviewOutcome | undefined
       if (!parked && this.options.cfg.stages[stageId]!.review.enabled && this.options.review !== undefined) {
-        review = await this.options.review.run(stageId, artifact, gate)
+        // 交叉检查看的是**最终产物** `filled`，与机器门禁、人工门、检查点冻结的
+        // digest 完全同源（docs/11 P1-04）。此前这里传的是裸 `artifact`：机器门禁按
+        // `filled.digest` 判、审核与人工门却按 `artifact.digest` 看，同一阶段存在两个
+        // "产物身份"，审核结论与最终冻结进检查点的摘要可能对不上。
+        review = await this.options.review.run(stageId, filled, gate)
         if (review.verdict === 'fail') {
           const retried = state.failures.filter(f => f.kind === 'review-fail').length
+          const recorded = {
+            kind: 'review-fail',
+            at: Date.now(),
+            rule: 'review',
+            detail: review.findings.join('\n'),
+          }
           if (retried < this.reviewRetryLimit(stageId)) {
             cp = await this.update(cp, stageId, {
               status: 'needs-fix',
-              failures: [
-                ...state.failures,
-                { kind: 'review-fail', at: Date.now(), rule: 'review', detail: review.findings.join('\n') },
-              ],
+              failures: [...state.failures, recorded],
             })
             continue // findings 经 stageRunContext 回喂重跑（≤1 次）
           }
+          // 重试预算耗尽：必须**落盘终态**（docs/11 P1-06）。只返回结果而不写检查点，
+          // 重启后状态会停在 `needs-fix`，恢复扫描据此判成"续跑"→ 再 spawn 一次、
+          // 再跑一次审核，等于绕过上限；而且"当前进程的返回结果"与"重启后读到的状态"
+          // 会是两个不同的词。
+          cp = await this.update(cp, stageId, {
+            status: 'review-failed',
+            failures: [...state.failures, recorded],
+          })
           return { outcome: 'review-failed', stageId }
         }
         if (review.verdict === 'degraded') {
@@ -273,7 +288,10 @@ export class PipelineDriver {
       const gateStartedAt = this.now()
       let decision: HumanDecision
       try {
-        decision = await this.options.human.gate(stageId, artifact, gate, review)
+        // 人工门看的也是 `filled`（与机器门禁、交叉检查同一份产物，docs/11 P1-04）：
+        // 真人批准的对象必须就是检查点将要冻结的那个 digest，否则"批准"与
+        // "被批准的内容"会错位。
+        decision = await this.options.human.gate(stageId, filled, gate, review)
       } catch (error) {
         await this.record({ stageId, kind: 'gate', startedAt: gateStartedAt, finishedAt: this.now(), success: false, errorCode: usageErrorCode(error) })
         throw error

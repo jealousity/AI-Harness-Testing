@@ -15,11 +15,12 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
 import type { PipelineConfig } from '../src/types.ts'
+import { STAGE_ORDER } from '../src/types.ts'
 import { AsyncPipelineRunner, decideRecovery } from '../src/web/async-runner.ts'
 import { pipelineIndexDir, type PipelineRunServiceOptions } from '../src/web/pipeline-run-service.ts'
 import { FilePipelineRunService } from '../src/web/pipeline-run-service.ts'
 import { PipelineRunError, type ActorContext } from '../src/web/pipeline-run-types.ts'
-import { CREATE, REVIEWER, ScriptedHost, baseConfig } from './web-fixtures.ts'
+import { CREATE, REVIEWER, SCOPE, ScriptedHost, baseConfig } from './web-fixtures.ts'
 
 let dir: string
 let config: PipelineConfig
@@ -316,4 +317,49 @@ test('shutdown 中止全部后台运行并返回被中止的 id', async () => {
   assert.ok(Array.isArray(cancelled))
   await runner.idle()
   assert.deepEqual(runner.runningIds(), [])
+})
+
+// ── P1-06：review-failed 必须是持久化终态（docs/11）──────────────────────────
+
+/** 打开 analyze 阶段的交叉检查（`baseConfig` 默认全部关闭）。 */
+function configWithReview(): PipelineConfig {
+  return baseConfig({
+    stages: Object.fromEntries(
+      STAGE_ORDER.map(id => [id, { rules: [], review: { enabled: id === 'analyze' } }]),
+    ),
+  })
+}
+
+test('review 重试耗尽：当前进程结果、重启后的 get、恢复扫描三者语义一致且不再 spawn', async () => {
+  config = configWithReview()
+  const host = new ScriptedHost({ review: () => ({ verdict: 'fail', findings: ['覆盖率不足'] }) })
+  const service = serviceOf(host)
+  await service.create(CREATE, REVIEWER)
+
+  // 先推进到 analyze：receive 的人工门不裁决就不会往下走（服务默认 `gateWaitTimeoutMs: 0`）。
+  assert.equal((await service.run('pipe-1', REVIEWER)).outcome, 'waiting-human')
+  const [receiveTask] = await service.listGateTasks(SCOPE, REVIEWER)
+  await service.claimGate({ ...SCOPE, gateTaskId: receiveTask!.gateTaskId }, REVIEWER)
+  await service.decideGate({ ...SCOPE, gateTaskId: receiveTask!.gateTaskId, action: 'approved' }, REVIEWER)
+
+  const result = await service.run('pipe-1', REVIEWER)
+  assert.equal(result.outcome, 'review-failed', `期望 review-failed，实际 ${result.outcome}`)
+  const analyzeSpawns = host.stages.filter(stage => stage === 'analyze').length
+  assert.equal(analyzeSpawns, 2, '初始一次 + 重试一次')
+
+  // 进程重启：全新 service 实例 + 全新 runner，只共享同一个 dataRoot。
+  const restartedHost = new ScriptedHost({ review: () => ({ verdict: 'fail', findings: ['覆盖率不足'] }) })
+  const restarted = serviceOf(restartedHost)
+  const view = await restarted.get('pipe-1', REVIEWER)
+  assert.equal(view.status, 'review-failed', '重启后状态必须与当前进程的返回结果一致')
+  assert.equal(view.failure?.kind, 'review-failed')
+  assert.match(view.failure?.detail ?? '', /覆盖率不足/)
+
+  const runner = runnerOf(restarted)
+  const outcomes = await runner.recover()
+  const mine = outcomes.find(item => item.pipelineId === 'pipe-1')!
+  assert.equal(mine.action, 'terminal', '终态必须不被恢复扫描重启')
+  assert.equal(mine.started, false)
+  await runner.idle()
+  assert.deepEqual(restartedHost.stages, [], '恢复扫描不得再 spawn 任何阶段（否则绕过 review 重试上限）')
 })

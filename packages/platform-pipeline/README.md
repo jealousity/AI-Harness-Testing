@@ -106,7 +106,7 @@ await ctx.plugin(platformPipelineHost, {
 ## 状态
 
 - 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）+ 2 份 ADR（docs/adr/0001 文档解析库选型、docs/adr/0002 存储后端选型与事务边界）
-- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **729 项测试全绿**
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **751 项测试全绿**
   - 注：在受限沙箱里跑全量 `node --test` 时，`test/fs-tools.test.ts` 的清理步骤可能被宿主 `safe-delete` 批量删除守卫拦下（按「每轮删除次数 > 阈值」判定，与代码无关）。单独运行该文件即通过。
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
 - Web 运行服务（M0 契约层）：`platform-pipeline/web` 提供无 HTTP 框架依赖的 `PipelineRunService`，覆盖 create/get/list/run/reenter 与人工门 list/claim/decide/cancel，以及 `getStageArtifact`/`listEvents`/`scanPipelineIndex`；Web 状态与阶段视图全部由检查点、产物与人工门任务重建，服务层不复制阶段逻辑。
@@ -151,6 +151,10 @@ await ctx.plugin(platformPipelineHost, {
   - **运维角色边界（P1-02）**：`assertGateRole` / `assertOperatorRole` / `assertAdminRole` 收敛到一处，service 与 HTTP 外壳共用。`reenter`、`cancelGate`、取消运行要求 `operator`/`admin`，`/api/admin/recover` 要求 `admin`。此前 `reenter`/`cancelGate` 只检查"actorId 非空"，任何只读调用者都能回退 cursor、取消门任务。判定**失败关闭**：未声明角色即拒绝。
   - **重入的乐观并发进锁（P1-03）**：`reenter` 的顺序改为「取锁 → 读检查点 → 读产物算 digest → 比较 → 重入 → 释放锁」。此前 digest 校验在锁外，两个进程可以各自"校验通过"然后先后写入，后写的静默覆盖先写的。
   - 剩余 P1/P2 项的状态见 `docs/11-m0-m4-audit-and-remediation-plan.md` 第 13 节（P1-04~P1-09、P2-02~P2-06 仍未修复）。
+- **审计整改批次 B 完成（docs/11 P1-04 / P1-05 / P1-06）**：
+  - **人工门绑定产物版本（P1-04）**：`HumanGateTask` 新增 `artifactDigest`，可续用判定改为 `pipelineId + stageId + artifactPath + artifactDigest + machineStatus`。批准的身份是"某个产物版本"而不是"那个路径上的东西"：同路径内容被替换后，旧任务既不能批准新内容，也不会让真人对着新内容看旧 findings（此时**新开门**，旧任务原样保留作审计）。**没有 digest 的旧记录不可续用**（失败关闭：无法确认批准对象时宁可多问一次）。同时把 driver 的**机器门禁、交叉检查与人工门统一到同一份 `filled` 产物**——此前机器门禁按填充后的 digest 判、审核与人工门却看裸产物，同一阶段存在两个"产物身份"。
+  - **门任务读写原子化（P1-05）**：`claim`/`decide`/`cancel`/`consume`/`expire` 此前都是 `get → 检查 → save`，两个调用者可以同时读到同一个 pending 快照、各自通过检查、再先后写入——两个调用都"成功"而磁盘只剩最后一个。文件后端改为 per-task 互斥（`mkdir` 独占 + 持有者令牌 + 有界等待 2s + 过期锁原子回收），内存后端加进程内 per-task 串行链保持**同语义**；抢不到抛 `GateTaskBusyError`，按类型映射成 `conflict`(409)。契约套件新增 2 项并发用例，file/memory/compose 三后端各跑一遍。
+  - **交叉检查失败成为持久化终态（P1-06）**：`CheckpointStatus` 新增 `review-failed`。此前 driver 只返回结果、不写检查点，于是重启后状态停在 `needs-fix`、恢复扫描判成"续跑"→ **再 spawn 一次并重跑审核**，等于绕过 review 重试上限；而且"当前进程的返回结果"与"重启后读到的状态"是两个不同的词。现在二者字面一致，`decideRecovery` 对它返回 `terminal`。
 - 文档解析（P0-A1 完成）：`documents/` 已提供注册表 + 统一中间表示 + **PDF/DOCX/XLSX/Markdown 四类必支持格式** + 文本族与分隔符表格解析器；`parse_doc` 走注册表，返回 `status`/`confidence`/`sections`/`tables`/`plainText`/`sourceRefs`/`diagnostics`/`limits`，并按 §5.6.8 不回传原始字节。`.doc`/`.xls` 按 ADR-0001 §9 显式 `unsupported` 并给出定向转换提示。
   - `sourceRef` 四级可追溯：`requirements.pdf#page=3`、`spec.docx#heading=1.1,table=1,row=2`、`cases.xlsx#sheet=接口!A2:F20`、`cases.csv#table=1,row=2`。
   - 不伪装：无文本层 → `partial` + `NO_TEXT_LAYER`；无缓存公式值 → `FORMULA_VALUE_UNAVAILABLE` 且**绝不自行计算**；无解析器 → `unsupported`；二进制族 magic 不匹配 → **绝不退回按文本读**。

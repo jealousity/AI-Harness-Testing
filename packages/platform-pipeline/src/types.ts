@@ -128,9 +128,21 @@ export interface PipelineConfig {
 
 // ── 检查点（docs/02 第 9 节 / docs/03 第 8 节）─────────────────────────────
 
+/**
+ * 阶段状态。
+ *
+ * `gate-failed` 与 `review-failed` 都是**持久化终态**（docs/11 P1-06）：
+ * 它们由 driver 当场落盘，因此重启后 `get` 与恢复扫描看到的是同一件事——
+ * `decideRecovery` 对二者都返回 `terminal`，不会替人决定重跑。
+ *
+ * `review-failed` 曾经不存在（driver 只返回结果、不落盘），后果是重启后状态仍停在
+ * `needs-fix`、恢复扫描把它当"续跑"、于是**再 spawn 一次并重跑一次审核**——
+ * 等于绕过 review 重试上限。新增这个状态就是为了让"当前进程的返回结果"与
+ * "重启后从磁盘读到的状态"是同一个词。
+ */
 export type CheckpointStatus =
   | 'idle' | 'running' | 'produced' | 'needs-fix'
-  | 'gate-failed' | 'awaiting-gate' | 'done' | 'needs-reentry'
+  | 'gate-failed' | 'review-failed' | 'awaiting-gate' | 'done' | 'needs-reentry'
 
 export interface Violation {
   readonly rule: string

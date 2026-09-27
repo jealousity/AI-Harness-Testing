@@ -881,9 +881,9 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 | P1-01 | create 运行参数没有持久化 | ✅ 已修复 | `PipelineRunManifest`（= 流水线索引，同一份文件同一次原子写）；`hostOptions()` 全部从清单读取；幂等指纹覆盖全部行为参数；executor 建连前复核。测试：`test/web-run-manifest.test.ts`（10 项）+ `test/platform-tools.test.ts` 的建连前复核 |
 | P1-02 | viewer 可执行 reenter/cancel/recover | ✅ 已修复 | `assertGateRole` / `assertOperatorRole` / `assertAdminRole` 收敛到 `pipeline-run-types.ts`，service 与 HTTP 外壳共用。测试：`test/web-actor-roles.test.ts`（8 项）+ `test/web-http.test.ts` 的 viewer 403 |
 | P1-03 | reenter 的 digest 校验在锁外 | ✅ 已修复 | `reenter` 改为「取锁 → 读检查点 → 算 digest → 比较 → 重入」；观测面测试：别人持锁 + 检查点缺失时必须报 `conflict` 而不是锁外快照的 `not-found`。测试：`test/pipeline-run-service.test.ts` 的 2 项 |
-| P1-04 | 人工门不绑定 artifact digest | ⬜ 未修复 | 批次 B |
-| P1-05 | 文件 gate task 非 CAS | ⬜ 未修复 | 批次 B |
-| P1-06 | review-failed 未持久化终态 | ⬜ 未修复 | 批次 B |
+| P1-04 | 人工门不绑定 artifact digest | ✅ 已修复 | `HumanGateTask.artifactDigest`；`findResumableTask` 判定改为 `pipelineId + stageId + artifactPath + artifactDigest + machineStatus`；无 digest 的旧记录不可续用（失败关闭）；driver 把**同一份 `filled` 产物**交给机器门禁、交叉检查与人工门。测试：`test/human-gate-artifact-digest.test.ts`（6 项）+ `test/driver.test.ts` 的"三处同源"用例 |
+| P1-05 | 文件 gate task 非 CAS | ✅ 已修复 | 文件后端新增 per-task 互斥（`mkdir` 独占 + 持有者令牌 + 有界等待 + 过期锁原子回收），`claim`/`decide`/`cancel`/`consume`/`expire` 全部进临界区；内存后端加进程内 per-task 串行链保持同语义；`GateTaskBusyError` 按**类型**映射成 `conflict`(409)。测试：`test/persistence.test.ts`（6 项）+ 契约套件新增 2 项并发用例（file/memory/compose 三后端各跑一遍） |
+| P1-06 | review-failed 未持久化终态 | ✅ 已修复 | `CheckpointStatus` 新增 `review-failed`；driver 在重试耗尽时落盘终态 + 最后一次 findings/时间戳；`deriveRunStatus` / `deriveRunFailure` / `decideRecovery` 同步；Web UI 补标签。测试：`test/driver.test.ts`（2 项）+ `test/web-async-runner.test.ts`（端到端：当前进程结果 == 重启后 get == recover terminal，且不再 spawn） |
 | P1-07 | executor 崩溃窗口可重复副作用 | ⬜ 未修复 | 批次 C |
 | P1-08 | 幂等台账与业务写入非同事务 | ⬜ 未修复 | 批次 C |
 | P1-09 | StorageBackend 未接入宿主装配 | ⬜ 未修复 | 批次 D |

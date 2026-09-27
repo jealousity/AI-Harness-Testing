@@ -14,7 +14,7 @@
 import { join } from 'node:path'
 
 import { normalizeConfig } from '../src/config.ts'
-import { PipelineDriver, type ArtifactStore } from '../src/driver.ts'
+import { PipelineDriver, type ArtifactStore, type ReviewOutcome } from '../src/driver.ts'
 import { resolvePlatformRoots } from '../src/platform-roots.ts'
 import { STAGE_ORDER, type PipelineConfig, type StageId } from '../src/types.ts'
 import { DEFAULT_RULESET_VERSION, buildGateEngine, gateTaskStoreDir, taskStoreDir } from '../src/runtime/platform-host.ts'
@@ -114,6 +114,14 @@ export interface ScriptedHostOptions {
   readonly budgetExceededStages?: readonly StageId[]
   /** 超限维度；缺省 `max-steps`。 */
   readonly budgetExceededKind?: UsageLimitKind
+  /**
+   * 交叉检查裁决工厂（docs/11 P1-06 的端到端复现需要它）。
+   *
+   * 缺省不装配审核：`baseConfig` 把每个阶段的 `review.enabled` 置为 false，
+   * 因此"审核失败"这条路径在服务层测试里默认不可达。要覆盖它，
+   * 测试需要同时打开配置里的 `review.enabled` 并在这里给出裁决。
+   */
+  readonly review?: (stageId: StageId) => ReviewOutcome
 }
 
 /** 记录 spawn 调用的脚本化运行器：用于断言"已批准阶段不重生成"。 */
@@ -249,6 +257,9 @@ export class ScriptedHost {
       artifacts,
       checkpoint: new FsCheckpointPort(),
       usage,
+      ...(this.options.review === undefined
+        ? {}
+        : { review: { run: async (stageId: StageId) => this.options.review!(stageId) } }),
     })
     return {
       roots,

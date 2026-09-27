@@ -107,12 +107,15 @@ test('PersistentHumanGate records machine violations and review findings on the 
 test('PersistentHumanGate resumes an open task after a restart instead of opening a second gate', async () => {
   const store = new FileHumanGateTaskStore(storeDir())
   // 模拟上一次进程在等待人工裁决时崩溃留下的未决任务。
+  // `artifactDigest` 必须写：可续用的判据是 `路径 + digest`（docs/11 P1-04），
+  // 没有 digest 的旧记录**不可续用**（失败关闭——无法确认批准对象时宁可多问一次）。
   await store.create({
     gateTaskId: 'gate-orphan',
     projectId: 'demo',
     pipelineId: 'p1',
     stageId: 'analyze',
     artifactPath: 'artifacts/p1/analyze.json',
+    artifactDigest: artifact().digest,
     machineStatus: 'passed',
     machineViolations: [],
     expiresAt: Date.now() + 60_000,
@@ -147,12 +150,14 @@ test('PersistentHumanGate resumes an open task after a restart instead of openin
 test('PersistentHumanGate reuses a decided-but-unconsumed gate exactly once', async () => {
   const store = new FileHumanGateTaskStore(storeDir())
   // 人工在流水线未运行时完成了裁决：这条结论必须被下一次 run 认领，而不是被丢弃。
+  // `artifactDigest` 与本次送审产物一致，才是"同一条裁决"（docs/11 P1-04）。
   await store.create({
     gateTaskId: 'gate-old',
     projectId: 'demo',
     pipelineId: 'p1',
     stageId: 'analyze',
     artifactPath: 'artifacts/p1/analyze.json',
+    artifactDigest: artifact().digest,
     machineStatus: 'passed',
     machineViolations: [],
     status: 'changes-needed',
@@ -428,7 +433,8 @@ test('PersistentHumanGate returns a decision already present on the first poll (
   const store = new FileHumanGateTaskStore(storeDir())
   await store.create({
     gateTaskId: 'gate-ready', projectId: 'demo', pipelineId: 'p1', stageId: 'analyze',
-    artifactPath: 'artifacts/p1/analyze.json', machineStatus: 'passed', machineViolations: [],
+    artifactPath: 'artifacts/p1/analyze.json', artifactDigest: artifact().digest,
+    machineStatus: 'passed', machineViolations: [],
     status: 'approved', decision: { by: 'alice', action: 'approved', note: '', at: 1 },
     expiresAt: Date.now() + 60_000,
   })

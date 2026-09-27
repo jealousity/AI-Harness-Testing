@@ -1084,6 +1084,9 @@ export function deriveRunStatus(checkpoint: Checkpoint, tasks: readonly HumanGat
   }
 
   if (states.some(state => state.status === 'gate-failed')) return 'gate-failed'
+  // 交叉检查重试耗尽：与 gate-failed 同为**持久化终态**（docs/11 P1-06），
+  // 因此恢复扫描不会把它当"续跑"重启，重跑必须显式 reenter。
+  if (states.some(state => state.status === 'review-failed')) return 'review-failed'
   if (states.some(state => state.status === 'needs-fix')) return 'needs-fix'
   if (states.some(state => state.status === 'needs-reentry')) return 'running'
   if (states.some(state => state.status === 'running' || state.status === 'produced')) return 'running'
@@ -1109,12 +1112,11 @@ function deriveRunFailure(
     const detail = status === 'rejected' ? task?.decision?.note ?? '' : task?.cancellation?.note ?? ''
     return { kind: status, stageId, detail }
   }
-  if (status === 'needs-fix') {
-    const stageId = STAGE_ORDER.find(id => checkpoint.stageStates[id]!.status === 'needs-fix')
+  if (status === 'review-failed') {
+    const stageId = STAGE_ORDER.find(id => checkpoint.stageStates[id]!.status === 'review-failed')
     if (stageId === undefined) return null
     const last = lastFailureOf(checkpoint.stageStates[stageId]!)
-    if (last === undefined || last.kind !== 'review-fail') return null
-    return { kind: 'review-failed', stageId, detail: last.detail ?? '' }
+    return { kind: 'review-failed', stageId, detail: last?.detail ?? '' }
   }
   return null
 }

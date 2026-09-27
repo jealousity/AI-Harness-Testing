@@ -431,7 +431,31 @@ function memoryTaskStore(map: Map<string, string>): StoragePorts['tasks'] {
 
 // ── 人工门任务 ──────────────────────────────────────────────────────────────────
 
+/**
+ * 进程内 per-task 互斥（docs/11 P1-05）。
+ *
+ * 与文件后端同一语义、同一必要性：`get → 检查 → save` 不是原子操作，
+ * 而 `await read(...)` 会让出事件循环，因此同一个进程里两个并发 claim 也能读到
+ * 同一份 pending 快照、各自通过检查、再先后写入——两个调用都"成功"。
+ * 后端之间行为必须一致，所以这里不能因为"内存里看起来是同步的"就省掉它。
+ *
+ * 实现是**串行链**：同一 key 上的 `work` 严格排队；链尾 settle 后清掉条目，
+ * Map 不会随任务数无限增长。
+ */
+function perTaskMutex(): <T>(key: string, work: () => Promise<T>) => Promise<T> {
+  const chains = new Map<string, Promise<void>>()
+  return (key, work) => {
+    const previous = chains.get(key) ?? Promise.resolve()
+    const next = previous.then(work, work)
+    const tail = next.then(() => undefined, () => undefined)
+    chains.set(key, tail)
+    void tail.then(() => { if (chains.get(key) === tail) chains.delete(key) })
+    return next
+  }
+}
+
 function memoryGateTaskStore(map: Map<string, string>): StoragePorts['gateTasks'] {
+  const locked = perTaskMutex()
   const read = (gateTaskId: string): HumanGateTask | null => {
     const key = KEY.gateTask(gateTaskId)
     const text = map.get(key)
@@ -467,37 +491,54 @@ function memoryGateTaskStore(map: Map<string, string>): StoragePorts['gateTasks'
     },
     async claim(gateTaskId, actor, ttlMs) {
       validateLease(actor, ttlMs)
-      const current = require(gateTaskId)
-      if (!['pending', 'claimed'].includes(current.status)) throw new Error(`human gate task is not claimable: ${current.status}`)
-      if (current.lease !== undefined && current.lease.expiresAt > Date.now() && current.lease.owner !== actor) throw new Error(`human gate task is claimed by ${current.lease.owner}`)
-      const now = Date.now()
-      return save({ ...current, status: 'claimed', claimedBy: actor, lease: { owner: actor, acquiredAt: current.lease?.acquiredAt ?? now, expiresAt: now + ttlMs }, updatedAt: now })
+      return locked(gateTaskId, async () => {
+        const current = require(gateTaskId)
+        if (!['pending', 'claimed'].includes(current.status)) throw new Error(`human gate task is not claimable: ${current.status}`)
+        if (current.lease !== undefined && current.lease.expiresAt > Date.now() && current.lease.owner !== actor) throw new Error(`human gate task is claimed by ${current.lease.owner}`)
+        const now = Date.now()
+        return save({ ...current, status: 'claimed', claimedBy: actor, lease: { owner: actor, acquiredAt: current.lease?.acquiredAt ?? now, expiresAt: now + ttlMs }, updatedAt: now })
+      })
     },
     async decide(gateTaskId, actor, action, note) {
-      const current = require(gateTaskId)
-      if (current.status !== 'claimed' || current.claimedBy !== actor) throw new Error('human gate decision requires the active claim owner')
-      if (note.trim() === '' && action !== 'approved') throw new Error('changes-needed/rejected decisions require a non-empty note')
-      const { lease: _lease, ...withoutLease } = current
-      return save({ ...(withoutLease as HumanGateTask), status: action as HumanGateTaskStatus, decision: { by: actor, action, note, at: Date.now() }, updatedAt: Date.now(), lease: undefined })
+      return locked(gateTaskId, async () => {
+        const current = require(gateTaskId)
+        if (current.status !== 'claimed' || current.claimedBy !== actor) throw new Error('human gate decision requires the active claim owner')
+        if (note.trim() === '' && action !== 'approved') throw new Error('changes-needed/rejected decisions require a non-empty note')
+        const { lease: _lease, ...withoutLease } = current
+        return save({ ...(withoutLease as HumanGateTask), status: action as HumanGateTaskStatus, decision: { by: actor, action, note, at: Date.now() }, updatedAt: Date.now(), lease: undefined })
+      })
     },
     async expire(now = Date.now()) {
       const candidates = all().filter(task => (task.expiresAt !== undefined && task.expiresAt <= now && ['pending', 'claimed'].includes(task.status))
         || (task.lease !== undefined && task.lease.expiresAt <= now && task.status === 'claimed'))
-      return candidates.map(task => save({ ...task, status: 'expired', updatedAt: now, lease: undefined }))
+      const expired: HumanGateTask[] = []
+      for (const task of candidates) {
+        expired.push(await locked(task.gateTaskId, async () => {
+          const current = read(task.gateTaskId)
+          // 期间被别人裁决/取消了：不覆盖别人的终态。
+          if (current === null || !['pending', 'claimed'].includes(current.status)) return current ?? task
+          return save({ ...current, status: 'expired', updatedAt: now, lease: undefined })
+        }))
+      }
+      return expired
     },
     async consume(gateTaskId, at = Date.now()) {
-      const current = require(gateTaskId)
-      if (current.consumedAt !== undefined) return current
-      if (!['approved', 'changes-needed', 'rejected'].includes(current.status)) throw new Error(`human gate task is not consumable: ${current.status}`)
-      return save({ ...current, consumedAt: at, updatedAt: at })
+      return locked(gateTaskId, async () => {
+        const current = require(gateTaskId)
+        if (current.consumedAt !== undefined) return current
+        if (!['approved', 'changes-needed', 'rejected'].includes(current.status)) throw new Error(`human gate task is not consumable: ${current.status}`)
+        return save({ ...current, consumedAt: at, updatedAt: at })
+      })
     },
     async cancel(gateTaskId, actor, note = '') {
       if (actor.trim() === '') throw new Error('cancellation actor must not be empty')
-      const current = require(gateTaskId)
-      if (!['pending', 'claimed'].includes(current.status)) throw new Error(`human gate task is not cancellable: ${current.status}`)
-      const { lease: _lease, ...withoutLease } = current
-      const now = Date.now()
-      return save({ ...(withoutLease as HumanGateTask), status: 'cancelled', cancellation: { by: actor, note, at: now }, updatedAt: now, lease: undefined })
+      return locked(gateTaskId, async () => {
+        const current = require(gateTaskId)
+        if (!['pending', 'claimed'].includes(current.status)) throw new Error(`human gate task is not cancellable: ${current.status}`)
+        const { lease: _lease, ...withoutLease } = current
+        const now = Date.now()
+        return save({ ...(withoutLease as HumanGateTask), status: 'cancelled', cancellation: { by: actor, note, at: now }, updatedAt: now, lease: undefined })
+      })
     },
   }
 }

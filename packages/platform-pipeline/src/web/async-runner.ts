@@ -56,7 +56,7 @@ export type RecoveryAction = 'resume' | 'await-human' | 'terminal' | 'unreadable
  * | `queued` / `running` / `needs-fix` | `resume` | 进程在运行中被杀，检查点未落终态；driver 从 cursor 继续 |
  * | `waiting-human`（有待裁决任务） | `await-human` | 必须等真人，绝不替人做裁决 |
  * | `waiting-human`（无待裁决任务） | `resume` | 裁决已下但尚未被消费，续跑正是去消费它 |
- * | `completed` / `rejected` / `gate-failed` / `cancelled` / `failed` | `terminal` | 终态；重跑需要显式 `reenter`，恢复扫描不替人决定 |
+ * | `completed` / `rejected` / `gate-failed` / `review-failed` / `cancelled` / `failed` | `terminal` | 终态；重跑需要显式 `reenter`，恢复扫描不替人决定 |
  */
 export function decideRecovery(status: PipelineRunStatus, hasOpenGateTask: boolean): RecoveryAction {
   switch (status) {
@@ -69,6 +69,9 @@ export function decideRecovery(status: PipelineRunStatus, hasOpenGateTask: boole
     case 'completed':
     case 'rejected':
     case 'gate-failed':
+    // 交叉检查重试耗尽是终态（docs/11 P1-06）：恢复扫描若判成 resume，
+    // 会再 spawn 一次并重跑审核，等于绕过 review 重试上限。
+    case 'review-failed':
     case 'cancelled':
     case 'failed':
       return 'terminal'

@@ -16,6 +16,7 @@
  */
 
 import type { HumanGateTaskStatus } from '../runtime/persistence.ts'
+import { GateTaskBusyError } from '../runtime/persistence.ts'
 import { isStorageInfrastructureError, type StorageUnavailableError } from '../storage/ports.ts'
 import type { CheckpointStatus, InputLocks, ReentryRecord, StageId } from '../types.ts'
 
@@ -73,6 +74,7 @@ export interface ActorContext {
  * | `waiting-human` | 任一阶段 `awaiting-gate` |
  * | `needs-fix` | 当前阶段 `needs-fix`（门禁或审核回喂重跑中） |
  * | `gate-failed` | 任一阶段 `gate-failed` |
+ * | `review-failed` | 任一阶段 `review-failed`（交叉检查重试耗尽；持久化终态） |
  * | `rejected` | 任一阶段 `awaiting-gate` 且最近人工门任务 `status === 'rejected'` |
  * | `completed` | `cursor === STAGE_ORDER.length` 且全阶段 `done` |
  * | `failed` | 运行抛出异常且检查点未落入上述任一终态 |
@@ -84,6 +86,7 @@ export type PipelineRunStatus =
   | 'waiting-human'
   | 'needs-fix'
   | 'gate-failed'
+  | 'review-failed'
   | 'rejected'
   | 'completed'
   | 'failed'
@@ -511,6 +514,11 @@ export function errorMessageOf(error: unknown): string {
  */
 export function toPipelineRunError(error: unknown, fallback: PipelineRunErrorCode = 'run-failed'): PipelineRunError {
   if (error instanceof PipelineRunError) return error
+  // 门任务正被另一个进程改写：这是**并发冲突**（重试即可），既不是请求不合法，
+  // 也不是门本身进了终态。按类型判据映射，避免依赖中文/英文报错文本。
+  if (error instanceof GateTaskBusyError) {
+    return new PipelineRunError('conflict', errorMessageOf(error), { gateTaskId: error.gateTaskId })
+  }
   // 存储基础设施故障走**类型判据**而不是文本匹配：它是跨后端的语义（file 是磁盘、
   // postgres 是连接池），靠中文报错文本去认会在换后端时静默失效。
   if (isStorageInfrastructureError(error)) {

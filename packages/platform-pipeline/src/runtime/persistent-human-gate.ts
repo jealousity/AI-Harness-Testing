@@ -261,13 +261,16 @@ export class PersistentHumanGate implements HumanGatePort {
 
   /** 续上未决任务；没有则新建。这是「可恢复」的关键：重启后不会重复弹门。 */
   private async openTask(stageId: StageId, artifact: StageArtifact, gate: JudgeResult, review?: ReviewOutcome): Promise<HumanGateTask> {
-    const resumed = await this.findResumableTask(stageId, artifact.path)
+    const resumed = await this.findResumableTask(stageId, artifact.path, artifact.digest)
     if (resumed !== null) return resumed
 
     return this.createTask({
       prefix: 'gate',
       stageId,
       artifactPath: artifact.path,
+      // 记下"批准的是哪一份产物"（docs/11 P1-04）。没有它，同路径内容被替换后
+      // 旧任务仍会按路径被复用——重则一条旧 approved 会放行重入后的新内容。
+      artifactDigest: artifact.digest,
       machineStatus: gate.status === 'passed' ? 'passed' : 'failed',
       violations: gate.violations.map(v => ({ rule: v.rule, level: v.level, detail: v.detail })),
       ...(review === undefined ? {} : { review }),
@@ -278,6 +281,7 @@ export class PersistentHumanGate implements HumanGatePort {
     readonly prefix: string
     readonly stageId: StageId
     readonly artifactPath: string
+    readonly artifactDigest?: string
     readonly machineStatus: 'passed' | 'failed'
     readonly violations: readonly { rule: string; level: 'BLOCKING' | 'WARNING'; detail: string }[]
     readonly review?: ReviewOutcome
@@ -290,6 +294,7 @@ export class PersistentHumanGate implements HumanGatePort {
       stageId: input.stageId,
       status: 'pending',
       artifactPath: input.artifactPath,
+      ...(input.artifactDigest === undefined ? {} : { artifactDigest: input.artifactDigest }),
       machineStatus: input.machineStatus,
       machineViolations: input.violations,
       ...(input.review === undefined ? {} : { review: { verdict: input.review.verdict, findings: [...input.review.findings] } }),
@@ -308,15 +313,24 @@ export class PersistentHumanGate implements HumanGatePort {
    * 已消费、已过期、已取消的任务都不可续用 —— 前者防止 `changes-needed` 打回重跑空转，
    * 后两者要求宿主显式重入而不是静默重开。
    *
-   * 要求 `machineStatus === 'passed'` 且产物路径一致：gateFailed 升级任务
-   * （`failed` + 空路径）因此永远不会被 gate() 误当作阶段门。
+   * 判定条件（docs/11 P1-04）：
+   * `pipelineId + stageId + artifactPath + artifactDigest + machineStatus === 'passed'`。
+   *
+   * - **digest 必须一致**：批准的身份是"某个产物版本"，不是"那个路径上的东西"。
+   *   同路径内容被替换后，旧任务既不能批准新内容，也不能让真人对着新内容看旧 findings；
+   *   此时**新开门**（旧任务原样保留作审计，永不被消费）。
+   * - **没有 digest 的旧记录不可续用**：无法确认批准对象时失败关闭——宁可多问一次，
+   *   绝不自动沿用（这与 `gate()` 里"宁可多问一次，绝不自动批准"是同一条原则）。
+   * - `machineStatus === 'passed'` 且产物路径非空：gateFailed 升级任务
+   *   （`failed` + 空路径）因此永远不会被 gate() 误当作阶段门。
    */
-  private async findResumableTask(stageId: StageId, artifactPath: string): Promise<HumanGateTask | null> {
+  private async findResumableTask(stageId: StageId, artifactPath: string, artifactDigest: string): Promise<HumanGateTask | null> {
     const now = this.now()
     const tasks = await this.options.store.list({ pipelineId: this.options.pipelineId })
     const open = tasks.find(task => task.stageId === stageId
       && task.machineStatus === 'passed'
       && task.artifactPath === artifactPath
+      && task.artifactDigest === artifactDigest
       && isResumable(task, now))
     return open ?? null
   }

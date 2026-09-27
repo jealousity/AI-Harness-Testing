@@ -29,6 +29,7 @@ import {
   type StoragePorts,
 } from '../src/storage/index.ts'
 import type { StageArtifact } from '../src/types.ts'
+import type { HumanGateTask } from '../src/runtime/persistence.ts'
 
 export interface StorageContractContext {
   readonly backend: StorageBackend
@@ -309,6 +310,58 @@ export function runStorageContract(options: StorageContractOptions): void {
       await store.claim('g1', 'reviewer-a', 60_000)
       await store.decide('g1', 'reviewer-a', 'approved', '')
       await assert.rejects(() => store.cancel!('g1', 'ops', '撤回'), /not cancellable|cancellable/)
+    } finally {
+      await cleanup()
+    }
+  })
+
+  /**
+   * 并发 claim 必须是 CAS（docs/11 P1-05）。
+   *
+   * `get → 检查 → save` 不是原子操作：两个调用者可以同时读到同一个 pending 快照、
+   * 各自通过检查、再先后写入——两个调用都"成功"，而磁盘上只剩最后一个持有者。
+   * 契约要求**最多一个成功**，且返回值必须与最终落盘事实一致。
+   *
+   * 这条用例对后端无假设：它只要求"读改写原子"，不关心实现是文件锁、revision CAS
+   * 还是数据库条件更新。
+   */
+  test(T(options, '并发 claim 最多一个成功，且返回值与最终事实一致'), async () => {
+    const { backend, checkpointRoot, cleanup } = await options.create()
+    try {
+      const store = backend.ports.gateTasks
+      await store.create(makeGateTaskInput('g-race'))
+
+      const results = await Promise.allSettled([
+        store.claim('g-race', 'reviewer-a', 60_000),
+        store.claim('g-race', 'reviewer-b', 60_000),
+      ])
+      const ok = results.filter((result): result is PromiseFulfilledResult<HumanGateTask> => result.status === 'fulfilled')
+      assert.equal(ok.length, 1, `并发 claim 只能有一个成功：${results.map(result => result.status).join(',')}`)
+
+      const persisted = await store.get('g-race')
+      assert.equal(persisted!.status, 'claimed')
+      assert.equal(persisted!.claimedBy, ok[0]!.value.claimedBy, '返回值必须与最终落盘事实一致')
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test(T(options, '并发 decide 最多一个成功，不得覆盖已落盘的裁决'), async () => {
+    const { backend, checkpointRoot, cleanup } = await options.create()
+    try {
+      const store = backend.ports.gateTasks
+      await store.create(makeGateTaskInput('g-race'))
+      await store.claim('g-race', 'reviewer-a', 60_000)
+
+      const results = await Promise.allSettled([
+        store.decide('g-race', 'reviewer-a', 'approved', ''),
+        store.decide('g-race', 'reviewer-a', 'rejected', '结论不成立'),
+      ])
+      const ok = results.filter((result): result is PromiseFulfilledResult<HumanGateTask> => result.status === 'fulfilled')
+      assert.equal(ok.length, 1, `并发 decide 只能有一个成功：${results.map(result => result.status).join(',')}`)
+
+      const persisted = await store.get('g-race')
+      assert.equal(persisted!.decision!.action, ok[0]!.value.decision!.action, '磁盘事实必须与胜者的返回值一致')
     } finally {
       await cleanup()
     }

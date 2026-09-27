@@ -1,6 +1,7 @@
-import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
-import { basename, join } from 'node:path'
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { setTimeout as delay } from 'node:timers/promises'
 import type { StageId } from '../types.ts'
 import {
   StorageCorruptError,
@@ -47,6 +48,18 @@ export interface HumanGateTask {
   readonly claimedBy?: string
   readonly lease?: Lease
   readonly artifactPath: string
+  /**
+   * 送审产物的 digest（docs/11 P1-04）。
+   *
+   * 批准的身份是**某个具体产物版本**，不是"那个路径上的东西"。少了这个字段，
+   * 同路径内容被替换后旧任务仍会按路径被复用——轻则真人看到的 findings 与最终
+   * 冻结进检查点的 digest 来自两份不同产物，重则一条 `approved`（尚未消费）的旧
+   * 裁决会放行重入后产生的新内容。
+   *
+   * 可选是为了兼容旧记录：**没有它的任务不可续用**（失败关闭——无法确认批准对象时
+   * 宁可多问一次，也绝不自动沿用）。`gateFailed` 升级任务不带它（它不对应具体产物）。
+   */
+  readonly artifactDigest?: string
   readonly machineStatus: 'passed' | 'failed'
   readonly machineViolations: readonly { rule: string; level: 'BLOCKING' | 'WARNING'; detail: string }[]
   readonly review?: Readonly<{ verdict: string; findings: readonly string[] }>
@@ -152,6 +165,29 @@ export class FileTaskStore implements TaskStore {
   private path(taskId: string): string { return join(this.dir, `${safeId(taskId)}.json`) }
 }
 
+/**
+ * 门任务正被另一个进程改写（文件后端的 per-task 互斥没抢到）。
+ *
+ * 单独成一个类型而不是靠报错文本：`toPipelineRunError` 按**类型**映射成
+ * `conflict`(409)，换后端（数据库条件更新）时这条语义不会因为文案变化而失效。
+ */
+export class GateTaskBusyError extends Error {
+  readonly gateTaskId: string
+
+  constructor(gateTaskId: string) {
+    super(`human gate task ${gateTaskId} is busy: another process is mutating it`)
+    this.name = 'GateTaskBusyError'
+    this.gateTaskId = gateTaskId
+  }
+}
+
+/** 单条门任务互斥的等待上限：超过就明确失败，而不是无限挂住调用方。 */
+const GATE_TASK_LOCK_WAIT_MS = 2_000
+/** 抢锁的重试间隔。 */
+const GATE_TASK_LOCK_RETRY_MS = 5
+/** 锁被视为"持有者已崩溃"的年龄。临界区只有几次小文件读写，30s 足够宽松。 */
+const GATE_TASK_LOCK_STALE_MS = 30_000
+
 export class FileHumanGateTaskStore implements HumanGateTaskStore {
   private readonly dir: string
   constructor(dir: string) { this.dir = dir }
@@ -159,6 +195,7 @@ export class FileHumanGateTaskStore implements HumanGateTaskStore {
   async create(input: Omit<HumanGateTask, 'createdAt' | 'updatedAt' | 'status'> & Partial<Pick<HumanGateTask, 'createdAt' | 'updatedAt' | 'status'>>): Promise<HumanGateTask> {
     const now = Date.now()
     const task: HumanGateTask = { ...input, status: input.status ?? 'pending', createdAt: input.createdAt ?? now, updatedAt: input.updatedAt ?? now }
+    // 新记录用全新 id，不可能与并发写者撞同一路径，因此不需要加锁。
     await writeJson(this.path(task.gateTaskId), task)
     return task
   }
@@ -173,50 +210,159 @@ export class FileHumanGateTaskStore implements HumanGateTaskStore {
       .sort((a, b) => a.createdAt - b.createdAt)
   }
 
+  /**
+   * 认领。
+   *
+   * **必须在互斥锁内**（docs/11 P1-05）：`get → 检查 → save` 不是原子操作，
+   * 两个调用者可以同时读到同一个 pending 快照、各自通过检查、再先后写入，
+   * 最后写入者覆盖前者——而两个调用都会返回"成功"。
+   */
   async claim(gateTaskId: string, actor: string, ttlMs: number): Promise<HumanGateTask> {
     validateLease(actor, ttlMs)
-    const current = await requireValue(this.get(gateTaskId), `human gate task not found: ${gateTaskId}`)
-    if (!['pending', 'claimed'].includes(current.status)) throw new Error(`human gate task is not claimable: ${current.status}`)
-    if (current.lease !== undefined && current.lease.expiresAt > Date.now() && current.lease.owner !== actor) throw new Error(`human gate task is claimed by ${current.lease.owner}`)
-    const now = Date.now()
-    return this.save({ ...current, status: 'claimed', claimedBy: actor, lease: { owner: actor, acquiredAt: current.lease?.acquiredAt ?? now, expiresAt: now + ttlMs }, updatedAt: now })
+    return this.withLock(gateTaskId, async () => {
+      const current = await requireValue(this.get(gateTaskId), `human gate task not found: ${gateTaskId}`)
+      if (!['pending', 'claimed'].includes(current.status)) throw new Error(`human gate task is not claimable: ${current.status}`)
+      if (current.lease !== undefined && current.lease.expiresAt > Date.now() && current.lease.owner !== actor) throw new Error(`human gate task is claimed by ${current.lease.owner}`)
+      const now = Date.now()
+      return this.save({ ...current, status: 'claimed', claimedBy: actor, lease: { owner: actor, acquiredAt: current.lease?.acquiredAt ?? now, expiresAt: now + ttlMs }, updatedAt: now })
+    })
   }
 
+  /** 裁决。与 `claim` 同理：检查"是不是当前 claim 持有者"与写入必须原子。 */
   async decide(gateTaskId: string, actor: string, action: 'approved' | 'changes-needed' | 'rejected', note: string): Promise<HumanGateTask> {
-    const current = await requireValue(this.get(gateTaskId), `human gate task not found: ${gateTaskId}`)
-    if (current.status !== 'claimed' || current.claimedBy !== actor) throw new Error('human gate decision requires the active claim owner')
-    if (note.trim() === '' && action !== 'approved') throw new Error('changes-needed/rejected decisions require a non-empty note')
-    const { lease: _lease, ...withoutLease } = current
-    return this.save({ ...withoutLease, status: action, decision: { by: actor, action, note, at: Date.now() }, updatedAt: Date.now(), lease: undefined })
+    return this.withLock(gateTaskId, async () => {
+      const current = await requireValue(this.get(gateTaskId), `human gate task not found: ${gateTaskId}`)
+      if (current.status !== 'claimed' || current.claimedBy !== actor) throw new Error('human gate decision requires the active claim owner')
+      if (note.trim() === '' && action !== 'approved') throw new Error('changes-needed/rejected decisions require a non-empty note')
+      const { lease: _lease, ...withoutLease } = current
+      return this.save({ ...withoutLease, status: action, decision: { by: actor, action, note, at: Date.now() }, updatedAt: Date.now(), lease: undefined })
+    })
   }
 
   async expire(now = Date.now()): Promise<readonly HumanGateTask[]> {
     const candidates = (await this.list()).filter(task => (task.expiresAt !== undefined && task.expiresAt <= now && ['pending', 'claimed'].includes(task.status)) || (task.lease !== undefined && task.lease.expiresAt <= now && task.status === 'claimed'))
     const expired: HumanGateTask[] = []
-    for (const task of candidates) expired.push(await this.save({ ...task, status: 'expired', updatedAt: now, lease: undefined }))
+    for (const task of candidates) {
+      // 逐条加锁：过期回收也可能与 claim/decide 并发，不能读改写裸奔。
+      expired.push(await this.withLock(task.gateTaskId, async () => {
+        const current = await this.get(task.gateTaskId)
+        // 期间被别人裁决/取消了：不再当作过期处理（不覆盖别人的终态）。
+        if (current === null || !['pending', 'claimed'].includes(current.status)) return current ?? task
+        return this.save({ ...current, status: 'expired', updatedAt: now, lease: undefined })
+      }))
+    }
     return expired
   }
 
+  /** 消费裁决。幂等：已消费则原样返回（并发下两个调用者必须拿到**同一个**时间戳）。 */
   async consume(gateTaskId: string, at = Date.now()): Promise<HumanGateTask> {
-    const current = await requireValue(this.get(gateTaskId), `human gate task not found: ${gateTaskId}`)
-    if (current.consumedAt !== undefined) return current
-    if (!['approved', 'changes-needed', 'rejected'].includes(current.status)) {
-      throw new Error(`human gate task is not consumable: ${current.status}`)
-    }
-    return this.save({ ...current, consumedAt: at, updatedAt: at })
+    return this.withLock(gateTaskId, async () => {
+      const current = await requireValue(this.get(gateTaskId), `human gate task not found: ${gateTaskId}`)
+      if (current.consumedAt !== undefined) return current
+      if (!['approved', 'changes-needed', 'rejected'].includes(current.status)) {
+        throw new Error(`human gate task is not consumable: ${current.status}`)
+      }
+      return this.save({ ...current, consumedAt: at, updatedAt: at })
+    })
   }
 
+  /** 取消。与 `decide` 抢同一把锁：二者只能有一个把任务推进终态。 */
   async cancel(gateTaskId: string, actor: string, note = ''): Promise<HumanGateTask> {
     if (actor.trim() === '') throw new Error('cancellation actor must not be empty')
-    const current = await requireValue(this.get(gateTaskId), `human gate task not found: ${gateTaskId}`)
-    if (!['pending', 'claimed'].includes(current.status)) throw new Error(`human gate task is not cancellable: ${current.status}`)
-    const { lease: _lease, ...withoutLease } = current
-    const now = Date.now()
-    return this.save({ ...withoutLease, status: 'cancelled', cancellation: { by: actor, note, at: now }, updatedAt: now, lease: undefined })
+    return this.withLock(gateTaskId, async () => {
+      const current = await requireValue(this.get(gateTaskId), `human gate task not found: ${gateTaskId}`)
+      if (!['pending', 'claimed'].includes(current.status)) throw new Error(`human gate task is not cancellable: ${current.status}`)
+      const { lease: _lease, ...withoutLease } = current
+      const now = Date.now()
+      return this.save({ ...withoutLease, status: 'cancelled', cancellation: { by: actor, note, at: now }, updatedAt: now, lease: undefined })
+    })
   }
 
   private path(gateTaskId: string): string { return join(this.dir, `${safeId(gateTaskId)}.json`) }
   private async save(task: HumanGateTask): Promise<HumanGateTask> { await writeJson(this.path(task.gateTaskId), task); return task }
+
+  // ── 单条任务互斥（docs/11 P1-05）────────────────────────────────────────────
+
+  private lockDir(gateTaskId: string): string { return join(this.dir, '.locks', `${safeId(gateTaskId)}.lock`) }
+
+  /**
+   * 在**该任务**的互斥锁内执行 `work`。
+   *
+   * 为什么文件后端需要它：POSIX 没有"条件 rename"，所以文件上的 CAS 只能靠互斥
+   * 把"读 → 检查 → 写"包成临界区。锁只作用于单条任务，不同门任务互不阻塞。
+   *
+   * 三条性质：
+   * - **有界等待**：超过 {@link GATE_TASK_LOCK_WAIT_MS} 就抛
+   *   {@link GateTaskBusyError}（映射成 `conflict` 409），不无限挂住调用方；
+   * - **自愈**：持有者崩溃会留下锁目录，超过 {@link GATE_TASK_LOCK_STALE_MS}
+   *   可被后来者接管（否则一次崩溃会永久锁死这个门）；
+   * - **不误删**：释放前核对锁目录里的持有者令牌，只删自己的锁；被判定过期并
+   *   回收后，原持有者不会再去删别人的锁。
+   */
+  private async withLock<T>(gateTaskId: string, work: () => Promise<T>): Promise<T> {
+    const lockDir = this.lockDir(gateTaskId)
+    const token = randomUUID()
+    await mkdir(dirname(lockDir), { recursive: true })
+    const deadline = Date.now() + GATE_TASK_LOCK_WAIT_MS
+    for (;;) {
+      try {
+        await mkdir(lockDir)
+        await writeFile(join(lockDir, 'owner'), token, 'utf8')
+        break
+      } catch (error) {
+        if (!isAlreadyExists(error)) throw error
+        if (await reclaimIfStale(lockDir)) continue
+        if (Date.now() >= deadline) throw new GateTaskBusyError(gateTaskId)
+        await delay(GATE_TASK_LOCK_RETRY_MS)
+      }
+    }
+    try {
+      return await work()
+    } finally {
+      await releaseLock(lockDir, token)
+    }
+  }
+}
+
+/** `mkdir` 独占失败：目录已存在（= 锁被持有）。 */
+function isAlreadyExists(error: unknown): boolean {
+  return error instanceof Error && (error as { code?: string }).code === 'EEXIST'
+}
+
+/**
+ * 回收"持有者已崩溃"的锁；返回是否值得立刻重试。
+ *
+ * 抢占不做 `rm -rf` 一个可能仍被他人持有的目录，而是**原子改名到唯一墓碑再删**：
+ * 改名是原子的，谁先改名成功谁负责清理，另一个只会拿到 ENOENT 并重试。
+ */
+async function reclaimIfStale(lockDir: string): Promise<boolean> {
+  let ageMs: number
+  try {
+    ageMs = Date.now() - (await stat(lockDir)).mtimeMs
+  } catch {
+    return true // 锁已消失：直接重试即可
+  }
+  if (ageMs < GATE_TASK_LOCK_STALE_MS) return false
+  const tombstone = `${lockDir}.stale-${randomUUID()}`
+  try {
+    await rename(lockDir, tombstone)
+  } catch {
+    return true // 别人抢先处理了
+  }
+  await rm(tombstone, { recursive: true, force: true })
+  return true
+}
+
+/** 只删自己持有的锁：被判定过期并回收后，不碰后来者的锁。 */
+async function releaseLock(lockDir: string, token: string): Promise<void> {
+  let owner: string
+  try {
+    owner = await readFile(join(lockDir, 'owner'), 'utf8')
+  } catch {
+    return
+  }
+  if (owner !== token) return
+  await rm(lockDir, { recursive: true, force: true })
 }
 
 export function newTaskId(prefix = 'task'): string { return `${prefix}-${randomUUID()}` }

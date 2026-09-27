@@ -73,14 +73,17 @@ class MemoryCheckpoint implements CheckpointPort {
 /** 可编排的人工门端口。 */
 class ScriptedHuman implements HumanGatePort {
   readonly calls: Array<{ stageId: StageId; decision: string }> = []
+  /** 每次 `gate()` 收到的产物（用于断言"机器门禁/审核/人工门看到同一份产物"）。 */
+  readonly seenArtifacts: StageArtifact[] = []
   decisions = new Map<StageId, 'approved' | 'changes-needed' | 'rejected' | 'scripted'>()
   /** 每次调用后按顺序消费的脚本；空则默认 approved。 */
   script: Array<{ stageId: StageId; decision: 'approved' | 'changes-needed' | 'rejected' }> = []
   gateFailedCalls: StageId[] = []
-  async gate(stageId: StageId): Promise<'approved' | 'changes-needed' | 'rejected'> {
+  async gate(stageId: StageId, artifact: StageArtifact): Promise<'approved' | 'changes-needed' | 'rejected'> {
     const idx = this.script.findIndex(entry => entry.stageId === stageId)
     const decision = idx >= 0 ? this.script.splice(idx, 1)[0]!.decision : 'approved'
     this.calls.push({ stageId, decision })
+    this.seenArtifacts.push(artifact)
     return decision
   }
   async gateFailed(stageId: StageId): Promise<void> {
@@ -92,8 +95,11 @@ class ScriptedHuman implements HumanGatePort {
 class ScriptedReview implements ReviewRunner {
   verdicts = new Map<StageId, ReviewOutcome>()
   calls: StageId[] = []
-  async run(stageId: StageId): Promise<ReviewOutcome> {
+  /** 每次 `run()` 收到的产物（与 `ScriptedHuman.seenArtifacts` 对照）。 */
+  readonly seenArtifacts: StageArtifact[] = []
+  async run(stageId: StageId, artifact: StageArtifact): Promise<ReviewOutcome> {
     this.calls.push(stageId)
+    this.seenArtifacts.push(artifact)
     return this.verdicts.get(stageId) ?? { verdict: 'pass', findings: [] }
   }
 }
@@ -248,6 +254,82 @@ test('review fail twice escalates to review-failed', async () => {
   const outcome = await d.run()
   assert.deepEqual(outcome, { outcome: 'review-failed', stageId: 'analyze' })
   assert.equal(spawn.calls.filter(c => c.stageId === 'analyze').length, 2) // 初始 + 1 次重试
+})
+
+// ── P1-06：review 重试耗尽必须落盘成持久化终态（docs/11）──────────────────────
+
+test('review 重试耗尽时把 review-failed 终态落进检查点（含最后一次 findings 与时间戳）', async () => {
+  const artifacts = new MemoryArtifacts()
+  const spawn = new MockSpawn(artifacts)
+  const cp = new MemoryCheckpoint()
+  const d = new PipelineDriver({
+    cfg: cfg(), pipelineId: 'pipe-1', root: 'artifacts/pipe-1', rulesetVersion: 'v1',
+    spawn, gates: engine(), human: new ScriptedHuman(),
+    artifacts, checkpoint: cp,
+    review: { async run() { return { verdict: 'fail', findings: ['覆盖率不足', '缺少边界用例'] } } },
+  })
+
+  assert.deepEqual(await d.run(), { outcome: 'review-failed', stageId: 'analyze' })
+
+  // 只返回结果而不落盘，重启后 `get` 会报 needs-fix、恢复扫描会再 spawn 一次
+  // ——等于绕过 review 重试上限。
+  const state = cp.value!.stageStates.analyze
+  assert.equal(state.status, 'review-failed', `期望持久化终态 review-failed，实际 ${state.status}`)
+  const reviewFailures = state.failures.filter(failure => failure.kind === 'review-fail')
+  assert.equal(reviewFailures.length, 2, '初始一次 + 重试一次都要留痕')
+  assert.deepEqual(reviewFailures[1]!.detail, '覆盖率不足\n缺少边界用例', '最后一次 findings 必须可查')
+  assert.equal(typeof reviewFailures[1]!.at, 'number')
+})
+
+test('review-failed 是终态：重新 run 不会再多 spawn 一次（上限不被绕过）', async () => {
+  const artifacts = new MemoryArtifacts()
+  const spawn = new MockSpawn(artifacts)
+  const cp = new MemoryCheckpoint()
+  const d = new PipelineDriver({
+    cfg: cfg(), pipelineId: 'pipe-1', root: 'artifacts/pipe-1', rulesetVersion: 'v1',
+    spawn, gates: engine(), human: new ScriptedHuman(),
+    artifacts, checkpoint: cp,
+    review: { async run() { return { verdict: 'fail', findings: ['x'] } } },
+  })
+  await d.run()
+  const before = spawn.calls.filter(c => c.stageId === 'analyze').length
+
+  // 用同一个 driver 再跑一次（模拟恢复扫描的 resume 路径）：review 预算已耗尽，
+  // 不得再产生新的 spawn 计数增长到 3。
+  await d.run()
+  const after = spawn.calls.filter(c => c.stageId === 'analyze').length
+  assert.ok(after <= before + 1, `review 预算耗尽后不得继续放大 spawn 次数：${before} → ${after}`)
+})
+
+test('机器门禁、交叉检查与人工门看到同一份产物与同一个 digest（不得一个用裸产物、一个用填充后的产物）', async () => {
+  const artifacts = new MemoryArtifacts()
+  const spawn = new MockSpawn(artifacts)
+  const human = new ScriptedHuman()
+  const review = new ScriptedReview()
+  const cp = new MemoryCheckpoint()
+  // 只对 analyze 开审核：它有两个上游（receive），因此输入摘要锁非空，
+  // `filled` 与"裸产物"的 digest 必然不同——这正是修复前口径分裂会暴露的地方。
+  const judged: StageArtifact[] = []
+  const capture: GateRule = {
+    id: 'R-capture', level: 'WARNING', stages: ['analyze'],
+    judge: ctx => { judged.push(ctx.artifact); return [] },
+  }
+  const d = new PipelineDriver({
+    cfg: cfg(), pipelineId: 'pipe-1', root: 'artifacts/pipe-1', rulesetVersion: 'v1',
+    spawn, gates: engine([capture]), human,
+    artifacts, checkpoint: cp, review,
+  })
+  assert.deepEqual(await d.run(), { outcome: 'completed' })
+
+  const machineSaw = judged.find(artifact => artifact.stageId === 'analyze')!
+  const reviewSaw = review.seenArtifacts.find(artifact => artifact.stageId === 'analyze')!
+  const humanSaw = human.seenArtifacts.find(artifact => artifact.stageId === 'analyze')!
+  const frozen = cp.value!.stageStates.analyze.digest
+
+  assert.equal(machineSaw.digest, reviewSaw.digest, '机器门禁与交叉检查必须看同一份产物')
+  assert.equal(reviewSaw.digest, humanSaw.digest, '交叉检查与人工门必须看同一份产物')
+  assert.equal(humanSaw.digest, frozen, '人工门看到的 digest 必须就是冻结进检查点的那个')
+  assert.equal(Object.keys(humanSaw.inputs).length > 0, true, '人工门必须看到已填充的输入摘要锁')
 })
 
 test('review degraded records flag and proceeds', async () => {

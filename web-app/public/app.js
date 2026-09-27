@@ -28,6 +28,7 @@ const STATUS_LABELS = {
   'waiting-human': '等待人工裁决',
   'needs-fix': '打回重跑中',
   'gate-failed': '机器门禁失败',
+  'review-failed': '交叉检查未通过',
   rejected: '已被拒绝',
   completed: '已完成',
   failed: '失败',
@@ -43,6 +44,7 @@ const STAGE_STATUS_LABELS = {
   'needs-reentry': '待重入',
   done: '已完成',
   'gate-failed': '门禁失败',
+  'review-failed': '交叉检查未通过',
 }
 
 const GATE_STATUS_LABELS = {
