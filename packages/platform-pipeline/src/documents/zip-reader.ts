@@ -20,6 +20,7 @@
 import { Unzip, UnzipInflate, UnzipPassThrough } from 'fflate'
 
 import { DOCUMENT_DIAGNOSTIC_CODES, DocumentParseError, type DocumentDiagnostic, type DocumentLimits } from './document-types.ts'
+import { assertCompressionRatioWithinLimits } from './document-limits.ts'
 import { isZipContainer } from './document-detect.ts'
 import { assertSafeArchiveEntry, classifyDangerousPart, dangerousPartDiagnostics } from './document-sanitize.ts'
 import { attr, childrenNamed, parseXml, type XmlLimits } from './xml.ts'
@@ -146,6 +147,15 @@ export function readOoxmlParts(bytes: Uint8Array, options: ReadOoxmlPartsOptions
         // 抛出后 fflate 会以错误回调终止该条目，条目不会进入 parts。
         throw new DocumentParseError(DOCUMENT_DIAGNOSTIC_CODES.limitExceeded, message, options.path)
       }
+      // 压缩比判据（docs/11 P2-03）：上面两道**逐字节**上限都过得去时，仍要拦住
+      // "小文件解压成几个 G"。走统一判据函数，避免这里再手写一遍规则——此前这条规则
+      // 只写在 `assertZipEntryWithinLimits` 里而解包路径从未调用它，等于没有。
+      //
+      // `file.size` 是 central directory 声明的**压缩后**大小。它同样可被伪造，但伪造方向
+      // 只会让压缩比**看起来更高**（更早被拒）；要压低压缩比必须真的填充字节，
+      // 而那受 `maxFileBytes` 约束。声明缺失（流式创建的归档）时跳过压缩比判据，
+      // 此时单条目/总量两道逐字节上限仍然生效。
+      assertCompressionRatioWithinLimits(file.name, file.size ?? 0, { uncompressedBytes }, limits)
       chunks.push(chunk)
       if (final) parts.set(file.name, concat(chunks, received))
     }

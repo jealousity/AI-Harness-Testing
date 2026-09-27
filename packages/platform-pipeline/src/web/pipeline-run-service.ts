@@ -562,7 +562,7 @@ export class FilePipelineRunService implements PipelineRunService {
     assertActor(actor)
     assertSafeIdentifier(pipelineId, 'pipelineId')
     const { manifest, config, backend, checkpointRoot } = await this.locate(pipelineId, actor)
-    await this.requireCheckpoint(backend, checkpointRoot)
+    await this.requireCheckpoint(backend, pipelineId, checkpointRoot)
 
     // 运行互斥（§6.3 M2-2）：锁覆盖 load checkpoint → 阶段产物生成 → 门禁/审核/人工门
     // 推进 → checkpoint save。**不含**人工门"阻塞等待"之后的续写——见下面的说明。
@@ -572,11 +572,11 @@ export class FilePipelineRunService implements PipelineRunService {
 
       try {
         const outcome = await host.driver.run()
-        const view = await this.buildView(config, await this.requireCheckpoint(backend, checkpointRoot))
+        const view = await this.buildView(config, await this.requireCheckpoint(backend, pipelineId, checkpointRoot))
         if (outcome.outcome === 'completed') return { outcome: 'completed', view }
         return { outcome: outcome.outcome, stageId: outcome.stageId, view }
       } catch (error) {
-        const view = await this.buildView(config, await this.requireCheckpoint(backend, checkpointRoot))
+        const view = await this.buildView(config, await this.requireCheckpoint(backend, pipelineId, checkpointRoot))
         // 人工门等待被中止：超时 = 让出控制权等真人裁决（docs/10 §4.2、§5.4 第 4 步）；
         // 信号中止 / 任务被外部取消 = 本次运行取消。两条路径都绝不自动批准。
         if (error instanceof HumanGateWaitAbortedError) {
@@ -622,7 +622,7 @@ export class FilePipelineRunService implements PipelineRunService {
     // 取锁 → 读检查点 → 读产物算 digest → 比较 → 重入 → 释放锁。
     const lock = await this.acquireRunLock(backend, input.pipelineId)
     try {
-      const current = await this.requireCheckpoint(backend, checkpointRoot)
+      const current = await this.requireCheckpoint(backend, input.pipelineId, checkpointRoot)
       // digest 口径与视图一致（检查点优先，缺省回读产物），否则停在人工门时永远对不上。
       const digest = await this.digestOf(config, current.stageStates[input.stageId]!)
       if (input.expectedCurrentDigest !== undefined && digest !== input.expectedCurrentDigest) {
@@ -887,7 +887,7 @@ export class FilePipelineRunService implements PipelineRunService {
     readonly checkpoint: Checkpoint
   }> {
     const { config, backend, checkpointRoot } = await this.locate(pipelineId, actor)
-    return { config, checkpoint: await this.requireCheckpoint(backend, checkpointRoot) }
+    return { config, checkpoint: await this.requireCheckpoint(backend, pipelineId, checkpointRoot) }
   }
 
   /**
@@ -1061,9 +1061,28 @@ export class FilePipelineRunService implements PipelineRunService {
     return { store, task, projectRoot }
   }
 
-  private async requireCheckpoint(backend: StorageBackend, checkpointRoot: string): Promise<Checkpoint> {
+  /**
+   * 读取检查点并校验它**确实属于**请求的那条流水线（docs/11 P2-01 剩余）。
+   *
+   * 为什么必须交叉校验：检查点路径由 `checkpointRoot/<pipelineId>` 拼出，因此正常情况下
+   * 两者一致。但检查点是**磁盘文件**——被手工改坏、被别的进程写到错误位置、或来自一次
+   * 失败的迁移时，内容里的 `pipelineId` 会与路径不一致。此时若继续按请求的 id 往下走，
+   * 后续所有事实（产物路径、门任务归属、用量 scope）都会建立在一条错位的记录上。
+   *
+   * 归类为 `storage-unavailable` 而不是 `not-found`：真相是**登记记录损坏**，
+   * 不是"这条流水线不存在"。报 `not-found` 会让运维去建一条新的，
+   * 而正确动作是修复/清理这个文件。
+   */
+  private async requireCheckpoint(backend: StorageBackend, pipelineId: string, checkpointRoot: string): Promise<Checkpoint> {
     const checkpoint = await backend.ports.checkpoints.load(checkpointRoot)
     if (checkpoint === null) throw new PipelineRunError('not-found', '流水线不存在', { checkpointRoot })
+    if (checkpoint.pipelineId !== pipelineId) {
+      throw new PipelineRunError(
+        'storage-unavailable',
+        `检查点记录的 pipelineId（${checkpoint.pipelineId}）与请求的 ${pipelineId} 不一致：登记记录损坏或被放错了位置`,
+        { checkpointRoot, expectedPipeline: pipelineId, actualPipeline: checkpoint.pipelineId },
+      )
+    }
     return checkpoint
   }
 

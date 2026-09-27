@@ -38,6 +38,8 @@ import {
   defaultParserRegistry,
   isSupportedDocumentFormat,
   projectKnowledge,
+  readFileWithinLimit,
+  resolveDocumentLimits,
   type DocumentDiagnostic,
   type DocumentLimits,
   type DocumentParserRegistry,
@@ -326,12 +328,21 @@ export async function parseWorkspaceDocument(
     return unavailableResult(label, errorMessage(error))
   }
 
-  let bytes: Uint8Array
-  try {
-    bytes = new Uint8Array(await readFile(target))
-  } catch (error) {
-    return unavailableResult(label, `读取文档失败：${errorMessage(error)}`)
+  // 字节上限必须在**读取之前**生效（docs/11 P2-02）。`readFile()` 会把整个文件读进内存，
+  // 一份 10 GiB 的"文档"在限额判据生效之前就已经把进程打爆了——那样的限额等于没有。
+  // `readFileWithinLimit` 先 `stat` 判一次，再按 `maxBytes + 1` 有界读取，
+  // 因此"stat 与 read 之间文件变大"也越不过上限。
+  const limits = resolveDocumentLimits(options.limits)
+  const read = await readFileWithinLimit(target, limits.maxFileBytes)
+  if (!read.ok) {
+    if (read.reason === 'too-large') {
+      // 超限是**可信结论**（available: true），与解析器内部的 limit-exceeded 同形：
+      // 调用方不需要区分"读前拒"和"读后拒"，两者都是"这份文档太大"。
+      return limitExceededResult(label, read.detail, read.size ?? 0)
+    }
+    return unavailableResult(label, `读取文档失败：${read.detail}`)
   }
+  const bytes = read.bytes
 
   const includeTables = raw.includeTables !== false
   const includeMetadata = raw.includeMetadata !== false
@@ -414,6 +425,28 @@ function unavailableResult(path: string, message: string): ParseDocToolResult {
     sourceRefs: [],
     diagnostics: [diagnostic(DOCUMENT_DIAGNOSTIC_CODES.parserFailed, 'error', message, path)],
     error: message,
+  }
+}
+
+/**
+ * 读取前就超限（docs/11 P2-02）。
+ *
+ * 与 {@link unavailableResult} 的关键差别：`available: true`——**这是一条可信结论**
+ * （"这份文档超过上限"），而不是"拿不到结果"。`available: false` 留给"路径越界/
+ * 文件不存在/读不出来"这类真正无法下结论的情况。
+ */
+function limitExceededResult(path: string, message: string, bytesRead: number): ParseDocToolResult {
+  return {
+    available: true,
+    status: 'limit-exceeded',
+    format: 'unknown',
+    fileName: path.split('/').pop() ?? path,
+    sections: [],
+    tables: [],
+    plainText: '',
+    sourceRefs: [],
+    diagnostics: [diagnostic(DOCUMENT_DIAGNOSTIC_CODES.limitExceeded, 'error', message, path)],
+    limits: { truncated: true, bytesRead },
   }
 }
 

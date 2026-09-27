@@ -112,6 +112,35 @@ test('累计解压总量超过上限时整体拒绝', async () => {
   assert.match(messages(doc), /压缩包解压总量/)
 })
 
+test('压缩比超过上限时按压缩比拒绝，而不是只靠单条目/总量上限（docs/11 P2-03）', async () => {
+  // 512 KiB 全零 deflate 后只有几百字节。把单条目上限与总量上限都放到 1 MiB，
+  // 于是两道**逐字节**上限都过得去——只有压缩比判据能拦下它。
+  // 修复前 `assertZipEntryWithinLimits` 从未被调用，这条用例会拿到 `parsed`。
+  const doc = await parse('ratio.docx', buildZipBomb(0.5), {
+    limits: {
+      maxZipEntryBytes: 1024 * 1024,
+      maxUncompressedBytes: 1024 * 1024,
+      maxCompressionRatio: 10,
+    },
+  })
+
+  assert.equal(doc.status, 'limit-exceeded', `压缩比必须参与判定：${messages(doc)}`)
+  assert.match(messages(doc), /压缩比/)
+  assert.equal(doc.sections.length, 0, '被拒的归档不得留下任何已解析内容')
+})
+
+test('正常 OOXML 的天然高压缩比不会被压缩比判据误杀', async () => {
+  // `[Content_Types].xml` 这类小部件压缩比天然很高（可达 50:1）。压缩比只在
+  // 累计解压量超过 `maxUncompressedBytes / maxCompressionRatio` 基线后才参与判定，
+  // 因此正常文档必须通过——否则这道防线会变成"所有 Office 文档都读不了"。
+  const doc = await parse('normal.docx', validDocx(), {
+    limits: { maxCompressionRatio: 10, maxUncompressedBytes: 1024 * 1024 },
+  })
+
+  assert.equal(doc.status, 'parsed', `正常文档不得被压缩比判据误杀：${messages(doc)}`)
+  assert.ok(doc.sections.length > 0)
+})
+
 // ── 路径穿越 ─────────────────────────────────────────────────────────────────
 
 test('归档含路径穿越条目时拒绝整个归档', async () => {

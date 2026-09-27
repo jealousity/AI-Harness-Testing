@@ -722,6 +722,25 @@ test('流水线索引与检查点落在 dataRoot 下的租户/项目目录内', 
   assert.ok(pipelineIndexDir(dir).startsWith(dir))
 })
 
+// ── 记录自洽性（docs/11 P2-01 剩余）──────────────────────────────────────────
+
+test('检查点里的 pipelineId 与请求不一致时显式失败，不按被篡改的 id 继续', async () => {
+  const { service } = await parkedAtReceiveGate()
+  const roots = resolvePlatformRoots(dir, config)
+  const checkpointFile = join(roots.checkpointRoot, 'pipe-1', 'checkpoint.json')
+  const raw = JSON.parse(await readFile(checkpointFile, 'utf8')) as Record<string, unknown>
+  await writeFile(checkpointFile, JSON.stringify({ ...raw, pipelineId: 'someone-else' }, null, 2), 'utf8')
+
+  await assert.rejects(() => service.get('pipe-1', REVIEWER), (error: unknown) => {
+    assert.ok(error instanceof PipelineRunError, `期望 PipelineRunError，实际 ${(error as Error)?.name}`)
+    // 这是**登记记录损坏**，不是"流水线不存在"：后者会让运维去建一条新的，
+    // 而真相是这个文件被改坏了/放错了位置。
+    assert.equal(error.code, 'storage-unavailable')
+    assert.match((error as Error).message, /pipelineId/)
+    return true
+  })
+})
+
 // ── 凭据不泄露 ───────────────────────────────────────────────────────────────
 
 test('API Key 不出现在任何返回值、视图或错误详情里', async () => {

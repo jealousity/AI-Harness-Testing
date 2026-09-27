@@ -114,16 +114,43 @@ export class LimitBudget {
 }
 
 /**
+ * 压缩比硬上限（docs/10 §5.6.5 B、docs/11 P2-03）。
+ *
+ * 为什么单独成一个函数：这条判据此前只写在 {@link assertZipEntryWithinLimits} 里，
+ * 而解包路径（`zip-reader.ts`）自己手写了两条逐字节判断、**从未调用它**——
+ * 于是"小文件解压成几个 G"只能靠单条目上限兜，一个刚好卡在上限之下的高压缩比条目
+ * 可以合法地膨胀上千倍。抽出来之后解包路径直接调用它，规则只有一份。
+ *
+ * 注意：**必须用压缩后真实字节数**算压缩比。Office 的 `[Content_Types].xml` 之类
+ * 小文件压缩比天然很高（可达 50:1），所以压缩比只在累计解压量超过
+ * `maxUncompressedBytes / maxCompressionRatio` 的基线后才参与判定，避免误杀正常文档。
+ *
+ * `compressedBytes <= 0`（流式创建的归档没有声明压缩大小）时跳过：此时单条目/总量
+ * 两道逐字节上限仍然生效，而伪造这个值只会让压缩比**看起来更高**（更早被拒）。
+ */
+export function assertCompressionRatioWithinLimits(
+  entryName: string,
+  compressedBytes: number,
+  totals: { readonly uncompressedBytes: number },
+  limits: DocumentLimits,
+): void {
+  const baseline = Math.floor(limits.maxUncompressedBytes / limits.maxCompressionRatio)
+  if (compressedBytes > 0 && totals.uncompressedBytes > baseline
+    && totals.uncompressedBytes / compressedBytes > limits.maxCompressionRatio) {
+    throw limitExceeded(
+      `压缩包压缩比 ${Math.round(totals.uncompressedBytes / compressedBytes)}:1 超过上限 ${limits.maxCompressionRatio}:1`,
+      entryName,
+    )
+  }
+}
+
+/**
  * 解压条目校验（防 zip bomb，docs/10 §5.6.5 B）。
  *
  * 三层判据缺一不可：
  * 1. 条目数上限——拦「几万个空文件」；
  * 2. 单条目解压后大小上限——拦「单个巨大 XML」；
  * 3. 总解压量 + 压缩比上限——拦「小文件解压成几个 G」。
- *
- * 注意：**必须用压缩后真实字节数**算压缩比。Office 的 `[Content_Types].xml` 之类
- * 小文件压缩比天然很高（可达 50:1），所以压缩比只在累计解压量超过
- * `maxUncompressedBytes / maxCompressionRatio` 的基线后才参与判定，避免误杀正常文档。
  */
 export function assertZipEntryWithinLimits(
   entryName: string,
@@ -141,14 +168,7 @@ export function assertZipEntryWithinLimits(
   if (totals.uncompressedBytes > limits.maxUncompressedBytes) {
     throw limitExceeded(`压缩包解压总量 ${totals.uncompressedBytes} 字节超过上限 ${limits.maxUncompressedBytes}`, entryName)
   }
-  const baseline = Math.floor(limits.maxUncompressedBytes / limits.maxCompressionRatio)
-  if (compressedBytes > 0 && totals.uncompressedBytes > baseline
-    && totals.uncompressedBytes / compressedBytes > limits.maxCompressionRatio) {
-    throw limitExceeded(
-      `压缩包压缩比 ${Math.round(totals.uncompressedBytes / compressedBytes)}:1 超过上限 ${limits.maxCompressionRatio}:1`,
-      entryName,
-    )
-  }
+  assertCompressionRatioWithinLimits(entryName, compressedBytes, totals, limits)
 }
 
 /**
