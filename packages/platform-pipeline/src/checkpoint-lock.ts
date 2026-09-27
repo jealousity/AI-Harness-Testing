@@ -28,7 +28,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { appendFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -221,6 +221,25 @@ export async function acquirePipelineLock(
       throw new PipelineLockHeldError({ pipelineId: id, lockPath: path, holder, staleMs })
     }
 
+    // **无 owner 的锁目录必须分两种情况**（否则会破坏互斥，docs/11 M5 并发门槛）：
+    //
+    // - **崩溃残留**：持有者在 `mkdir` 与写 `owner.json` 之间被杀 → 目录已经放了很久，
+    //   可以安全抢占；
+    // - **正在获取**：另一个进程刚 `mkdir` 成功、还没写 owner → 目录是**新的**。
+    //   把它当残留抢走，会让"抢走者"和"原主"都以为自己持有锁——这是实测到的
+    //   互斥破坏（4 进程压测里出现过两个进程的持有区间重叠）。
+    //
+    // 判据用目录 mtime。真正的窗口只有微秒级，因此宽限期取得很宽松；
+    // 超时后仍按残留处理，避免一次崩溃永久锁死流水线。
+    if (holder === null && reason === 'unreadable' && await isBeingAcquired(path)) {
+      await emit(audit, {
+        kind: 'contended', pipelineId: id, at, lockPath: path,
+        owner: provisionalOwner(options.ownerId, 0, host, at), previous: null,
+        detail: '锁目录存在但没有 owner：判定为"另一个进程正在获取"，拒绝抢占',
+      })
+      throw new PipelineLockHeldError({ pipelineId: id, lockPath: path, holder: null, staleMs })
+    }
+
     // 删除前再读一次：`holder` 是我们几微秒前看到的，期间对方可能已续租或换手。
     const confirmed = await readOwner(path)
     if (!sameHolder(confirmed, holder)) continue
@@ -250,7 +269,28 @@ export async function acquirePipelineLock(
     acquiredAt,
     heartbeatAt: acquiredAt,
   }
-  await writeOwner(path, current)
+  try {
+    await writeOwner(path, current)
+  } catch (error) {
+    // `mkdir` 成功到写 `owner.json` 之间有一个**必然存在**的窗口：竞争者此时读到的是
+    // "没有 owner 的锁目录"，于是把它当成崩溃残留抢走（`stealStaleLock` 会先
+    // `rename(path, tomb)`）。我们刚写进那个目录的 `owner.json.tmp` 随目录一起被移走，
+    // rename 于是报 ENOENT（源文件不存在）。
+    //
+    // 这不是基础设施故障，而是"**我们输掉了这次竞争**"。裸 ENOENT 会被上层归成
+    // `run-failed`(500)，而它其实是 `conflict`(409)——运维动作完全不同，
+    // 因此必须在这里翻译成 `PipelineLockHeldError`。
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      const holder = await readOwner(path)
+      await emit(audit, {
+        kind: 'contended', pipelineId: id, at: now(), lockPath: path,
+        owner: current, previous: holder,
+        detail: '写 owner 期间锁目录被竞争者抢走（mkdir 与写 owner 之间的窗口）',
+      })
+      throw new PipelineLockHeldError({ pipelineId: id, lockPath: path, holder, staleMs })
+    }
+    throw error
+  }
 
   let released = false
   let timer: ReturnType<typeof setInterval> | undefined
@@ -466,6 +506,41 @@ type StaleReason = 'dead-holder' | 'heartbeat-expired' | 'unreadable'
  * - `heartbeat-expired`：`heartbeatAt` 超过 `staleMs`。跨主机时这是唯一可用的判据
  *   （pid 在别的机器上没有意义）。
  */
+/**
+ * 锁目录是否"正在被另一个进程获取"？
+ *
+ * `mkdir` 成功与写入 `owner.json` 之间必然有一个窗口（微秒级）。在这个窗口里，
+ * 竞争者读到的是"目录存在、**owner 文件根本不存在**"。若不区分，竞争者会把它当
+ * 崩溃残留抢走，于是**两个进程都以为自己持有锁**——实测到的互斥破坏
+ * （4 进程压测里出现过持有区间重叠）。
+ *
+ * 判据有两条，缺一不可：
+ * 1. **`owner.json` 不存在**（而不是"存在但读坏了"）。文件被写坏是**已经获取过**的
+ *    痕迹，属于可恢复的残留；文件根本不存在才是"还没来得及写"。
+ * 2. **目录很新**。宽限期取得远大于真实窗口（微秒级）：5 秒已经极其宽松；
+ *    超过宽限期仍无 owner，说明持有者真的在两步之间崩了，按残留抢占
+ *    （否则一次崩溃会永久锁死流水线）。
+ *
+ * 用真实时钟而不是注入时钟：`mtime` 来自文件系统，与注入的 `now()` 不同源，
+ * 混用会得出无意义的比较。
+ */
+const OWNERLESS_GRACE_MS = 5_000
+
+async function isBeingAcquired(lockPath: string): Promise<boolean> {
+  try {
+    await stat(join(lockPath, OWNER_FILE_NAME))
+    return false // owner 文件存在（哪怕内容是坏的）：不是"正在获取"
+  } catch {
+    // owner 文件不存在 —— 继续看目录年龄。
+  }
+  try {
+    return Date.now() - (await stat(lockPath)).mtimeMs < OWNERLESS_GRACE_MS
+  } catch {
+    // 目录已经消失：让调用方继续走原有流程。
+    return false
+  }
+}
+
 function staleReason(owner: PipelineLockOwner | null, at: number, staleMs: number): StaleReason | null {
   if (owner === null) return 'unreadable'
   if (isHolderDead(owner)) return 'dead-holder'
