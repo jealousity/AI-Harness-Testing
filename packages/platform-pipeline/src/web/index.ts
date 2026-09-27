@@ -9,7 +9,6 @@
 
 export {
   FilePipelineRunService,
-  assertTargetBaseUrlAllowed,
   buildEventTimeline,
   combineSignals,
   deriveRunStatus,
@@ -23,6 +22,15 @@ export {
   type PlatformHostFactory,
   type RunCallOptions,
 } from './pipeline-run-service.ts'
+
+export {
+  assertTargetBaseUrlAllowed,
+  assertTargetResolvedAllowed,
+  isPrivateAddress,
+  safeTargetUrlForMessage,
+  type AssertTargetResolvedOptions,
+  type ResolveHost,
+} from './ssrf-guard.ts'
 
 export {
   PipelineRunRegistry,

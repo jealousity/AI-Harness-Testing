@@ -435,6 +435,25 @@ test('executor_run refuses to run without a target base url (no forged execution
   assert.equal(result.records, undefined)
 })
 
+test('executor_run 在建连前复核**解析后**的地址，拒绝时一个请求都不发（docs/11 P2-04）', async () => {
+  await writeDesign({ testCases: [{ id: 'c1', steps: [{ action: 'GET /health', expected: ['200'] }] }] })
+  let requests = 0
+  let checked = 0
+  const entry = tool(baseContext({
+    targetBaseUrl: 'https://evil.example',
+    request: async () => { requests += 1; return { status: 200, text: async () => 'ok' } },
+    assertResolvedTargetAllowed: async () => {
+      checked += 1
+      throw new Error('域名解析到私有地址 127.0.0.1')
+    },
+  }), 'executor_run')
+
+  const result = await entry.execute({}, ctx) as { error?: string }
+  assert.equal(checked, 1, '建连前必须复核一次')
+  assert.equal(requests, 0, '复核失败时一个请求都不发')
+  assert.match(result.error ?? '', /解析到私有地址/)
+})
+
 test('executor_run 在建连前再次校验 targetBaseUrl：清单被篡改成内网地址也不能发请求（docs/11 P1-01）', async () => {
   await writeDesign({ testCases: [{ id: 'c1', steps: [{ action: 'GET /health' }] }] })
   let sent = 0

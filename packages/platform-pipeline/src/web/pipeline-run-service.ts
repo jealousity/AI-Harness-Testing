@@ -51,6 +51,7 @@ import {
 } from '../idempotency.ts'
 import { resolvePlatformRoots, type PlatformStorageRoots } from '../platform-roots.ts'
 import { assertScopeMatch } from '../platform-scope.ts'
+import { assertTargetBaseUrlAllowed, assertTargetResolvedAllowed } from './ssrf-guard.ts'
 import { createFileStorageBackendFromRoots } from '../storage/file/index.ts'
 import {
   assertBackendPorts,
@@ -124,6 +125,8 @@ export interface PipelineRunServiceOptions {
   readonly defaultGateTaskTtlMs?: number
   /** `targetBaseUrl` 校验；缺省拒绝本机、内网、链路本地与 CGNAT 地址（docs/10 §5.3 的 SSRF 约束）。 */
   readonly assertTargetBaseUrl?: (url: string) => void
+  /** 建连前的解析后复核（docs/11 P2-04）；缺省 = `assertTargetResolvedAllowed`。 */
+  readonly assertResolvedTargetAllowed?: (url: string) => Promise<void>
   /** 取消信号（本 service 实例内所有 run 共享；M1 的 async-runner 会改为每 run 独立）。 */
   readonly signal?: AbortSignal
   /**
@@ -372,6 +375,8 @@ export class FilePipelineRunService implements PipelineRunService {
   private readonly loadConfig: (configRef: string) => Promise<PipelineConfig>
   private readonly createHost: PlatformHostFactory
   private readonly assertTargetBaseUrl: (url: string) => void
+  /** 建连前的解析后复核（docs/11 P2-04）。 */
+  private readonly assertResolvedTargetAllowed: (url: string) => Promise<void>
   /** 配置缓存（docs/10 §4.2「加载、校验和缓存配置」）。只缓存解析成功的配置。 */
   private readonly configCache = new Map<string, PipelineConfig>()
   /**
@@ -391,6 +396,7 @@ export class FilePipelineRunService implements PipelineRunService {
     this.loadConfig = options.loadConfig ?? (async ref => loadPipelineConfig(ref))
     this.createHost = options.createHost ?? createPlatformHost
     this.assertTargetBaseUrl = options.assertTargetBaseUrl ?? assertTargetBaseUrlAllowed
+    this.assertResolvedTargetAllowed = options.assertResolvedTargetAllowed ?? assertTargetResolvedAllowed
   }
 
   async create(input: CreatePipelineRunInput, actor: ActorContext): Promise<PipelineRunSummary> {
@@ -1001,6 +1007,7 @@ export class FilePipelineRunService implements PipelineRunService {
       // executor 建连前复核用的同一份判据（docs/11 P1-01）：清单是磁盘文件，
       // 可能被篡改或来自旧版本，不能只信"创建时校验过一次"。
       assertTargetBaseUrl: this.assertTargetBaseUrl,
+      assertResolvedTargetAllowed: this.assertResolvedTargetAllowed,
       // 宿主必须用**本服务缓存的那一个**后端（docs/11 P1-09），否则 Web 读一个事实源、
       // driver 写另一个。用包装过的工厂而不是直接透传，见 `cachedBackendFactory`。
       createStorageBackend: this.cachedBackendFactory(),
@@ -1514,43 +1521,3 @@ function isMissingFile(error: unknown): boolean {
   return error instanceof Error && 'code' in error && (error as { code?: string }).code === 'ENOENT'
 }
 
-/**
- * `targetBaseUrl` 的静态 SSRF 校验（docs/10 §5.3「不能默认访问本机和内网」）。
- *
- * 只做**字面量**判定：拒绝本机名、`.internal`/`.local`、回环/私有/链路本地/CGNAT 地址，
- * 以及非 http(s) 协议。不做 DNS 解析，因此无法防止 DNS rebinding —— executor 侧在
- * 建立连接时仍须复核实际对端地址。
- */
-export function assertTargetBaseUrlAllowed(rawUrl: string): void {
-  let url: URL
-  try {
-    url = new URL(rawUrl)
-  } catch {
-    throw new PipelineRunError('invalid-request', `targetBaseUrl 不是合法 URL：${rawUrl}`)
-  }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new PipelineRunError('invalid-request', `targetBaseUrl 只允许 http/https：${rawUrl}`, { protocol: url.protocol })
-  }
-  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '')
-  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.internal') || host.endsWith('.local')) {
-    throw new PipelineRunError('forbidden', `targetBaseUrl 不允许指向本机/内网：${rawUrl}`, { host })
-  }
-  if (isPrivateAddress(host)) {
-    throw new PipelineRunError('forbidden', `targetBaseUrl 不允许指向私有地址：${rawUrl}`, { host })
-  }
-}
-
-function isPrivateAddress(host: string): boolean {
-  if (host === '::1' || host === '::' || host === '0.0.0.0') return true
-  // IPv6 唯一本地地址 fc00::/7 与链路本地 fe80::/10
-  if (/^f[cd][0-9a-f]{2}:/i.test(host) || /^fe[89ab][0-9a-f]:/i.test(host)) return true
-  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host)
-  if (match === null) return false
-  const [a, b] = [Number(match[1]), Number(match[2])]
-  if (a === 0 || a === 10 || a === 127) return true
-  if (a === 172 && b >= 16 && b <= 31) return true
-  if (a === 192 && b === 168) return true
-  if (a === 169 && b === 254) return true
-  if (a === 100 && b >= 64 && b <= 127) return true
-  return false
-}

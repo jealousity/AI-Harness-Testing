@@ -131,6 +131,17 @@ export interface PlatformToolContext {
    */
   readonly assertTargetBaseUrl?: (url: string) => void
   /**
+   * **解析后**的建连前复核（docs/11 P2-04）：防 DNS rebinding。
+   *
+   * 与 `assertTargetBaseUrl` 的分工：后者只判字符串（快、无副作用，创建时也用它）；
+   * 本钩子在**每次发出请求之前**解析域名并复核实际对端地址。域名可以在创建之后
+   * 解析到别处，所以两者不能互相替代。
+   *
+   * 宿主注入（生产是 `assertTargetResolvedAllowed`）。缺省 = 不复核，仅用于
+   * 不经过 Web/CLI 创建流程的测试；**真实宿主必须注入**。
+   */
+  readonly assertResolvedTargetAllowed?: (url: string) => Promise<void>
+  /**
    * 远端幂等键的请求头名（docs/11 P1-07）。
    *
    * 声明它 = **宿主确认被测服务支持幂等键**。此后 `executor_run` 会在每个请求上带
@@ -893,6 +904,19 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
         } catch (error) {
           return await finish(
             { error: `被测服务基址未通过宿主复核，拒绝执行：${errorMessage(error)}` },
+            { success: false, errorCode: 'target-unavailable' },
+          )
+        }
+      }
+      // 解析后复核（docs/11 P2-04）：字面量校验只能证明"那个字符串看起来安全"，
+      // 域名可以在创建之后解析到内网（DNS rebinding）。必须在**发出任何请求之前**
+      // 解析一次并复核实际对端地址。
+      if (ctx.assertResolvedTargetAllowed !== undefined) {
+        try {
+          await ctx.assertResolvedTargetAllowed(baseUrl)
+        } catch (error) {
+          return await finish(
+            { error: `被测服务基址解析后未通过宿主复核，拒绝执行：${errorMessage(error)}` },
             { success: false, errorCode: 'target-unavailable' },
           )
         }

@@ -91,6 +91,13 @@ export interface PlatformHostOptions {
    */
   readonly assertTargetBaseUrl?: (url: string) => void
   /**
+   * **解析后**的建连前复核（docs/11 P2-04）：防 DNS rebinding。
+   *
+   * 与 `assertTargetBaseUrl` 同时注入：后者判字符串（创建时也用它），
+   * 本钩子在每次发请求前解析域名并复核实际对端地址。
+   */
+  readonly assertResolvedTargetAllowed?: (url: string) => Promise<void>
+  /**
    * 远端幂等键的请求头名（docs/11 P1-07）。
    *
    * 声明它 = 宿主确认**被测服务支持幂等键**：executor 会在每个请求上带
@@ -358,6 +365,7 @@ function buildToolRegistry(
     checkpointRoot,
     ...(options.targetBaseUrl === undefined ? {} : { targetBaseUrl: options.targetBaseUrl }),
     ...(options.assertTargetBaseUrl === undefined ? {} : { assertTargetBaseUrl: options.assertTargetBaseUrl }),
+    ...(options.assertResolvedTargetAllowed === undefined ? {} : { assertResolvedTargetAllowed: options.assertResolvedTargetAllowed }),
     ...(options.executorIdempotencyHeader === undefined ? {} : { executorIdempotencyHeader: options.executorIdempotencyHeader }),
     ...(options.diagProbes === undefined ? {} : { diagProbes: options.diagProbes }),
     ...(options.diagTimeoutMs === undefined ? {} : { diagTimeoutMs: options.diagTimeoutMs }),
