@@ -106,7 +106,7 @@ await ctx.plugin(platformPipelineHost, {
 ## 状态
 
 - 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）+ 2 份 ADR（docs/adr/0001 文档解析库选型、docs/adr/0002 存储后端选型与事务边界）
-- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **820 项测试全绿**
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **823 项测试全绿**
   - 注：在受限沙箱里跑全量 `node --test` 时，`test/fs-tools.test.ts` 的清理步骤可能被宿主 `safe-delete` 批量删除守卫拦下（按「每轮删除次数 > 阈值」判定，与代码无关）。单独运行该文件即通过。
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
 - Web 运行服务（M0 契约层）：`platform-pipeline/web` 提供无 HTTP 框架依赖的 `PipelineRunService`，覆盖 create/get/list/run/reenter 与人工门 list/claim/decide/cancel，以及 `getStageArtifact`/`listEvents`/`scanPipelineIndex`；Web 状态与阶段视图全部由检查点、产物与人工门任务重建，服务层不复制阶段逻辑。
@@ -182,7 +182,8 @@ await ctx.plugin(platformPipelineHost, {
   - **并发门槛**（`test/m5-multiprocess-concurrency.test.ts`）：4 个**真实 node 子进程**同时 claim / decide 同一条门任务、同时抢同一条流水线的运行锁。**抓出一个真实的互斥破坏**：`mkdir` 到写 `owner.json` 之间的窗口被竞争者当成崩溃残留抢占 → 两个进程同时持锁（实测到持有区间重叠）。修法：owner 文件**不存在**且目录很新（5s 宽限）判定为"正在获取"，与"文件存在但损坏"严格区分。同时修掉"写 owner 期间被抢走抛裸 `ENOENT` → 上层归成 500 而不是 409"。修后**连跑 8 次全绿**。
   - **预算长跑门槛**（`test/m5-budget-soak.test.ts`）：多批次 + 中途换 service 实例，判据全部来自**原始用量日志与聚合结果的对照**——换实例后累计必须逐字相同、打回重跑一批后必须精确等于两批之和、汇总值必须等于日志里的事件条数。判据刻意**不写死每批多少个 step**（那是聚合口径的实现细节），只钉住关系。
   - **真实执行器的六阶段端到端**（`test/m5-execute-e2e.test.ts`）：真实本地 HTTP 被测系统 + 真实 `executor_run`（真实请求/证据/会话链）+ `execute` 阶段 R4-08 用**同一份**会话文件判过账 + 六阶段跑到 `completed`；配套负向用例证明"无执行数据时必须拦下，且不得存在会话文件"（不伪造执行记录）。此前只覆盖了负向的一半。
-  - **未收口**（如实标注，不写成已完成）：真实跨天（wall-clock）运行、公网可达的真实被测系统 + 真实模型、可运行的外部后端。发布范围限制见 `docs/13` §3。
+  - **真实时钟门槛**（`test/m5-realtime-soak.test.ts`）：**故意用真实时间**验证注入时钟测不到的两件事——① 自动续租跑在真实的 `setInterval` 上，因此超过 `staleMs` 之后长跑锁仍抢不走；② 没有续租时真实经过的时间确实让它可被接管；③ **真实子进程**取得锁后被杀（不 release），真实等待即可接管。只要续租定时器没装上或被 `unref` 掉，长跑就会被别人抢走锁，而**所有注入时钟的单元测试仍然全绿**——这就是这组用例存在的理由。
+  - **未收口**（如实标注，不写成已完成）：真实**跨天**运行（8c）、公网可达的真实被测系统 + 真实模型（10b）、可运行的外部后端（11）。发布范围限制见 `docs/13` §3。
 - 文档解析（P0-A1 完成）：`documents/` 已提供注册表 + 统一中间表示 + **PDF/DOCX/XLSX/Markdown 四类必支持格式** + 文本族与分隔符表格解析器；`parse_doc` 走注册表，返回 `status`/`confidence`/`sections`/`tables`/`plainText`/`sourceRefs`/`diagnostics`/`limits`，并按 §5.6.8 不回传原始字节。`.doc`/`.xls` 按 ADR-0001 §9 显式 `unsupported` 并给出定向转换提示。
   - `sourceRef` 四级可追溯：`requirements.pdf#page=3`、`spec.docx#heading=1.1,table=1,row=2`、`cases.xlsx#sheet=接口!A2:F20`、`cases.csv#table=1,row=2`。
   - 不伪装：无文本层 → `partial` + `NO_TEXT_LAYER`；无缓存公式值 → `FORMULA_VALUE_UNAVAILABLE` 且**绝不自行计算**；无解析器 → `unsupported`；二进制族 magic 不匹配 → **绝不退回按文本读**。

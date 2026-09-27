@@ -918,6 +918,8 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 | M5-7 | `9d97607` | `feat: route idempotency ledger through a records port` | clean | 是 |
 | M5-8 | `e2e40ae` | `docs: fix stale statements after the records port landed` | clean | 是 |
 | M5-9 | `eddf7b7` | `feat: route pipeline index through an injectable host record store` | clean | 是 |
+| M5-10 | `98cf102` | `docs: correct the commit hash recorded for the index wiring` | clean | 是 |
+| M5-11 | 本次提交 | `test: add m5 real-clock gate for lease renewal and takeover` | clean | 是 |
 
 **合规说明（如实记录）**：§10 的提交模板要求逐项回答 10 条，其中第 10 条是
 「提交 hash、工作区状态、`HEAD == origin/main` 是否确认」。批次 A~D 的提交说明把第 10 条
