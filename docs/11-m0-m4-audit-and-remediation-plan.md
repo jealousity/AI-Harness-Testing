@@ -909,6 +909,8 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 | M5-2 | `7b47578` | `fix: add m5 recovery and multiprocess gates, fix lock mutual exclusion` | clean | 是 |
 | M5-3 | `77098fd` | `docs: record m5 release gate status with evidence` | clean | 是 |
 | M5-4 | `d06aed6` | `test: add m5 budget soak gate across batches and restarts` | clean | 是 |
+| M5-5 | `bfa3e47` | `docs: mark m5 budget soak gate closed and record gate-8 evidence` | clean | 是 |
+| M5-6 | `05f0faa` | `test: add m5 real-executor six-stage end-to-end gate` | clean | 是 |
 
 **合规说明（如实记录）**：§10 的提交模板要求逐项回答 10 条，其中第 10 条是
 「提交 hash、工作区状态、`HEAD == origin/main` 是否确认」。批次 A~D 的提交说明把第 10 条
@@ -923,9 +925,34 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 - **已收口**：安全（越权/凭据/存在性/SSRF/解析限额）、恢复演练（自动化）、
   并发（跨进程 CAS 与运行锁，4 个真实子进程，连跑 8 次全绿）、预算终止与查询、
   Web 六阶段端到端（脚本化宿主）。
-- **已收口（追加）**：预算跨批次 / 跨进程重启的累计（`test/m5-budget-soak.test.ts`）。
-- **未收口**：真实跨天（wall-clock）运行、真实被测系统（非脚本化宿主）的六阶段端到端、
-  可运行的外部后端（PostgreSQL / Object Store）。
+- **已收口（追加）**：预算跨批次 / 跨进程重启的累计（`test/m5-budget-soak.test.ts`）；
+  真实执行器的六阶段端到端（`test/m5-execute-e2e.test.ts`，含"无数据必须拦下"的负向一半）。
+- **未收口**：真实跨天（wall-clock）运行、公网可达的真实被测系统 + 真实模型、
+  可运行的外部后端（PostgreSQL / Object Store），以及约束书 §二 要求的
+  **`pipeline manifest/index/idempotency` 事实来源统一**（见下方冲突说明）。
+
+### 13.3 待用户裁决的设计冲突（约束书 §一.7 要求先报告）
+
+约束书 `docs/prompts/deepseek-m0-m5-execution-constraints.md` §二 明确要求统一
+**`pipeline manifest/index/idempotency` 的事实来源**。动手前发现一个结构性冲突，
+无法靠"看起来合理的解释"绕过：
+
+| | 作用域 | 现状 |
+|---|---|---|
+| `StoragePorts`（9 个端口） | **项目级**（file 后端绑死一个 `projectRoot`） | 检查点/产物/门任务/用量等 |
+| 流水线索引 / 运行清单 | **dataRoot 级**（`<dataRoot>/pipelines/<id>.json`，跨项目） | 仍是文件 |
+| 幂等台账 | **项目级**（`<projectRoot>/idempotency/**`） | 仍是文件 |
+
+两种改法：
+
+- **(a)** 把索引**搬到项目级**：改落盘布局 + 改恢复扫描语义（现在跨项目扫全部流水线）。
+- **(b)** 给 dataRoot 级的宿主记录**另开一个注入点**（与 `StoragePorts` 并列），
+  索引走它、幂等台账走现有的项目级后端。
+
+按 §一.7「如果认为计划有冲突，先报告冲突和影响，不能自行选择一个'看起来合理'的解释」，
+**未自行选择**，等待裁决。
+
+---
 
 门槛推进过程中由**门槛测试本身**抓出并修复了 4 个真实缺陷（不是读代码发现的）：
 
