@@ -14,7 +14,7 @@
 import { join } from 'node:path'
 
 import { normalizeConfig } from '../src/config.ts'
-import { PipelineDriver, type ArtifactStore, type ReviewOutcome } from '../src/driver.ts'
+import { PipelineDriver, type ArtifactStore, type ExecutionLoader, type ReviewOutcome } from '../src/driver.ts'
 import { resolvePlatformRoots } from '../src/platform-roots.ts'
 import { STAGE_ORDER, type PipelineConfig, type StageId } from '../src/types.ts'
 import { DEFAULT_RULESET_VERSION, buildGateEngine } from '../src/runtime/platform-host.ts'
@@ -120,6 +120,14 @@ export interface ScriptedHostOptions {
    * 测试需要同时打开配置里的 `review.enabled` 并在这里给出裁决。
    */
   readonly review?: (stageId: StageId) => ReviewOutcome
+  /**
+   * 执行数据加载器（docs/08 R4-08/09/10 对账）。
+   *
+   * 缺省不装配：脚本化宿主不产生真实执行数据，因此 `execute` 阶段配上执行对账规则时
+   * 必然失败——那正是"不伪造执行记录"的负向证据（`web-http.test.ts` 验收7）。
+   * 要验证**通过**的那一半，宿主必须真的装配它，并在此之前让 executor 真实执行。
+   */
+  readonly execution?: ExecutionLoader
 }
 
 /** 记录 spawn 调用的脚本化运行器：用于断言"已批准阶段不重生成"。 */
@@ -260,6 +268,7 @@ export class ScriptedHost {
       artifacts,
       checkpoint: ports.checkpoints,
       usage,
+      ...(this.options.execution === undefined ? {} : { execution: this.options.execution }),
       ...(this.options.review === undefined
         ? {}
         : { review: { run: async (stageId: StageId) => this.options.review!(stageId) } }),
