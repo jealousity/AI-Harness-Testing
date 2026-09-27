@@ -29,10 +29,18 @@ import { stageRules } from '../gates/stage-rules.ts'
 import { pipelineContractSchemas } from '../contracts/schemas.ts'
 import { resolvePlatformRoots, type PlatformStorageRoots } from '../platform-roots.ts'
 import { LlmProviderRegistry, type ResolvedLlmProvider } from '../provider-registry.ts'
-import { FsArtifactStore, FsCheckpointPort } from '../stores/fs.ts'
+import { FsArtifactStore } from '../stores/fs.ts'
+import { createFileStorageBackendFromRoots } from '../storage/file/index.ts'
+import {
+  assertBackendPorts,
+  type ArtifactStore,
+  type StorageBackend,
+  type StorageBackendFactory,
+  type StoragePorts,
+} from '../storage/ports.ts'
 import { toolById } from '../tool-catalog.ts'
 import { STAGE_ORDER, type PipelineConfig, type StageId } from '../types.ts'
-import { UsageRecorder, fileUsageStore, usageDir } from '../usage.ts'
+import { UsageRecorder, usageDir } from '../usage.ts'
 import type { DiagSpec } from '../executor/env-diag.ts'
 import { fsReadTool, fsWriteTool } from './fs-tools.ts'
 import { OpenAICompatibleClient } from './openai-client.ts'
@@ -44,7 +52,7 @@ import {
   executorSessionPath,
   loadExecutionSession,
 } from './platform-tools.ts'
-import { FileHumanGateTaskStore, FileTaskStore, type HumanGateTask } from './persistence.ts'
+import { FileHumanGateTaskStore, FileTaskStore, type HumanGateTask, type HumanGateTaskStore, type TaskStore } from './persistence.ts'
 import {
   PersistentHumanGate,
   type PersistentGateAuditRecord,
@@ -105,17 +113,37 @@ export interface PlatformHostOptions {
   readonly maxRetries?: number
   /** 自定义传输（测试注入 / 私有网关代理）。 */
   readonly fetchImpl?: typeof fetch
+  /**
+   * 存储后端工厂（docs/11 P1-09）。
+   *
+   * 宿主与 Web 服务都是**多项目**的（项目目录由 `resolvePlatformRoots` 按租户/项目
+   * 推导），一个现成的后端实例绑死一个 `projectRoot`，服务不了第二个项目，
+   * 因此这里注入的是"根 → 后端"的**工厂**。
+   *
+   * 缺省 = 文件后端（`createFileStorageBackendFromRoots`）。换后端 = 换这一个函数：
+   * driver / 门禁 / 工具 / Web 服务一行都不用改。
+   */
+  readonly createStorageBackend?: StorageBackendFactory
 }
 
 export interface PlatformHost {
   readonly roots: PlatformStorageRoots
   readonly checkpointRoot: string
+  /**
+   * 本次装配使用的存储后端（docs/11 P1-09）。
+   *
+   * 暴露它是为了让宿主能在启动时 `await assertStorageBackendHealthy(host.backend)`，
+   * 也让排障能直接问"这条流水线的记录到底存在哪个后端"。
+   */
+  readonly backend: StorageBackend
+  /** `backend.ports` 的别名：宿主内所有部件都从这里取端口，不再各自 new 实现。 */
+  readonly ports: StoragePorts
   readonly provider: ResolvedLlmProvider
   readonly llm: OpenAICompatibleClient
   readonly tools: ToolRegistry
-  readonly artifacts: FsArtifactStore
-  readonly gateTasks: FileHumanGateTaskStore
-  readonly tasks: FileTaskStore
+  readonly artifacts: ArtifactStore
+  readonly gateTasks: HumanGateTaskStore
+  readonly tasks: TaskStore
   readonly gate: PersistentHumanGate
   readonly driver: PipelineDriver
   /** 用量落点（docs/10 §7.3）：`<projectRoot>/usage/<pipelineId>.jsonl`。 */
@@ -156,6 +184,16 @@ export function createPlatformHost(options: PlatformHostOptions): PlatformHost {
   const roots = resolvePlatformRoots(options.dataRoot, config)
   const checkpointRoot = join(roots.checkpointRoot, options.pipelineId)
 
+  // ── 存储后端（docs/11 P1-09）────────────────────────────────────────────────
+  //
+  // 宿主**只从 backend 取端口**，自己不再 new 任何具体文件实现。于是"换后端"
+  // 就是换这一个工厂函数，driver / gate / 工具一行都不用改。
+  // 缺省装配 = 文件后端（本地开发与单机部署）。
+  const backend = (options.createStorageBackend ?? createFileStorageBackendFromRoots)(roots)
+  // 装配即校验：声称实现的端口必须真的存在，缺必需端口在这里就炸。
+  assertBackendPorts(backend)
+  const ports = backend.ports
+
   const registry = new LlmProviderRegistry(config.llm, options.env ?? process.env)
   const requirement = { tools: true, structuredOutput: true } as const
   const provider = options.providerName === undefined
@@ -171,19 +209,19 @@ export function createPlatformHost(options: PlatformHostOptions): PlatformHost {
     ...(options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl }),
   })
 
-  const artifacts = new FsArtifactStore(roots.artifactsRoot)
+  const artifacts = ports.artifacts
   const gates = buildGateEngine(config)
   // 用量记录器绑定 (tenant, project, pipeline)：调用点只描述"发生了什么"，
   // 不自己编 scope 与时长（口径分裂会让 Web 与 CLI 的汇总对不上）。
   const usage = new UsageRecorder({
-    store: fileUsageStore(usageLogDir(roots.projectRoot)),
+    store: ports.usage,
     scope: {
       tenantId: config.scope?.tenantId ?? 'default',
       projectId: config.projectId,
       pipelineId: options.pipelineId,
     },
   })
-  const tools = buildToolRegistry(roots, options, checkpointRoot, usage)
+  const tools = buildToolRegistry(roots, options, checkpointRoot, usage, backend)
   const signal = options.signal
 
   const stageRunner = new OpenAIStageRunner({
@@ -195,8 +233,8 @@ export function createPlatformHost(options: PlatformHostOptions): PlatformHost {
     ...(signal === undefined ? {} : { signal }),
   })
 
-  const gateTasks = new FileHumanGateTaskStore(gateTaskStoreDir(roots.projectRoot))
-  const tasks = new FileTaskStore(taskStoreDir(roots.projectRoot))
+  const gateTasks = ports.gateTasks
+  const tasks = ports.tasks
   const gate = new PersistentHumanGate({
     store: gateTasks,
     projectId: config.projectId,
@@ -218,10 +256,12 @@ export function createPlatformHost(options: PlatformHostOptions): PlatformHost {
     gates,
     human: gate,
     artifacts,
-    checkpoint: new FsCheckpointPort(),
+    checkpoint: ports.checkpoints,
     review,
     // execute 阶段门禁（R4-08/09/10）要对账 executor 自产的记录与证据；
     // 会话由 executor_run 落盘，这里只做只读加载（缺失 = 未真实执行，门禁据此拦截）。
+    // 注意：执行会话/证据/调用日志是 **executor 的执行数据**，不是宿主记录，
+    // 因此它们不在 §8.2 的 9 个端口里，仍按项目目录落盘（见 ADR-0002 §7）。
     execution: createExecutionLoader(roots.projectRoot, options.pipelineId),
     ...(options.receiveInput === undefined ? {} : { receiveInput: options.receiveInput }),
     ...(options.maxGateRetries === undefined ? {} : { maxGateRetries: options.maxGateRetries }),
@@ -229,7 +269,7 @@ export function createPlatformHost(options: PlatformHostOptions): PlatformHost {
     ...(signal === undefined ? {} : { signal }),
   })
 
-  return { roots, checkpointRoot, provider, llm, tools, artifacts, gateTasks, tasks, gate, driver, usage }
+  return { roots, checkpointRoot, backend, ports, provider, llm, tools, artifacts, gateTasks, tasks, gate, driver, usage }
 }
 
 /**
@@ -297,6 +337,7 @@ function buildToolRegistry(
   options: PlatformHostOptions,
   checkpointRoot: string,
   usage: UsageRecorder,
+  backend: StorageBackend,
 ): ToolRegistry {
   const registry = new InMemoryToolRegistry()
   registry.register(fsReadTool({ root: roots.projectRoot }))
@@ -306,6 +347,11 @@ function buildToolRegistry(
     artifactsRoot: roots.artifactsRoot,
     pipelineId: options.pipelineId,
     projectId: options.config.projectId,
+    // 端口优先（docs/11 P1-09）：工具不得绕过 backend 直接读本地文件。
+    artifacts: backend.ports.artifacts,
+    checkpoints: backend.ports.checkpoints,
+    ...(backend.ports.knowledge === undefined ? {} : { knowledge: backend.ports.knowledge }),
+    ...(backend.ports.cases === undefined ? {} : { cases: backend.ports.cases }),
     ...(roots.knowledgeRoot === undefined ? {} : { knowledgeRoot: roots.knowledgeRoot }),
     ...(roots.casesRoot === undefined ? {} : { casesRoot: roots.casesRoot }),
     ...(options.receiveInput === undefined ? {} : { receiveInput: options.receiveInput }),
@@ -330,11 +376,15 @@ export interface CheckpointHostOptions {
   readonly dataRoot: string
   readonly pipelineId: string
   readonly rulesetVersion?: string
+  /** 存储后端工厂；缺省 = 文件后端。与 `createPlatformHost` 同一接缝（docs/11 P1-09）。 */
+  readonly createStorageBackend?: StorageBackendFactory
 }
 
 export interface CheckpointHost {
   readonly roots: PlatformStorageRoots
   readonly checkpointRoot: string
+  readonly backend: StorageBackend
+  readonly ports: StoragePorts
   readonly driver: PipelineDriver
 }
 
@@ -347,6 +397,8 @@ export interface CheckpointHost {
 export function createCheckpointHost(options: CheckpointHostOptions): CheckpointHost {
   if (options.pipelineId.trim() === '') throw new Error('pipelineId 必填')
   const roots = resolvePlatformRoots(options.dataRoot, options.config)
+  const backend = (options.createStorageBackend ?? createFileStorageBackendFromRoots)(roots)
+  assertBackendPorts(backend)
   const unavailable = (what: string) => (): never => {
     throw new Error(`checkpoint-only host 未装配 ${what}；运行阶段请改用 createPlatformHost`)
   }
@@ -358,8 +410,14 @@ export function createCheckpointHost(options: CheckpointHostOptions): Checkpoint
     spawn: { runStage: unavailable('stage spawner') },
     gates: buildGateEngine(options.config),
     human: { gate: unavailable('human gate'), gateFailed: unavailable('human gate') },
-    artifacts: new FsArtifactStore(roots.artifactsRoot),
-    checkpoint: new FsCheckpointPort(),
+    artifacts: backend.ports.artifacts,
+    checkpoint: backend.ports.checkpoints,
   })
-  return { roots, checkpointRoot: join(roots.checkpointRoot, options.pipelineId), driver }
+  return {
+    roots,
+    checkpointRoot: join(roots.checkpointRoot, options.pipelineId),
+    backend,
+    ports: backend.ports,
+    driver,
+  }
 }

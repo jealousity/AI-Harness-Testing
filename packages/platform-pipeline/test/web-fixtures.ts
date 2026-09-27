@@ -17,22 +17,20 @@ import { normalizeConfig } from '../src/config.ts'
 import { PipelineDriver, type ArtifactStore, type ReviewOutcome } from '../src/driver.ts'
 import { resolvePlatformRoots } from '../src/platform-roots.ts'
 import { STAGE_ORDER, type PipelineConfig, type StageId } from '../src/types.ts'
-import { DEFAULT_RULESET_VERSION, buildGateEngine, gateTaskStoreDir, taskStoreDir } from '../src/runtime/platform-host.ts'
+import { DEFAULT_RULESET_VERSION, buildGateEngine } from '../src/runtime/platform-host.ts'
 import type { PlatformHost, PlatformHostOptions } from '../src/runtime/platform-host.ts'
-import { FileHumanGateTaskStore, FileTaskStore } from '../src/runtime/persistence.ts'
 import { PersistentHumanGate } from '../src/runtime/persistent-human-gate.ts'
 import { ScriptedStageRunner } from '../src/runtime/scripted-runtime.ts'
 import { InMemoryToolRegistry } from '../src/runtime/tool-registry.ts'
 import { OpenAICompatibleClient } from '../src/runtime/openai-client.ts'
 import type { ResolvedLlmProvider } from '../src/provider-registry.ts'
-import { FsArtifactStore, FsCheckpointPort } from '../src/stores/fs.ts'
+import { createFileStorageBackendFromRoots } from '../src/storage/file/index.ts'
+import { assertBackendPorts } from '../src/storage/ports.ts'
 import type { SpawnRequest, SpawnedRun, StageSpawner } from '../src/stage-spawner.ts'
 import {
   StageBudgetExceededError,
   UsageRecorder,
-  fileUsageStore,
   recordUsage,
-  usageDir,
   type UsageLimitKind,
   type UsageSink,
 } from '../src/usage.ts'
@@ -213,11 +211,16 @@ export class ScriptedHost {
   readonly factory: PlatformHostFactory = (options: PlatformHostOptions): PlatformHost => {
     const roots = resolvePlatformRoots(options.dataRoot, options.config)
     const checkpointRoot = join(roots.checkpointRoot, options.pipelineId)
-    const artifacts = new FsArtifactStore(roots.artifactsRoot)
-    // 用量记录器与生产同源（同一份 `usageDir` + `UsageRecorder`），否则"预算查询"
+    // 与生产同一接缝（docs/11 P1-09）：脚本化宿主也从**后端**取端口，
+    // 因此测试能注入 memory 后端来验证"换后端只改装配"。
+    const backend = (options.createStorageBackend ?? createFileStorageBackendFromRoots)(roots)
+    assertBackendPorts(backend)
+    const ports = backend.ports
+    const artifacts = ports.artifacts
+    // 用量记录器与生产同源（同一份 usage 端口 + `UsageRecorder`），否则"预算查询"
     // 在测试里走的是另一套路径，等于没验证 docs/10 §7.3。
     const usage = new UsageRecorder({
-      store: fileUsageStore(usageDir(roots.projectRoot)),
+      store: ports.usage,
       scope: {
         tenantId: options.config.scope?.tenantId ?? 'default',
         projectId: options.config.projectId,
@@ -226,8 +229,8 @@ export class ScriptedHost {
     })
     this.spawner ??= new RecordingSpawner(artifacts, this.options, usage)
     const spawner = this.spawner
-    const gateTasks = new FileHumanGateTaskStore(gateTaskStoreDir(roots.projectRoot))
-    const tasks = new FileTaskStore(taskStoreDir(roots.projectRoot))
+    const gateTasks = ports.gateTasks
+    const tasks = ports.tasks
     const gate = new PersistentHumanGate({
       store: gateTasks,
       projectId: options.config.projectId,
@@ -255,7 +258,7 @@ export class ScriptedHost {
       gates: buildGateEngine(options.config),
       human: gate,
       artifacts,
-      checkpoint: new FsCheckpointPort(),
+      checkpoint: ports.checkpoints,
       usage,
       ...(this.options.review === undefined
         ? {}
@@ -264,6 +267,8 @@ export class ScriptedHost {
     return {
       roots,
       checkpointRoot,
+      backend,
+      ports,
       provider,
       llm: new OpenAICompatibleClient({
         baseUrl: provider.baseUrl,

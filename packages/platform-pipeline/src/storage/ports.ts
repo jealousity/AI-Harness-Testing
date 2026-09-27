@@ -23,6 +23,7 @@
  */
 
 import type { AcquirePipelineLockOptions, PipelineLock } from '../checkpoint-lock.ts'
+import type { PlatformStorageRoots } from '../platform-roots.ts'
 import type { HumanGateTaskStore, TaskStore } from '../runtime/persistence.ts'
 import type { UsageStore } from '../usage.ts'
 import type { Checkpoint, StageArtifact } from '../types.ts'
@@ -504,6 +505,37 @@ export interface StorageMigrationReport {
   readonly migrated: readonly { readonly ref: string; readonly kind: StorageRecordKind; readonly from: number }[]
   readonly skipped: readonly { readonly ref: string; readonly kind: StorageRecordKind; readonly reason: string }[]
   readonly backupDir: string | null
+}
+
+/**
+ * 后端工厂：由**项目存储根**装配一个后端（docs/11 P1-09）。
+ *
+ * 为什么是工厂而不是一个现成的后端实例：宿主与 Web 服务都是**多项目**的——
+ * 项目目录由 `resolvePlatformRoots(dataRoot, config)` 按租户/项目推导，
+ * 一个实例绑死一个 `projectRoot`，无法服务第二个项目。
+ * 工厂把"根 → 后端"这一步收成一个函数，于是**换后端 = 换这一个函数**。
+ */
+export type StorageBackendFactory = (roots: PlatformStorageRoots) => StorageBackend
+
+/**
+ * 校验后端确实可用，否则抛 {@link StorageUnavailableError}（docs/11 P1-09 第五步）。
+ *
+ * 只把 `unreadable`（基础设施读不了）判成"后端不可用"：
+ * - `corrupt-json` / `schema-invalid` 是**数据问题**，应该被看见并被修复，
+ *   但让整个服务起不来比坏一条记录更糟——它们在 `diagnose()` 的返回里照常报告；
+ * - `migration-needed` 是待办，不是故障；
+ * - `unsupported-version` 由读侧显式失败（绝不降级解析），不需要在启动时一刀切。
+ */
+export async function assertStorageBackendHealthy(backend: StorageBackend): Promise<StorageHealth> {
+  const health = await backend.diagnose()
+  const unreadable = health.diagnostics.filter(item => item.code === 'unreadable')
+  if (unreadable.length > 0) {
+    throw new StorageUnavailableError(
+      backend.name, 'diagnose',
+      `${unreadable.length} 处记录读取失败：${unreadable.slice(0, 3).map(item => `${item.ref}（${item.detail}）`).join('；')}`,
+    )
+  }
+  return health
 }
 
 // ── 装配校验 ────────────────────────────────────────────────────────────────────

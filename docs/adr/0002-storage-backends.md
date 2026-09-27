@@ -258,6 +258,8 @@ PostgreSQL 的表里保留 `payload jsonb`（检查点、任务、门任务）�
 | 4 | 对象存储没有条件写，`artifacts` 并发写是"后写覆盖" | file 后端同样如此 | 若将来要防，需在端口层引入 `expectedDigest` 之类的条件参数 |
 | 5 | 审计 append-only 的强度 | PG 靠 `REVOKE`；对象存储只能靠 bucket policy | 因此审计**固定**放 PG，不随部署形态改变 |
 | 6 | `memory` 后端的锁只在进程内有效 | 已写进模块头注释与测试（`锁是**进程内**的`） | 生产部署必须用 file / PG；这一点由 `describe().name` 与锁路径 `memory://` 可观测 |
+| 7 | **宿主级记录不在端口内**（docs/11 P1-09 第四步） | 流水线索引/运行清单（`<dataRoot>/pipelines/<id>.json`）、幂等台账（`<projectRoot>/idempotency/**`）、执行会话/证据/调用日志（`<projectRoot>/executor/**`）仍是**文件实现**；`StorageBackend` 只管 §8.2 的 9 个端口 | 要让它们也随后端切换，需要**新增端口**（例如一个"带集合的键值记录"端口）——那是 `docs/10 §8.2` 端口清单的扩展，属于新的设计决定，不在 P1-B/P1-09 范围内。**当前行为已被测试钉住**：`test/storage-backend-wiring.test.ts` 断言"换了内存后端之后这些目录仍然出现" |
+| 8 | **未接入后端工厂的入口** | `cli.ts` 的门任务存储、`plugin.ts`（cordis 插件）、`harness/host-plugin.ts`（可选 Harness 适配层）、`src/e2e/minimal-host.ts`（测试宿主）仍直接 `new FileHumanGateTaskStore` / `FsArtifactStore` / `FsCheckpointPort` | 核心宿主与 Web 服务已接入（P1-09）；其余入口要么属可选适配层，要么是测试宿主。逐个接入即可，**不需要改端口** |
 
 ## 8. 一致性证据
 

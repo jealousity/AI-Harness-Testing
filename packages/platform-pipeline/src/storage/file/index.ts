@@ -26,6 +26,7 @@
 import { copyFile, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, relative, resolve } from 'node:path'
 import type { Dirent } from 'node:fs'
+import type { PlatformStorageRoots } from '../../platform-roots.ts'
 import { FsArtifactStore, FsCheckpointPort } from '../../stores/fs.ts'
 import { MarkdownCaseStore, MarkdownKnowledgeStore, decodeKnowledgeMeta } from '../../stores/markdown.ts'
 import { FileHumanGateTaskStore, FileTaskStore } from '../../runtime/persistence.ts'
@@ -99,6 +100,29 @@ function resolveDirs(options: FileStorageOptions): ResolvedDirs {
 }
 
 /** 装配文件后端。 */
+/**
+ * 由**项目存储根**装配文件后端。
+ *
+ * 这是宿主与 Web 服务的**默认装配**，也是"换后端 = 换一个函数"的落点：
+ * 调用方只需换掉传给 `createStorageBackend` 的那个函数，其余代码一行不动。
+ */
+export function createFileStorageBackendFromRoots(roots: PlatformStorageRoots): StorageBackend {
+  return createFileStorageBackend({
+    projectRoot: roots.projectRoot,
+    artifactsRoot: roots.artifactsRoot,
+    checkpointRoot: roots.checkpointRoot,
+    ...(roots.knowledgeRoot === undefined ? {} : { knowledgeRoot: roots.knowledgeRoot }),
+    ...(roots.casesRoot === undefined ? {} : { casesRoot: roots.casesRoot }),
+  })
+}
+
+/**
+ * 文件后端装配：把既有实现按端口接起来。
+ *
+ * **这里是唯一 new 具体文件实现的地方**（`FsArtifactStore` / `FsCheckpointPort` /
+ * `FileTaskStore` / `FileHumanGateTaskStore` / `fileUsageStore` / markdown store）——
+ * 宿主、Web 服务与 CLI 都只拿端口，因此换后端不需要改它们。
+ */
 export function createFileStorageBackend(options: FileStorageOptions): StorageBackend {
   const dirs = resolveDirs(options)
 

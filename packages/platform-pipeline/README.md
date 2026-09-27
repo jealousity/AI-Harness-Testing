@@ -106,7 +106,7 @@ await ctx.plugin(platformPipelineHost, {
 ## 状态
 
 - 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）+ 2 份 ADR（docs/adr/0001 文档解析库选型、docs/adr/0002 存储后端选型与事务边界）
-- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **760 项测试全绿**
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **769 项测试全绿**
   - 注：在受限沙箱里跑全量 `node --test` 时，`test/fs-tools.test.ts` 的清理步骤可能被宿主 `safe-delete` 批量删除守卫拦下（按「每轮删除次数 > 阈值」判定，与代码无关）。单独运行该文件即通过。
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
 - Web 运行服务（M0 契约层）：`platform-pipeline/web` 提供无 HTTP 框架依赖的 `PipelineRunService`，覆盖 create/get/list/run/reenter 与人工门 list/claim/decide/cancel，以及 `getStageArtifact`/`listEvents`/`scanPipelineIndex`；Web 状态与阶段视图全部由检查点、产物与人工门任务重建，服务层不复制阶段逻辑。
@@ -162,6 +162,13 @@ await ctx.plugin(platformPipelineHost, {
     - `received` 之后**不重发**：该用例的记录与证据已在日志里，重启时按当前链尾重新挂链补进会话（内容字段原样保留，只重算位置与摘要，因此不会与期间产生的记录撞 seq）。
     - **日志损坏 → 阻断**，与幂等台账刻意相反：台账损坏按"无记录"处理是安全的（重新执行 `create` 只是重写同样的检查点），而这里损坏的记录可能是 `sent`，当成"没执行过"就是盲目重发。
   - **台账不再被当成 exactly-once 的来源（P1-08）**：executor 路径的判定以调用日志为准，台账退化为**兜底**（只在日志里没有本次调用记录时才查它，用于兼容更早版本留下的现场）。`idempotency.ts` 的模块注释里那段"已知窗口"改写为明确的「本模块**不**提供的保证」——exactly-once 不是台账给的，是 `sent` 屏障给的；`sent` 之后能否重发取决于远端是否支持幂等键。
+- **审计整改批次 D 完成（docs/11 P1-09，主体）**：`StorageBackend` 真正接进宿主装配。
+  - **接缝**：`PlatformHostOptions.createStorageBackend` / `PipelineRunServiceOptions.createStorageBackend` / `CheckpointHostOptions.createStorageBackend` 收一个 `StorageBackendFactory`（`根 → 后端`）。为什么是工厂：宿主与服务都是**多项目**的，一个后端实例绑死一个 `projectRoot`。
+  - **不再有旁路**：`createPlatformHost`、`createCheckpointHost`、平台工具集（`artifacts`/`checkpoints`/`knowledge`/`cases`）、`FilePipelineRunService`（产物/检查点/门任务/用量/锁）全部只从 `backend.ports` 取事实。`createFileStorageBackend` 现在是**唯一** new 具体文件实现的地方。
+  - **服务与宿主必须共用同一个后端实例**：服务按 `projectRoot` 缓存后端，并把**缓存后的工厂**转发给宿主。直接透传用户工厂的话，一个"每次调用都新建实例"的工厂会让 Web 读后端 A、driver 写后端 B——两边各自"成功"而事实分裂；文件后端因为落在同一目录上而看起来没事，正好掩盖这个错误。
+  - **装配即校验**：`assertBackendPorts`（缺必需端口立刻失败）；首次使用时 `assertStorageBackendHealthy`——只有 `unreadable`（基础设施读不了）算后端不可用并报 `storage-unavailable`，单条记录损坏/待迁移只在体检里报告（让整个服务起不来比坏一条记录更糟）。
+  - **HTTP 外壳改用统一错误映射**（`toPipelineRunError`）：此前它自己手搓兜底、只认 `PipelineRunError`，任何直抛的 `StorageUnavailableError` 都会被归成 `run-failed`(500)，而它应当是 `storage-unavailable`(503)——运维动作完全不同。
+  - **已知边界（如实声明，测试已钉住）**：流水线索引/清单与幂等台账仍是**宿主级文件记录**，不在 docs/10 §8.2 的 9 个端口内，因此换后端不会换它们；`cli.ts` 的门任务存储、`plugin.ts`、`harness/host-plugin.ts`、`e2e/minimal-host.ts` 仍是直连文件实现。见 `docs/adr/0002-storage-backends.md` §7。
 - 文档解析（P0-A1 完成）：`documents/` 已提供注册表 + 统一中间表示 + **PDF/DOCX/XLSX/Markdown 四类必支持格式** + 文本族与分隔符表格解析器；`parse_doc` 走注册表，返回 `status`/`confidence`/`sections`/`tables`/`plainText`/`sourceRefs`/`diagnostics`/`limits`，并按 §5.6.8 不回传原始字节。`.doc`/`.xls` 按 ADR-0001 §9 显式 `unsupported` 并给出定向转换提示。
   - `sourceRef` 四级可追溯：`requirements.pdf#page=3`、`spec.docx#heading=1.1,table=1,row=2`、`cases.xlsx#sheet=接口!A2:F20`、`cases.csv#table=1,row=2`。
   - 不伪装：无文本层 → `partial` + `NO_TEXT_LAYER`；无缓存公式值 → `FORMULA_VALUE_UNAVAILABLE` 且**绝不自行计算**；无解析器 → `unsupported`；二进制族 magic 不匹配 → **绝不退回按文本读**。

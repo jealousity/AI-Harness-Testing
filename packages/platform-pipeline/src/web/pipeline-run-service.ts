@@ -51,7 +51,14 @@ import {
 } from '../idempotency.ts'
 import { resolvePlatformRoots, type PlatformStorageRoots } from '../platform-roots.ts'
 import { assertScopeMatch } from '../platform-scope.ts'
-import { FsArtifactStore, FsCheckpointPort } from '../stores/fs.ts'
+import { createFileStorageBackendFromRoots } from '../storage/file/index.ts'
+import {
+  assertBackendPorts,
+  assertStorageBackendHealthy,
+  type StorageBackend,
+  type StorageBackendFactory,
+} from '../storage/ports.ts'
+import { FsArtifactStore } from '../stores/fs.ts'
 import {
   budgetFailuresOf,
   fileUsageStore,
@@ -70,7 +77,7 @@ import {
   type PlatformHost,
   type PlatformHostOptions,
 } from '../runtime/platform-host.ts'
-import { FileHumanGateTaskStore, type HumanGateTask } from '../runtime/persistence.ts'
+import { type HumanGateTask, type HumanGateTaskStore } from '../runtime/persistence.ts'
 import { HumanGateWaitAbortedError } from '../runtime/persistent-human-gate.ts'
 import {
   PipelineRunError,
@@ -126,6 +133,15 @@ export interface PipelineRunServiceOptions {
    * 锁会按 `staleMs / 3` 自动续租。只有"进程被杀、心跳停摆"才会超过这个上限。
    */
   readonly lockStaleMs?: number
+  /**
+   * 存储后端工厂（docs/11 P1-09）。
+   *
+   * 缺省 = 文件后端。服务是**多项目**的（项目目录由 `resolvePlatformRoots` 推导），
+   * 所以注入的是"根 → 后端"的工厂而不是现成实例。
+   *
+   * 换后端 = 换这一个函数：`create`/`run`/`get`/`gate`/`usage` 一行都不用改。
+   */
+  readonly createStorageBackend?: StorageBackendFactory
 }
 
 /** `run()` 的每次调用选项。 */
@@ -358,6 +374,16 @@ export class FilePipelineRunService implements PipelineRunService {
   private readonly assertTargetBaseUrl: (url: string) => void
   /** 配置缓存（docs/10 §4.2「加载、校验和缓存配置」）。只缓存解析成功的配置。 */
   private readonly configCache = new Map<string, PipelineConfig>()
+  /**
+   * 按项目根缓存的后端（docs/11 P1-09）。
+   *
+   * 必须按项目缓存：一个后端实例绑死一个 `projectRoot`，而本服务同时服务多个项目。
+   * 缓存还让"同一次进程里对同一项目只装配一次后端"成立——否则每次 `get` 都会
+   * 新建一遍 store（在文件后端上只是浪费，在外部后端上就是每次新建连接池）。
+   */
+  private readonly backends = new Map<string, StorageBackend>()
+  /** 已做过健康检查的后端。`diagnose()` 会扫全项目记录，不能每次调用都跑。 */
+  private readonly healthy = new WeakSet<StorageBackend>()
 
   constructor(options: PipelineRunServiceOptions) {
     if (options.dataRoot.trim() === '') throw new Error('PipelineRunService 需要非空 dataRoot')
@@ -419,7 +445,7 @@ export class FilePipelineRunService implements PipelineRunService {
     rulesetVersion: string,
   ): Promise<PipelineRunSummary> {
     const checkpointRoot = join(roots.checkpointRoot, input.pipelineId)
-    const checkpoint = new FsCheckpointPort()
+    const checkpoint = this.backendOf(config).ports.checkpoints
 
     // pipelineId 在租户/项目作用域内唯一（docs/10 §5.3）：已存在即冲突，绝不静默复用。
     // 走到这里说明台账里没有本次请求的记录，磁盘上的同 id 流水线是别人/旧版本建的。
@@ -486,7 +512,7 @@ export class FilePipelineRunService implements PipelineRunService {
     if (state.artifact === '') return null
 
     const roots = resolvePlatformRoots(this.options.dataRoot, config)
-    const artifact = await new FsArtifactStore(roots.artifactsRoot).read(state.artifact)
+    const artifact = await this.backendOf(config).ports.artifacts.read(state.artifact)
     if (artifact === null) return null
     return {
       pipelineId,
@@ -504,7 +530,7 @@ export class FilePipelineRunService implements PipelineRunService {
     assertSafeIdentifier(pipelineId, 'pipelineId')
     const { config, checkpoint } = await this.loadRun(pipelineId, actor)
     const roots = resolvePlatformRoots(this.options.dataRoot, config)
-    const tasks = await new FileHumanGateTaskStore(gateTaskStoreDir(roots.projectRoot)).list({ pipelineId })
+    const tasks = await this.backendOf(config).ports.gateTasks.list({ pipelineId })
     return buildEventTimeline(checkpoint, tasks)
   }
 
@@ -522,7 +548,7 @@ export class FilePipelineRunService implements PipelineRunService {
     assertSafeIdentifier(pipelineId, 'pipelineId')
     const { config, checkpoint } = await this.loadRun(pipelineId, actor)
     const roots = resolvePlatformRoots(this.options.dataRoot, config)
-    const read = await fileUsageStore(usageDir(roots.projectRoot)).read(pipelineId)
+    const read = await this.backendOf(config).ports.usage.read(pipelineId)
     return summarizeUsage(read.events, {
       pipelineId,
       budgetOf: stageId => config.stages[stageId]!.budget,
@@ -535,22 +561,22 @@ export class FilePipelineRunService implements PipelineRunService {
   async run(pipelineId: string, actor: ActorContext, options: RunCallOptions = {}): Promise<RunResult> {
     assertActor(actor)
     assertSafeIdentifier(pipelineId, 'pipelineId')
-    const { manifest, config, checkpointRoot, checkpointBase } = await this.locate(pipelineId, actor)
-    await this.requireCheckpoint(checkpointRoot)
+    const { manifest, config, backend, checkpointRoot } = await this.locate(pipelineId, actor)
+    await this.requireCheckpoint(backend, checkpointRoot)
 
     // 运行互斥（§6.3 M2-2）：锁覆盖 load checkpoint → 阶段产物生成 → 门禁/审核/人工门
     // 推进 → checkpoint save。**不含**人工门"阻塞等待"之后的续写——见下面的说明。
-    const lock = await this.acquireRunLock(checkpointBase, pipelineId)
+    const lock = await this.acquireRunLock(backend, pipelineId)
     try {
       const host = this.createHost(this.hostOptions(config, manifest, pipelineId, options.signal))
 
       try {
         const outcome = await host.driver.run()
-        const view = await this.buildView(config, await this.requireCheckpoint(checkpointRoot))
+        const view = await this.buildView(config, await this.requireCheckpoint(backend, checkpointRoot))
         if (outcome.outcome === 'completed') return { outcome: 'completed', view }
         return { outcome: outcome.outcome, stageId: outcome.stageId, view }
       } catch (error) {
-        const view = await this.buildView(config, await this.requireCheckpoint(checkpointRoot))
+        const view = await this.buildView(config, await this.requireCheckpoint(backend, checkpointRoot))
         // 人工门等待被中止：超时 = 让出控制权等真人裁决（docs/10 §4.2、§5.4 第 4 步）；
         // 信号中止 / 任务被外部取消 = 本次运行取消。两条路径都绝不自动批准。
         if (error instanceof HumanGateWaitAbortedError) {
@@ -586,7 +612,7 @@ export class FilePipelineRunService implements PipelineRunService {
     if (!STAGE_ORDER.includes(input.stageId)) {
       throw new PipelineRunError('invalid-request', `未知阶段：${input.stageId}`, { allowed: [...STAGE_ORDER] })
     }
-    const { config, checkpointRoot, checkpointBase } = await this.locate(input.pipelineId, actor)
+    const { config, backend, checkpointRoot } = await this.locate(input.pipelineId, actor)
 
     // 重入会写检查点（cursor 回退 + 下游标 needs-reentry），因此与 run 抢同一把锁。
     //
@@ -594,9 +620,9 @@ export class FilePipelineRunService implements PipelineRunService {
     // 不是写入那一刻的状态，用它做校验等于允许覆盖别人刚产生的新版本——两个进程
     // 各自"校验通过"然后先后写入，后写的静默覆盖先写的。正确顺序只能是
     // 取锁 → 读检查点 → 读产物算 digest → 比较 → 重入 → 释放锁。
-    const lock = await this.acquireRunLock(checkpointBase, input.pipelineId)
+    const lock = await this.acquireRunLock(backend, input.pipelineId)
     try {
-      const current = await this.requireCheckpoint(checkpointRoot)
+      const current = await this.requireCheckpoint(backend, checkpointRoot)
       // digest 口径与视图一致（检查点优先，缺省回读产物），否则停在人工门时永远对不上。
       const digest = await this.digestOf(config, current.stageStates[input.stageId]!)
       if (input.expectedCurrentDigest !== undefined && digest !== input.expectedCurrentDigest) {
@@ -612,6 +638,8 @@ export class FilePipelineRunService implements PipelineRunService {
         config,
         dataRoot: this.options.dataRoot,
         pipelineId: input.pipelineId,
+        // 与 `locate` 用同一个缓存工厂：重入读写的检查点必须和 Web 读的是同一份事实。
+        createStorageBackend: this.cachedBackendFactory(),
         ...(this.options.signal === undefined ? {} : { signal: this.options.signal }),
       })
       return await host.driver.reenter(input.stageId, actor.actorId, input.reason)
@@ -681,7 +709,7 @@ export class FilePipelineRunService implements PipelineRunService {
    * 重试永远拿不到首次结果（§6.4 的反面）。
    */
   private async decideOnce(
-    store: FileHumanGateTaskStore,
+    store: HumanGateTaskStore,
     task: HumanGateTask,
     input: GateDecisionInput,
     actor: ActorContext,
@@ -735,10 +763,66 @@ export class FilePipelineRunService implements PipelineRunService {
 
   // ── 内部：索引、作用域、配置 ────────────────────────────────────────────────
 
+  /**
+   * 该项目根对应的存储后端（docs/11 P1-09）。
+   *
+   * 按 `projectRoot` 缓存；装配时 `assertBackendPorts` 立刻校验端口完整性，
+   * 而不是等到某个功能"莫名其妙不可用"。
+   */
+  private backendOf(config: PipelineConfig): StorageBackend {
+    return this.backendForRoots(resolvePlatformRoots(this.options.dataRoot, config))
+  }
+
+  private backendForRoots(roots: PlatformStorageRoots): StorageBackend {
+    const cached = this.backends.get(roots.projectRoot)
+    if (cached !== undefined) return cached
+    const backend = (this.options.createStorageBackend ?? createFileStorageBackendFromRoots)(roots)
+    assertBackendPorts(backend)
+    this.backends.set(roots.projectRoot, backend)
+    return backend
+  }
+
+  /**
+   * 转发给宿主的工厂：**返回本服务缓存的那个后端**。
+   *
+   * 为什么不能直接把 `options.createStorageBackend` 透传给宿主：那个工厂每次调用都可能
+   * 造一个新实例（内存后端尤其如此），于是 Web 读后端 A、driver 写后端 B —— 两边各自
+   * "成功"，而事实分裂。文件后端因为落在同一个目录上而**看起来**没事，正好掩盖这个错误。
+   *
+   * 用缓存包装之后，"服务与宿主看同一份事实"就是机器保证，而不是一句约定。
+   */
+  private cachedBackendFactory(): StorageBackendFactory {
+    return roots => this.backendForRoots(roots)
+  }
+
+  /**
+   * 后端的**健康检查**（docs/11 P1-09 第五步）：每个后端只做一次。
+   *
+   * 放在首次使用而不是构造函数里：`diagnose()` 会扫全项目记录（外部后端还可能建连），
+   * 而构造函数是同步的。读路径都经 {@link locate}，因此"第一次真正要用它"就是检查点。
+   *
+   * 只有**基础设施读不了**（`unreadable`）才算后端不可用并抛 `StorageUnavailableError`；
+   * 单条记录损坏 / 待迁移是**数据问题**，它们在 `diagnose()` 的返回里照常报告，
+   * 但让整个服务起不来比坏一条记录更糟。
+   */
+  private async ensureBackendHealthy(backend: StorageBackend): Promise<void> {
+    if (this.healthy.has(backend)) return
+    try {
+      await assertStorageBackendHealthy(backend)
+    } catch (error) {
+      // 服务契约是"前置失败抛 PipelineRunError"（docs/10 §4.2）。原样放一个
+      // `StorageUnavailableError` 出去，HTTP 外壳会把它归成 `run-failed`(500)——
+      // 而它应当是 `storage-unavailable`(503)：运维动作完全不同。
+      throw toPipelineRunError(error, 'storage-unavailable')
+    }
+    this.healthy.add(backend)
+  }
+
   /** 解析流水线所在项目、检查点路径与运行清单，并校验调用者作用域。 */
   private async locate(pipelineId: string, actor: ActorContext): Promise<{
     readonly manifest: PipelineRunManifest
     readonly config: PipelineConfig
+    readonly backend: StorageBackend
     readonly checkpointRoot: string
     /** checkpoints 根（不含 pipelineId）：锁路径由它与 pipelineId 一起拼出。 */
     readonly checkpointBase: string
@@ -747,23 +831,37 @@ export class FilePipelineRunService implements PipelineRunService {
     const config = await this.configOf(manifest.configRef)
     // 索引与配置漂移（改配置里的 projectId 后没重建索引）在这里被拦下，而不是串到别的项目目录。
     this.assertScope(config, manifest.projectId, actor)
+    const backend = this.backendOf(config)
+    await this.ensureBackendHealthy(backend)
     const roots = resolvePlatformRoots(this.options.dataRoot, config)
-    return { manifest, config, checkpointRoot: join(roots.checkpointRoot, pipelineId), checkpointBase: roots.checkpointRoot }
+    return {
+      manifest,
+      config,
+      backend,
+      checkpointRoot: join(roots.checkpointRoot, pipelineId),
+      checkpointBase: roots.checkpointRoot,
+    }
   }
 
   /**
    * 取得该流水线的运行锁（docs/10 §6.3 M2-1/M2-2）。
    *
-   * 锁路径由 {@link pipelineLockPath} 统一算出，与 CLI / Harness 完全一致——此前 Web 与
-   * Harness 传的基准目录不同（一个是 per-pipeline 目录、一个是 checkpoints 根），拼出的
-   * 锁路径不一样，等于没锁（§6.2 第 5 条）。
+   * 走 `backend.ports.lock` 而不是直接调 `acquirePipelineLock`（docs/11 P1-09）：
+   * 外部后端把互斥映射到 advisory lock / `SETNX`，语义不变（抢不到抛
+   * `PipelineLockHeldError`）。文件后端的工厂已经绑定了检查点根，因此调用方
+   * 只给 pipelineId——这正是 M2 修掉的"三个入口拼出三条不同路径 = 等于没锁"。
    *
    * 抢不到锁时抛 `conflict`(409) 而不是 500：这是"别人正在跑"，不是服务故障。
    */
-  private async acquireRunLock(checkpointBase: string, pipelineId: string): Promise<PipelineLock> {
+  private async acquireRunLock(backend: StorageBackend, pipelineId: string): Promise<PipelineLock> {
+    const factory = backend.ports.lock
+    if (factory === undefined) {
+      throw new PipelineRunError('storage-unavailable', `存储后端 ${backend.name} 未提供 lock 端口：无法保证同一条流水线不被并发运行`, {
+        backend: backend.name,
+      })
+    }
     try {
-      return await acquirePipelineLock(checkpointBase, pipelineId, {
-        audit: fileLockAudit(lockAuditPath(checkpointBase)),
+      return await factory(pipelineId, {
         ...(this.options.lockStaleMs === undefined ? {} : { staleMs: this.options.lockStaleMs }),
       })
     } catch (error) {
@@ -788,8 +886,8 @@ export class FilePipelineRunService implements PipelineRunService {
     readonly config: PipelineConfig
     readonly checkpoint: Checkpoint
   }> {
-    const { config, checkpointRoot } = await this.locate(pipelineId, actor)
-    return { config, checkpoint: await this.requireCheckpoint(checkpointRoot) }
+    const { config, backend, checkpointRoot } = await this.locate(pipelineId, actor)
+    return { config, checkpoint: await this.requireCheckpoint(backend, checkpointRoot) }
   }
 
   /**
@@ -903,13 +1001,16 @@ export class FilePipelineRunService implements PipelineRunService {
       // executor 建连前复核用的同一份判据（docs/11 P1-01）：清单是磁盘文件，
       // 可能被篡改或来自旧版本，不能只信"创建时校验过一次"。
       assertTargetBaseUrl: this.assertTargetBaseUrl,
+      // 宿主必须用**本服务缓存的那一个**后端（docs/11 P1-09），否则 Web 读一个事实源、
+      // driver 写另一个。用包装过的工厂而不是直接透传，见 `cachedBackendFactory`。
+      createStorageBackend: this.cachedBackendFactory(),
       ...(signal === undefined ? {} : { signal }),
     }
   }
 
   /** 门任务存储：路径经 `gateTaskStoreDir` 统一生成（docs/10 §4.3）。 */
   private async gateStoreOf(pipelineId: string, projectId: string | undefined, actor: ActorContext): Promise<{
-    readonly store: FileHumanGateTaskStore
+    readonly store: HumanGateTaskStore
     readonly config: PipelineConfig
     /** 项目根：幂等台账目录由它与 `idempotencyDir` 拼出，与锁/产物同源。 */
     readonly projectRoot: string
@@ -925,7 +1026,7 @@ export class FilePipelineRunService implements PipelineRunService {
     }
     const roots = resolvePlatformRoots(this.options.dataRoot, config)
     return {
-      store: new FileHumanGateTaskStore(gateTaskStoreDir(roots.projectRoot)),
+      store: this.backendOf(config).ports.gateTasks,
       config,
       projectRoot: roots.projectRoot,
     }
@@ -935,7 +1036,7 @@ export class FilePipelineRunService implements PipelineRunService {
   private async requireGateTask(
     input: { readonly projectId?: string; readonly pipelineId: string; readonly gateTaskId: string },
     actor: ActorContext,
-  ): Promise<{ readonly store: FileHumanGateTaskStore; readonly task: HumanGateTask; readonly projectRoot: string }> {
+  ): Promise<{ readonly store: HumanGateTaskStore; readonly task: HumanGateTask; readonly projectRoot: string }> {
     assertSafeIdentifier(input.pipelineId, 'pipelineId')
     assertSafeIdentifier(input.gateTaskId, 'gateTaskId')
     const { store, projectRoot } = await this.gateStoreOf(input.pipelineId, input.projectId, actor)
@@ -960,8 +1061,8 @@ export class FilePipelineRunService implements PipelineRunService {
     return { store, task, projectRoot }
   }
 
-  private async requireCheckpoint(checkpointRoot: string): Promise<Checkpoint> {
-    const checkpoint = await loadCheckpoint(checkpointRoot)
+  private async requireCheckpoint(backend: StorageBackend, checkpointRoot: string): Promise<Checkpoint> {
+    const checkpoint = await backend.ports.checkpoints.load(checkpointRoot)
     if (checkpoint === null) throw new PipelineRunError('not-found', '流水线不存在', { checkpointRoot })
     return checkpoint
   }
@@ -1023,8 +1124,8 @@ export class FilePipelineRunService implements PipelineRunService {
 
   private async buildView(config: PipelineConfig, checkpoint: Checkpoint): Promise<PipelineRunView> {
     const roots = resolvePlatformRoots(this.options.dataRoot, config)
-    const artifacts = new FsArtifactStore(roots.artifactsRoot)
-    const store = new FileHumanGateTaskStore(gateTaskStoreDir(roots.projectRoot))
+    const artifacts = this.backendOf(config).ports.artifacts
+    const store = this.backendOf(config).ports.gateTasks
     const tasks = await store.list({ pipelineId: checkpoint.pipelineId })
     const status = deriveRunStatus(checkpoint, tasks)
 
@@ -1051,7 +1152,7 @@ export class FilePipelineRunService implements PipelineRunService {
 
   /** 当前生效的阶段摘要：检查点值优先，缺失时回读产物文件（见 `effectiveDigest`）。 */
   private async digestOf(config: PipelineConfig, state: StageState): Promise<string> {
-    return effectiveDigest(new FsArtifactStore(resolvePlatformRoots(this.options.dataRoot, config).artifactsRoot), state)
+    return effectiveDigest(this.backendOf(config).ports.artifacts, state)
   }
 }
 

@@ -14,6 +14,7 @@ export {
   StorageUnavailableError,
   assertBackendPorts,
   assertSchemaVersion,
+  assertStorageBackendHealthy,
   checkAndStripSchemaVersion,
   isStorageDataError,
   isStorageInfrastructureError,
@@ -39,6 +40,7 @@ export {
   type PipelineLockFactory,
   type StorageBackend,
   type StorageBackendDescription,
+  type StorageBackendFactory,
   type StorageDiagnostic,
   type StorageDiagnosticCode,
   type StorageHealth,
@@ -58,6 +60,7 @@ export {
 export {
   FILE_STORAGE_VALIDATORS,
   createFileStorageBackend,
+  createFileStorageBackendFromRoots,
   type FileStorageOptions,
 } from './file/index.ts'
 

@@ -35,6 +35,7 @@ import {
   assertOperatorRole,
   errorMessageOf,
   redactSecrets,
+  toPipelineRunError,
 } from '../packages/platform-pipeline/src/web/index.ts'
 
 const ROOT = fileURLToPath(new URL('.', import.meta.url))
@@ -498,10 +499,11 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET') return await serveStatic(req, res, pathname)
     return json(res, 405, { error: 'method not allowed' })
   } catch (error) {
-    // 错误映射：`PipelineRunError` 自带 HTTP 状态；未知异常一律 500，绝不降级成 200。
-    const mapped = error instanceof PipelineRunError
-      ? error
-      : new PipelineRunError('run-failed', errorMessageOf(error))
+    // 错误映射：走 service 层的**统一映射**（`toPipelineRunError`），而不是自己手搓兜底。
+    // 手搓的版本只认 `PipelineRunError`，任何直接抛上来的 `StorageUnavailableError`
+    // 都会被归成 `run-failed`(500)——而它应当是 `storage-unavailable`(503)：
+    // 前者让人去查产物与规则，后者让人去修基础设施，运维动作完全不同。
+    const mapped = toPipelineRunError(error)
     // 错误详情经 redactSecrets 脱敏后再出网：凭据不进日志也不进响应（docs/10 §2.2）。
     return json(res, mapped.httpStatus, { error: redactSecrets(mapped.toView()) })
   }

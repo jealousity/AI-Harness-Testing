@@ -62,6 +62,12 @@ import {
   type InvocationRecord,
 } from '../executor/invocation-journal.ts'
 import { FsArtifactStore } from '../stores/fs.ts'
+import type {
+  ArtifactStore,
+  CaseStorePort,
+  CheckpointPort,
+  KnowledgeStorePort,
+} from '../storage/ports.ts'
 import {
   KnowledgeConflictError,
   MarkdownCaseStore,
@@ -87,6 +93,20 @@ export interface PlatformToolContext {
   readonly artifactsRoot: string
   readonly pipelineId: string
   readonly projectId: string
+  /**
+   * 产物端口（docs/11 P1-09）。
+   *
+   * 宿主从 `StorageBackend.ports` 注入；缺省时回退到 `artifactsRoot` 的文件实现
+   * ——那只服务于**不经宿主装配**的调用方（单测、脚本），真实宿主必须注入，
+   * 否则换后端时工具会绕过 backend 直接读本地文件。
+   */
+  readonly artifacts?: ArtifactStore
+  /** 知识库端口；缺省回退到 `knowledgeRoot` 的 markdown 实现。 */
+  readonly knowledge?: KnowledgeStorePort
+  /** 用例库端口；缺省回退到 `casesRoot` 的 markdown 实现。 */
+  readonly cases?: CaseStorePort
+  /** 检查点端口（`gate_check` 读它）；缺省回退到 `checkpointRoot` 的文件实现。 */
+  readonly checkpoints?: CheckpointPort
   /** markdown-fs 知识库目录；未配置 = `kb_query`/`kb_write` 返回 available=false。 */
   readonly knowledgeRoot?: string
   /** markdown-fs 用例库目录；未配置 = `case_query`/`case_archive` 返回 available=false。 */
@@ -199,8 +219,12 @@ export async function loadExecutionSession(
 
 /** 构造平台标准工具集（顺序即 ACL 目录顺序）。 */
 export function buildPlatformTools(ctx: PlatformToolContext): readonly ToolDefinition[] {
-  const knowledge = ctx.knowledgeRoot === undefined ? undefined : new MarkdownKnowledgeStore(ctx.knowledgeRoot)
-  const cases = ctx.casesRoot === undefined ? undefined : new MarkdownCaseStore(ctx.casesRoot)
+  // 端口优先：宿主装配的后端是唯一事实来源（docs/11 P1-09）。
+  // 目录回退只服务于不经宿主装配的调用方（单测、脚本）。
+  const knowledge = ctx.knowledge
+    ?? (ctx.knowledgeRoot === undefined ? undefined : new MarkdownKnowledgeStore(ctx.knowledgeRoot))
+  const cases = ctx.cases
+    ?? (ctx.casesRoot === undefined ? undefined : new MarkdownCaseStore(ctx.casesRoot))
 
   return [
     parseDocTool(ctx),
@@ -481,7 +505,7 @@ interface KbQueryArgs {
   readonly limit?: unknown
 }
 
-function kbQueryTool(ctx: PlatformToolContext, store: MarkdownKnowledgeStore | undefined): ToolDefinition<KbQueryArgs, unknown> {
+function kbQueryTool(ctx: PlatformToolContext, store: KnowledgeStorePort | undefined): ToolDefinition<KbQueryArgs, unknown> {
   return {
     name: 'kb_query',
     description: '检索项目知识库（只读）。返回 available/source/entries，每条含 score 与匹配依据 matchedBy/matchedTerms。',
@@ -511,13 +535,16 @@ function kbQueryTool(ctx: PlatformToolContext, store: MarkdownKnowledgeStore | u
           hint: '未提供检索条件（entities/tags/text）：本次未执行检索，不代表知识库为空。',
         }
       }
-      const hits = await store.readHits({
+      const query = {
         ...(entities.length === 0 ? {} : { entities }),
         ...(tags.length === 0 ? {} : { tags }),
         ...(text === undefined ? {} : { text }),
         project: ctx.projectId,
         limit: clampLimit(args?.limit),
-      })
+      }
+      const hits = store.readHits === undefined
+        ? (await store.read(query)).map(entry => ({ entry, score: 0, matchedBy: [], matchedTerms: [] }))
+        : await store.readHits(query)
       return {
         available: true,
         source: 'markdown-fs',
@@ -536,7 +563,7 @@ interface KbWriteArgs {
   readonly entry?: unknown
 }
 
-function kbWriteTool(ctx: PlatformToolContext, store: MarkdownKnowledgeStore | undefined): ToolDefinition<KbWriteArgs, unknown> {
+function kbWriteTool(ctx: PlatformToolContext, store: KnowledgeStorePort | undefined): ToolDefinition<KbWriteArgs, unknown> {
   return {
     name: 'kb_write',
     description:
@@ -603,7 +630,7 @@ interface CaseQueryArgs {
   readonly version?: unknown
 }
 
-function caseQueryTool(ctx: PlatformToolContext, store: MarkdownCaseStore | undefined): ToolDefinition<CaseQueryArgs, unknown> {
+function caseQueryTool(ctx: PlatformToolContext, store: CaseStorePort | undefined): ToolDefinition<CaseQueryArgs, unknown> {
   return {
     name: 'case_query',
     description: '检索项目历史用例（只读）。可按来源需求与版本过滤，返回每个用例的最新版本元信息。',
@@ -634,7 +661,7 @@ interface CaseArchiveArgs {
   readonly case?: unknown
 }
 
-function caseArchiveTool(ctx: PlatformToolContext, store: MarkdownCaseStore | undefined): ToolDefinition<CaseArchiveArgs, unknown> {
+function caseArchiveTool(ctx: PlatformToolContext, store: CaseStorePort | undefined): ToolDefinition<CaseArchiveArgs, unknown> {
   return {
     name: 'case_archive',
     description: '把一个**已获人工批准**的版本化用例归档到项目用例库（同 caseId 不同 version 追加版本记录，R6-02）。',
@@ -768,7 +795,7 @@ function dedupeStrings(values: readonly string[]): string[] {
  *   设计变更后 `designDigest` 变了 → 键变了 → 是**新的一轮执行**，正常重跑。
  */
 function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunArgs, ExecutorRunResult> {
-  const artifacts = new FsArtifactStore(ctx.artifactsRoot)
+  const artifacts = ctx.artifacts ?? new FsArtifactStore(ctx.artifactsRoot)
   const sessionPath = executorSessionPath(ctx.projectRoot, ctx.pipelineId)
   const evidenceDir = executorEvidenceDir(ctx.projectRoot, ctx.pipelineId)
   const ledger = fileIdempotencyLedger(idempotencyDir(ctx.projectRoot))
@@ -1274,11 +1301,15 @@ function gateCheckTool(ctx: PlatformToolContext): ToolDefinition<GateCheckArgs, 
     },
     async execute(args, context) {
       assertNotAborted(context.signal)
-      if (ctx.checkpointRoot === undefined) return { error: '宿主未配置检查点目录（checkpointRoot）' }
+      if (ctx.checkpoints === undefined && ctx.checkpointRoot === undefined) {
+        return { error: '宿主未配置检查点端口或目录（checkpoints / checkpointRoot）' }
+      }
       const requested = isNonEmptyString(args?.pipelineId) ? String(args.pipelineId) : ctx.pipelineId
       if (requested !== ctx.pipelineId) return { error: `pipelineId 不匹配：本次运行绑定 ${ctx.pipelineId}` }
       try {
-        const checkpoint = await loadCheckpoint(ctx.checkpointRoot)
+        const checkpoint = ctx.checkpoints === undefined
+          ? await loadCheckpoint(ctx.checkpointRoot!)
+          : await ctx.checkpoints.load(ctx.checkpointRoot ?? ctx.pipelineId)
         if (checkpoint === null) return { error: `检查点不存在：${ctx.pipelineId}` }
         return { text: JSON.stringify(checkpoint, null, 2) }
       } catch (error) {
