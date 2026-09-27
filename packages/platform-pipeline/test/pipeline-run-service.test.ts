@@ -636,7 +636,16 @@ test('租户不匹配与项目白名单外一律拒绝（不靠前端传参决�
   const service = serviceOf(new ScriptedHost())
   await service.create(CREATE, REVIEWER)
 
-  await assert.rejects(() => service.get('pipe-1', { actorId: 'mallory', tenantId: 'other' }), isCode('scope-mismatch'))
+  // 跨租户读取**按"不存在"回应**（docs/11 M5 安全门槛 3）：用 403 区分
+  // "存在但不是你的"与"不存在"会给出一个枚举通道。
+  await assert.rejects(
+    () => service.get('pipe-1', { actorId: 'mallory', tenantId: 'other' }),
+    (error: unknown) => {
+      assert.ok(isCode('not-found')(error))
+      assert.ok(!(error as Error).message.includes('acme'), '不得泄露目标租户标识')
+      return true
+    },
+  )
   await assert.rejects(
     () => service.create({ ...CREATE, pipelineId: 'pipe-2' }, { actorId: 'bob', tenantId: 'acme', projectIds: ['other'] }),
     isCode('forbidden'),
@@ -1081,9 +1090,10 @@ test('getUsage 的作用域校验与 get 同源：未登记 / 作用域外一律
   await service.create(CREATE, REVIEWER)
 
   await assert.rejects(() => service.getUsage('nope', REVIEWER), isCode('not-found'))
+  // 跨租户查询与"不存在"同形（防枚举，docs/11 M5 安全门槛 3）。
   await assert.rejects(
     () => service.getUsage('pipe-1', { actorId: 'bob', tenantId: 'other', roles: ['reviewer'] }),
-    isCode('scope-mismatch'),
+    isCode('not-found'),
   )
   await assert.rejects(() => service.getUsage('pipe-1', { actorId: '' }), isCode('unauthenticated'))
   await assert.rejects(() => service.getUsage('../etc', REVIEWER), isCode('invalid-request'))

@@ -411,7 +411,7 @@ export class FilePipelineRunService implements PipelineRunService {
     assertNonNegativeInteger(input.gateTaskTtlMs, 'gateTaskTtlMs')
 
     const config = await this.configOf(input.configRef)
-    this.assertScope(config, input.projectId, actor)
+    this.assertScope(config, input.projectId, actor, { kind: 'expose' })
 
     const roots = resolvePlatformRoots(this.options.dataRoot, config)
     const rulesetVersion = input.rulesetVersion ?? DEFAULT_RULESET_VERSION
@@ -836,7 +836,7 @@ export class FilePipelineRunService implements PipelineRunService {
     const manifest = await this.requireIndex(pipelineId)
     const config = await this.configOf(manifest.configRef)
     // 索引与配置漂移（改配置里的 projectId 后没重建索引）在这里被拦下，而不是串到别的项目目录。
-    this.assertScope(config, manifest.projectId, actor)
+    this.assertScope(config, manifest.projectId, actor, { kind: 'hide', pipelineId })
     const backend = this.backendOf(config)
     await this.ensureBackendHealthy(backend)
     const roots = resolvePlatformRoots(this.options.dataRoot, config)
@@ -946,8 +946,34 @@ export class FilePipelineRunService implements PipelineRunService {
     return config
   }
 
-  /** 配置声明的租户/项目必须与调用者一致（跨项目读取在此被拒）。 */
-  private assertScope(config: PipelineConfig, projectId: string, actor: ActorContext): void {
+  /**
+   * 配置声明的租户/项目必须与调用者一致（跨项目读取在此被拒）。
+   *
+   * **跨作用域读取按"不存在"回应，而不是 403**（docs/11 M5 安全门槛 3）。
+   * 用 403 区分"存在但不是你的"与"不存在"，等于给了一个**枚举通道**：
+   * 攻击者拿任意合法身份反复试，就能画出别人的 pipelineId 地图，
+   * 并从"expected demo, got other-project"里读出对方属于哪个项目。
+   *
+   * 代价是运维少了一条"这是别人的项目"的直接提示——那份可诊断性由**服务端日志**
+   * 承担（错误详情里带 `reason: 'scope'`），不出现在响应里。
+   *
+   * 项目白名单（`assertProjectAllowed`）仍然抛 `scope-mismatch`：那是调用者**自己声明的**
+   * 输入与自己的配置不符，回显它不泄露任何别人的信息。
+   */
+  private assertScope(
+    config: PipelineConfig,
+    projectId: string,
+    actor: ActorContext,
+    /**
+     * 不匹配时的回应方式。
+     *
+     * - `hide`：读**既有**流水线时用。按"不存在"回应，防止用 403/404 的差别枚举
+     *   别人的 pipelineId（docs/11 M5 安全门槛 3）。
+     * - `expose`：**创建**时用。此时不匹配的是调用者自己声明的 `projectId` 与自己的
+     *   `configRef` 指向的配置——回显它不泄露任何别人的信息，而且这是纠错必需的信息。
+     */
+    onMismatch: { readonly kind: 'hide'; readonly pipelineId: string } | { readonly kind: 'expose' },
+  ): void {
     assertProjectAllowed(actor, projectId)
     try {
       // 只比较**调用者能够声明**的维度：项目与租户。
@@ -965,7 +991,12 @@ export class FilePipelineRunService implements PipelineRunService {
         { projectId, ...(actor.tenantId === undefined ? {} : { tenantId: actor.tenantId }) },
       )
     } catch (error) {
-      throw toPipelineRunError(error, 'scope-mismatch')
+      if (onMismatch.kind === 'expose') throw toPipelineRunError(error, 'scope-mismatch')
+      // 诊断性由**服务端日志**承担（详情里带 `reason: 'scope'`），不出现在响应里。
+      throw new PipelineRunError('not-found', `未登记的 pipeline：${onMismatch.pipelineId}`, {
+        pipelineId: onMismatch.pipelineId,
+        reason: 'scope',
+      })
     }
   }
 

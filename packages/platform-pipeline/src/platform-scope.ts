@@ -12,10 +12,18 @@ export interface ScopeContext {
   readonly environment?: string
 }
 
+/**
+ * 校验作用域一致。
+ *
+ * **消息里只回显调用者自己的作用域，不回显目标的作用域**（docs/11 M5 安全门槛）：
+ * 后者是别人的项目/租户标识，回显它等于给出一个存在性探测通道——
+ * 攻击者可以拿一个猜到的 pipelineId 反复试，从"expected demo, got other-project"
+ * 里读出对方属于哪个项目。调用者本来就知道自己的 scope，所以保留它没有泄露。
+ */
 export function assertScopeMatch(expected: PlatformScope, actual: ScopeContext): void {
-  if (expected.projectId !== actual.projectId) throw new Error(`project scope mismatch: expected ${expected.projectId}, got ${actual.projectId}`)
-  if (expected.tenantId !== undefined && expected.tenantId !== actual.tenantId) throw new Error(`tenant scope mismatch: expected ${expected.tenantId}, got ${actual.tenantId ?? '(missing)'}`)
-  if (expected.environment !== undefined && expected.environment !== actual.environment) throw new Error(`environment scope mismatch: expected ${expected.environment}, got ${actual.environment ?? '(missing)'}`)
+  if (expected.projectId !== actual.projectId) throw new Error(`project scope mismatch: 目标不在调用者作用域内（调用者 projectId=${expected.projectId}）`)
+  if (expected.tenantId !== undefined && expected.tenantId !== actual.tenantId) throw new Error(`tenant scope mismatch: 目标不在调用者作用域内（调用者 tenantId=${expected.tenantId}）`)
+  if (expected.environment !== undefined && expected.environment !== actual.environment) throw new Error(`environment scope mismatch: 目标不在调用者作用域内（调用者 environment=${expected.environment}）`)
 }
 
 export function projectDataRoot(root: string, scope: ScopeContext): string {
