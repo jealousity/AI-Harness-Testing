@@ -884,8 +884,8 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 | P1-04 | 人工门不绑定 artifact digest | ✅ 已修复 | `HumanGateTask.artifactDigest`；`findResumableTask` 判定改为 `pipelineId + stageId + artifactPath + artifactDigest + machineStatus`；无 digest 的旧记录不可续用（失败关闭）；driver 把**同一份 `filled` 产物**交给机器门禁、交叉检查与人工门。测试：`test/human-gate-artifact-digest.test.ts`（6 项）+ `test/driver.test.ts` 的"三处同源"用例 |
 | P1-05 | 文件 gate task 非 CAS | ✅ 已修复 | 文件后端新增 per-task 互斥（`mkdir` 独占 + 持有者令牌 + 有界等待 + 过期锁原子回收），`claim`/`decide`/`cancel`/`consume`/`expire` 全部进临界区；内存后端加进程内 per-task 串行链保持同语义；`GateTaskBusyError` 按**类型**映射成 `conflict`(409)。测试：`test/persistence.test.ts`（6 项）+ 契约套件新增 2 项并发用例（file/memory/compose 三后端各跑一遍） |
 | P1-06 | review-failed 未持久化终态 | ✅ 已修复 | `CheckpointStatus` 新增 `review-failed`；driver 在重试耗尽时落盘终态 + 最后一次 findings/时间戳；`deriveRunStatus` / `deriveRunFailure` / `decideRecovery` 同步；Web UI 补标签。测试：`test/driver.test.ts`（2 项）+ `test/web-async-runner.test.ts`（端到端：当前进程结果 == 重启后 get == recover terminal，且不再 spawn） |
-| P1-07 | executor 崩溃窗口可重复副作用 | ⬜ 未修复 | 批次 C |
-| P1-08 | 幂等台账与业务写入非同事务 | ⬜ 未修复 | 批次 C |
+| P1-07 | executor 崩溃窗口可重复副作用 | ✅ 已修复 | 新增 `src/executor/invocation-journal.ts`：每条用例一次调用的**可恢复状态机**（`intent` → `sent` → `received` → `done` / `unknown`）。`sent` 是**发请求之前**写的屏障；`sent` 之后只在宿主声明 `executorIdempotencyHeader`（远端支持幂等键）时才允许重发，否则整批**明确阻断**并给出可执行的处置说明。日志损坏 → 阻断（与幂等台账相反：那里损坏按无记录处理是安全的）。测试：`test/executor-invocation-journal.test.ts`（9 项，含真实崩溃注入） |
+| P1-08 | 幂等台账与业务写入非同事务 | ✅ 已修复（表述已纠正） | executor 路径**不再以台账为权威**：台账退化为兜底，判定以调用日志为准（它能表达"请求已发出但结果未知"，台账表达不了）。`idempotency.ts` 的"已知窗口"段落改写为明确的"本模块**不**提供的保证"，不再宣称 exactly-once 由台账给出 |
 | P1-09 | StorageBackend 未接入宿主装配 | ⬜ 未修复 | 批次 D |
 | P2-01 | `readIndex` 校验不统一 | 🟡 部分修复 | `readIndex` 已复用 `isIndexEntry` 并校验文件名一致性（P1-01 的"不静默降级"依赖它）；**checkpoint.pipelineId 交叉校验仍未做**，见批次 E |
 | P2-02 | parser 未在 readFile 前限制字节 | ⬜ 未修复 | 批次 E |

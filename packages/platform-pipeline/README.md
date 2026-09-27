@@ -106,7 +106,7 @@ await ctx.plugin(platformPipelineHost, {
 ## 状态
 
 - 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）+ 2 份 ADR（docs/adr/0001 文档解析库选型、docs/adr/0002 存储后端选型与事务边界）
-- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **751 项测试全绿**
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **760 项测试全绿**
   - 注：在受限沙箱里跑全量 `node --test` 时，`test/fs-tools.test.ts` 的清理步骤可能被宿主 `safe-delete` 批量删除守卫拦下（按「每轮删除次数 > 阈值」判定，与代码无关）。单独运行该文件即通过。
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
 - Web 运行服务（M0 契约层）：`platform-pipeline/web` 提供无 HTTP 框架依赖的 `PipelineRunService`，覆盖 create/get/list/run/reenter 与人工门 list/claim/decide/cancel，以及 `getStageArtifact`/`listEvents`/`scanPipelineIndex`；Web 状态与阶段视图全部由检查点、产物与人工门任务重建，服务层不复制阶段逻辑。
@@ -155,6 +155,13 @@ await ctx.plugin(platformPipelineHost, {
   - **人工门绑定产物版本（P1-04）**：`HumanGateTask` 新增 `artifactDigest`，可续用判定改为 `pipelineId + stageId + artifactPath + artifactDigest + machineStatus`。批准的身份是"某个产物版本"而不是"那个路径上的东西"：同路径内容被替换后，旧任务既不能批准新内容，也不会让真人对着新内容看旧 findings（此时**新开门**，旧任务原样保留作审计）。**没有 digest 的旧记录不可续用**（失败关闭：无法确认批准对象时宁可多问一次）。同时把 driver 的**机器门禁、交叉检查与人工门统一到同一份 `filled` 产物**——此前机器门禁按填充后的 digest 判、审核与人工门却看裸产物，同一阶段存在两个"产物身份"。
   - **门任务读写原子化（P1-05）**：`claim`/`decide`/`cancel`/`consume`/`expire` 此前都是 `get → 检查 → save`，两个调用者可以同时读到同一个 pending 快照、各自通过检查、再先后写入——两个调用都"成功"而磁盘只剩最后一个。文件后端改为 per-task 互斥（`mkdir` 独占 + 持有者令牌 + 有界等待 2s + 过期锁原子回收），内存后端加进程内 per-task 串行链保持**同语义**；抢不到抛 `GateTaskBusyError`，按类型映射成 `conflict`(409)。契约套件新增 2 项并发用例，file/memory/compose 三后端各跑一遍。
   - **交叉检查失败成为持久化终态（P1-06）**：`CheckpointStatus` 新增 `review-failed`。此前 driver 只返回结果、不写检查点，于是重启后状态停在 `needs-fix`、恢复扫描判成"续跑"→ **再 spawn 一次并重跑审核**，等于绕过 review 重试上限；而且"当前进程的返回结果"与"重启后读到的状态"是两个不同的词。现在二者字面一致，`decideRecovery` 对它返回 `terminal`。
+- **审计整改批次 C 完成（docs/11 P1-07 / P1-08）**：
+  - **执行调用成为可恢复状态机（P1-07）**：新增 `src/executor/invocation-journal.ts`，每条用例一个调用日志文件，`phase` 单调推进：`intent`（声明要执行、**尚未发请求**）→ `sent`（**发请求之前**写的屏障）→ `received`（响应已拿到、记录与证据已落日志）→ `done`（会话与台账都已落盘）；`unknown` 显式表达"不可判定"。
+    - 此前台账只在执行完成后才写，因此**表达不了"请求已发出但结果未知"**：崩溃窗口里磁盘上什么都没有，重试就会再发一次真实请求。这正是"重复副作用"的来源。
+    - `sent` 之后**不盲目重发**：宿主声明 `executorIdempotencyHeader`（= 确认被测服务支持幂等键）时才允许重发，并且每次请求都带**同一个稳定键**（该键是宿主的安全边界，design 产物里的同名字段顶不掉它）；未声明时整批**明确阻断**，一个新请求都不发，并给出可执行的处置说明（确认远端未执行→删日志；确认已执行→把 `phase` 改为 `done`）。
+    - `received` 之后**不重发**：该用例的记录与证据已在日志里，重启时按当前链尾重新挂链补进会话（内容字段原样保留，只重算位置与摘要，因此不会与期间产生的记录撞 seq）。
+    - **日志损坏 → 阻断**，与幂等台账刻意相反：台账损坏按"无记录"处理是安全的（重新执行 `create` 只是重写同样的检查点），而这里损坏的记录可能是 `sent`，当成"没执行过"就是盲目重发。
+  - **台账不再被当成 exactly-once 的来源（P1-08）**：executor 路径的判定以调用日志为准，台账退化为**兜底**（只在日志里没有本次调用记录时才查它，用于兼容更早版本留下的现场）。`idempotency.ts` 的模块注释里那段"已知窗口"改写为明确的「本模块**不**提供的保证」——exactly-once 不是台账给的，是 `sent` 屏障给的；`sent` 之后能否重发取决于远端是否支持幂等键。
 - 文档解析（P0-A1 完成）：`documents/` 已提供注册表 + 统一中间表示 + **PDF/DOCX/XLSX/Markdown 四类必支持格式** + 文本族与分隔符表格解析器；`parse_doc` 走注册表，返回 `status`/`confidence`/`sections`/`tables`/`plainText`/`sourceRefs`/`diagnostics`/`limits`，并按 §5.6.8 不回传原始字节。`.doc`/`.xls` 按 ADR-0001 §9 显式 `unsupported` 并给出定向转换提示。
   - `sourceRef` 四级可追溯：`requirements.pdf#page=3`、`spec.docx#heading=1.1,table=1,row=2`、`cases.xlsx#sheet=接口!A2:F20`、`cases.csv#table=1,row=2`。
   - 不伪装：无文本层 → `partial` + `NO_TEXT_LAYER`；无缓存公式值 → `FORMULA_VALUE_UNAVAILABLE` 且**绝不自行计算**；无解析器 → `unsupported`；二进制族 magic 不匹配 → **绝不退回按文本读**。

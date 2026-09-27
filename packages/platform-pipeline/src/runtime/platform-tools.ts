@@ -51,6 +51,16 @@ import {
 import { runDiag, type DiagProbe, type DiagSpec } from '../executor/env-diag.ts'
 import { HttpExecutor, type HttpCase, type HttpRequestFn, type HttpStep } from '../executor/http.ts'
 import type { ExecutionSession } from '../executor/executor.ts'
+import { makeRecord, type ExecutionRecord } from '../executor/records.ts'
+import type { EvidenceEntry } from '../executor/verify.ts'
+import {
+  InvocationJournalCorruptError,
+  fileInvocationJournal,
+  isRetryableAfterSent,
+  type InvocationFragment,
+  type InvocationPhase,
+  type InvocationRecord,
+} from '../executor/invocation-journal.ts'
 import { FsArtifactStore } from '../stores/fs.ts'
 import {
   KnowledgeConflictError,
@@ -99,6 +109,17 @@ export interface PlatformToolContext {
    */
   readonly assertTargetBaseUrl?: (url: string) => void
   /**
+   * 远端幂等键的请求头名（docs/11 P1-07）。
+   *
+   * 声明它 = **宿主确认被测服务支持幂等键**。此后 `executor_run` 会在每个请求上带
+   * `Idempotency-Key: <稳定键>`，于是"请求已发出但结果未知"的用例可以安全重发
+   * （远端会把重复请求折叠成同一个副作用）。
+   *
+   * 缺省（未声明）= 远端不支持幂等键：`sent` 之后一律**明确阻断**，
+   * 不假装 exactly-once。**不要为了"让它跑过去"而随便声明它。**
+   */
+  readonly executorIdempotencyHeader?: string
+  /**
    * `env_diag` 的固定探针白名单（docs/06：不授予任意命令执行权）。
    * 模型不能自行指定目标；缺省 = 探针未配置。
    */
@@ -135,6 +156,16 @@ export function executorSessionPath(projectRoot: string, pipelineId: string): st
 /** 执行证据落盘目录约定（executor 独占写；execute 阶段 agent 无写权）。 */
 export function executorEvidenceDir(projectRoot: string, pipelineId: string): string {
   return join(projectRoot, 'executor', pipelineId, 'evidence')
+}
+
+/**
+ * 执行调用日志目录约定（docs/11 P1-07）。
+ *
+ * 与 `session.json` / `evidence/` 同级：三者同属"这一次真实执行"的事实，
+ * 放在一起才能让运维一眼看全现场。
+ */
+export function executorInvocationDir(projectRoot: string, pipelineId: string): string {
+  return join(projectRoot, 'executor', pipelineId, 'invocations')
 }
 
 /**
@@ -681,6 +712,14 @@ interface ExecutorRunResult {
   readonly error?: string
   /** 本次**没有真正执行**、直接重放首次记录的用例 id（docs/10 §6.3 M2-3）。 */
   readonly replayedCaseIds?: readonly string[]
+  /**
+   * 因"上一次调用结果未知"而拒绝执行的用例 id（docs/11 P1-07）。
+   *
+   * 存在它时**一个请求都没有发出**：宁可整批阻断，也不在结果不可判定时制造重复副作用。
+   */
+  readonly blockedCaseIds?: readonly string[]
+  /** 处置方式（给 agent 与运维看的可执行说明，不是泛泛的"请联系管理员"）。 */
+  readonly hint?: string
 }
 
 /** 幂等台账里存的执行记录摘要：与回给 agent 的形状一致，重放时原样返回。 */
@@ -841,19 +880,91 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
         )
       }
 
-      // ── 幂等分流：命中台账的用例直接重放，只有未命中的才真正执行 ──────────────
+      // ── 分流：调用日志（权威）→ 幂等台账（兜底）→ 真正执行 ────────────────────
+      //
+      // 顺序不能换。台账只在**执行完成之后**才写，因此它表达不了"请求已发出但结果未知"；
+      // 调用日志的 `phase` 才表达得了（docs/11 P1-07 / P1-08）。
+      const journal = fileInvocationJournal(executorInvocationDir(ctx.projectRoot, ctx.pipelineId))
+      const remoteIdempotencyHeader = ctx.executorIdempotencyHeader
+
       const replayable = new Map<string, ExecutorInvocationResult>()
-      const pending: string[] = []
-      const keys = new Map<string, { readonly key: string; readonly fingerprint: string }>()
+      const resumable = new Map<string, InvocationRecord>()
+      const pending: {
+        readonly caseId: string
+        readonly key: string
+        readonly fingerprint: string
+        readonly attempt: number
+        readonly remoteIdempotencyKey?: string
+      }[] = []
+      const blocked: { readonly caseId: string; readonly phase: InvocationPhase; readonly journalPath: string }[] = []
+
       for (const caseId of requestedIds) {
         const fields = [ctx.pipelineId, caseId, executorInputDigest(ctx.pipelineId, caseId, design.digest, baseUrl)]
         const key = idempotencyKey(invocationNamespace, fields)
-        keys.set(caseId, { key, fingerprint: idempotencyFingerprint(invocationNamespace, fields) })
-        const record = await ledger.lookup<ExecutorInvocationResult>(invocationNamespace, key)
-        if (record === null) pending.push(caseId)
-        else replayable.set(caseId, record.result)
+        const fingerprint = idempotencyFingerprint(invocationNamespace, fields)
+
+        let record
+        try {
+          record = await journal.read(caseId)
+        } catch (error) {
+          if (error instanceof InvocationJournalCorruptError) {
+            // 损坏 = **不可判定**，不是"没执行过"：当成没执行过就会盲目重发。
+            blocked.push({ caseId, phase: 'unknown', journalPath: journal.pathOf(caseId) })
+            continue
+          }
+          throw error
+        }
+        // 指纹不一致 = 换了 design 或被测基址 = 另一次调用，日志里的旧阶段不适用。
+        const sameInvocation = record !== null && record.fingerprint === fingerprint
+        const attempt = (sameInvocation ? record!.attempt : 0) + 1
+
+        if (sameInvocation) {
+          const phase = record!.phase
+          if ((phase === 'done' || phase === 'received') && record!.fragment !== undefined) {
+            if (phase === 'done') replayable.set(caseId, summaryOfFragment(record!.fragment))
+            else resumable.set(caseId, record!)
+            continue
+          }
+          if (phase === 'unknown' || (phase === 'sent' && !isRetryableAfterSent(record!))) {
+            // 请求已发出、响应未落盘，而远端不支持幂等键：**明确阻断**，
+            // 既不重发也不假装成功（docs/11 P1-07）。
+            blocked.push({ caseId, phase, journalPath: journal.pathOf(caseId) })
+            continue
+          }
+          // intent / 带远端幂等键的 sent → 可以安全地重来一次。
+        }
+
+        // 台账兜底：老版本或人工处置过的现场可能只有台账没有日志。
+        const ledgerRecord = await ledger.lookup<ExecutorInvocationResult>(invocationNamespace, key)
+        if (ledgerRecord !== null) {
+          replayable.set(caseId, ledgerRecord.result)
+          continue
+        }
+        pending.push({
+          caseId, key, fingerprint, attempt,
+          ...(remoteIdempotencyHeader === undefined ? {} : { remoteIdempotencyKey: key }),
+        })
       }
-      if (pending.length === 0) {
+
+      if (blocked.length > 0) {
+        // 一次调用要么完整执行，要么明确阻断：存在不可判定的用例时**一个新请求都不发**。
+        const detail = blocked
+          .map(item => `- ${item.caseId}（${item.phase}）：${item.journalPath}`)
+          .join('\n')
+        return await finish(
+          {
+            error: `拒绝执行：以下用例的上一次调用结果未知，重发可能造成重复副作用。\n${detail}`,
+            blockedCaseIds: blocked.map(item => item.caseId),
+            hint: remoteIdempotencyHeader === undefined
+              ? '处置方式（二选一）：①向被测服务确认这些用例未被执行 → 删除对应的调用日志文件后重试；'
+                + '②确认已执行 → 把该文件的 phase 改为 done 并填入远端返回的结果摘要。'
+                + '若被测服务支持幂等键，可在宿主声明 executorIdempotencyHeader，此后这类用例可安全重发。'
+              : '处置方式：向被测服务确认结果后删除对应调用日志文件（宿主已声明远端支持幂等键，正常情况下不会走到这里）。',
+          },
+          { success: false, errorCode: 'invocation-unknown' },
+        )
+      }
+      if (pending.length === 0 && resumable.size === 0) {
         // 全部命中：一个用例都不执行，会话文件一个字节都不改。
         return await finish(
           { records: requestedIds.map(id => replayable.get(id)!), replayedCaseIds: requestedIds },
@@ -865,7 +976,23 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
       const executor = new HttpExecutor({
         resolveCase: async (id) => {
           const found = designCases.find(entry => entry.id === id)
-          return found === undefined ? undefined : { id: found.id, steps: toHttpSteps(found.id, found.steps, baseUrl) }
+          if (found === undefined) return undefined
+          // 远端幂等键：同一条用例在**同一次调用**（同 design + 同基址）下永远是同一个值，
+          // 因此重发会被远端折叠成同一个副作用。
+          const remoteKey = remoteIdempotencyHeader === undefined
+            ? undefined
+            : pending.find(item => item.caseId === id)?.remoteIdempotencyKey
+          return {
+            id: found.id,
+            steps: toHttpSteps(
+              found.id,
+              found.steps,
+              baseUrl,
+              remoteKey === undefined || remoteIdempotencyHeader === undefined
+                ? undefined
+                : { [remoteIdempotencyHeader]: remoteKey },
+            ),
+          }
         },
         writeEvidence: async (path, evidenceContent) => {
           // HttpExecutor 传的是 `<evidenceDir>/<file>` 绝对路径；转成相对证据根后再做
@@ -878,20 +1005,92 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
         ...(ctx.request === undefined ? {} : { request: ctx.request }),
       })
       const prior = await readSessionFile(sessionPath)
-      const last = prior?.records[prior.records.length - 1]
-      const session = await executor.run(pending, {
-        designArtifactPath: artifactPath(ctx.pipelineId, 'design'),
-        evidenceDir,
-        invocationId: `inv-${Date.now()}`,
-        ...(last === undefined
-          ? {}
-          : { continuation: { startSeq: last.seq + 1, prevHash: last.ownHash, segment: last.segment } }),
-      })
+
+      // ── 先补齐"已收到响应、会话未落盘"的用例，再执行新的 ──────────────────────
+      //
+      // 顺序必须是"续用在前、执行在后"：续用片段的 seq/prevHash 是在崩溃前按当时的
+      // 链尾算出来的，重排到新记录之后会让链断掉。会话内的记录顺序不要求与
+      // `requestedIds` 一致（R4-08 按 caseId 对账），因此重排是安全的。
+      const produced = new Map<string, ExecutorInvocationResult>()
+      const resumedRecords: ExecutionRecord[] = []
+      const resumedEvidence: EvidenceEntry[] = []
+      for (const caseId of requestedIds) {
+        const record = resumable.get(caseId)
+        if (record === undefined) continue
+        const fragment = record.fragment
+        if (fragment === undefined) continue
+        // 重新挂链：内容（capturedAt/durationMs/status/evidenceRefs）原样保留，
+        // 只按**当前**链尾重算位置与摘要——否则与期间产生的会话记录撞 seq。
+        for (const entry of fragment.records) {
+          const tail = resumedRecords[resumedRecords.length - 1] ?? prior?.records[prior.records.length - 1]
+          const rechained = makeRecord({
+            seq: (tail?.seq ?? 0) + 1,
+            caseId: entry.caseId,
+            capturedAt: entry.capturedAt,
+            durationMs: entry.durationMs,
+            status: entry.status,
+            evidenceRefs: entry.evidenceRefs,
+            prevHash: tail?.ownHash ?? '',
+            segment: tail?.segment ?? 1,
+          })
+          resumedRecords.push(rechained)
+        }
+        resumedEvidence.push(...fragment.evidence)
+        const lastResumed = resumedRecords[resumedRecords.length - 1]
+        if (lastResumed !== undefined) {
+          produced.set(caseId, {
+            seq: lastResumed.seq, caseId, status: lastResumed.status,
+            evidenceRefs: lastResumed.evidenceRefs, durationMs: lastResumed.durationMs,
+          })
+        }
+      }
+
+      const executedRecords: ExecutionRecord[] = []
+      const executedEvidence: EvidenceEntry[] = []
+      const invocationId = `inv-${Date.now()}`
+      for (const item of pending) {
+        const base = {
+          caseId: item.caseId, key: item.key, fingerprint: item.fingerprint, attempt: item.attempt,
+          ...(item.remoteIdempotencyKey === undefined ? {} : { remoteIdempotencyKey: item.remoteIdempotencyKey }),
+        }
+        // ① intent：声明要执行，此刻**尚未发出任何请求**。
+        await journal.write({ ...base, phase: 'intent', updatedAt: Date.now() })
+        // ② sent：**发请求之前**的屏障。写成功之后才允许发请求——否则崩溃窗口里
+        //    磁盘上仍是 intent，重启就会把"可能已发出"当成"没发过"再发一次。
+        await journal.write({ ...base, phase: 'sent', updatedAt: Date.now() })
+
+        const tail = executedRecords[executedRecords.length - 1]
+          ?? resumedRecords[resumedRecords.length - 1]
+          ?? prior?.records[prior.records.length - 1]
+        const one = await executor.run([item.caseId], {
+          designArtifactPath: artifactPath(ctx.pipelineId, 'design'),
+          evidenceDir,
+          invocationId,
+          ...(tail === undefined
+            ? {}
+            : { continuation: { startSeq: tail.seq + 1, prevHash: tail.ownHash, segment: tail.segment } }),
+        })
+        // ③ received：响应已拿到、记录与证据已落进日志 → 之后**不需要重发**。
+        await journal.write({
+          ...base, phase: 'received', updatedAt: Date.now(),
+          fragment: { records: one.records, evidence: one.evidence },
+        })
+        executedRecords.push(...one.records)
+        executedEvidence.push(...one.evidence)
+        const record = one.records[one.records.length - 1]
+        if (record !== undefined) {
+          produced.set(item.caseId, {
+            seq: record.seq, caseId: record.caseId, status: record.status,
+            evidenceRefs: record.evidenceRefs, durationMs: record.durationMs,
+          })
+        }
+      }
+
       const merged = {
         pipelineId: ctx.pipelineId,
         evidenceDir,
-        records: [...(prior?.records ?? []), ...session.records],
-        evidence: [...(prior?.evidence ?? []), ...session.evidence],
+        records: [...(prior?.records ?? []), ...resumedRecords, ...executedRecords],
+        evidence: [...(prior?.evidence ?? []), ...resumedEvidence, ...executedEvidence],
       }
       // 原子写（tmp → rename）：会话文件是 R4-08/09/10 的对账依据，半截写入等于把真实
       // 执行数据变成"不可对账"——正是 §6.4 要避免的状态。
@@ -900,25 +1099,42 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
       await writeFile(tmpPath, JSON.stringify(merged, null, 2), 'utf8')
       await rename(tmpPath, sessionPath)
 
-      // 登记台账：记录已在会话里落盘，这里的 produce 是**纯返回**，不产生副作用。
-      // 登记失败不掩盖执行结果——台账是加速器，事实来源始终是会话文件。
-      const produced = new Map<string, ExecutorInvocationResult>()
-      for (const record of session.records) {
-        const summary: ExecutorInvocationResult = {
-          seq: record.seq,
-          caseId: record.caseId,
-          status: record.status,
-          evidenceRefs: record.evidenceRefs,
-          durationMs: record.durationMs,
+      // ④ done：会话已落盘 → 之后重放即可，不必再看日志阶段。
+      //    **续用的用例也要标 done**：它们这一轮已经"落地"，不标就会在下一次调用里
+      //    被反复续用（结果虽然一致，但阶段永远不收敛，且每次都白写一遍会话）。
+      //    台账仍然写（向后兼容：service 层与其它读取方按台账判断"这个键有没有结果"）。
+      //    登记失败不掩盖执行结果——事实来源始终是会话文件 + 调用日志。
+      const settled: { readonly caseId: string; readonly key: string; readonly fingerprint: string; readonly attempt: number; readonly remoteIdempotencyKey?: string }[] = [
+        ...[...resumable.values()].map(record => ({
+          caseId: record.caseId, key: record.key, fingerprint: record.fingerprint,
+          attempt: record.attempt,
+          ...(record.remoteIdempotencyKey === undefined ? {} : { remoteIdempotencyKey: record.remoteIdempotencyKey }),
+        })),
+        ...pending,
+      ]
+      for (const item of settled) {
+        const summary = produced.get(item.caseId)
+        if (summary === undefined) continue
+        try {
+          await journal.write({
+            caseId: item.caseId, key: item.key, fingerprint: item.fingerprint,
+            attempt: item.attempt, phase: 'done', updatedAt: Date.now(),
+            ...(item.remoteIdempotencyKey === undefined ? {} : { remoteIdempotencyKey: item.remoteIdempotencyKey }),
+            fragment: {
+              records: merged.records.filter(record => record.caseId === item.caseId),
+              // `done` 阶段的证据已经在会话文件里了，日志只需要记录摘要（用于重放）。
+              // `EvidenceEntry` 不带 caseId，这里也没有"按用例取证据"的需求。
+              evidence: [],
+            },
+          })
+        } catch {
+          // 有意忽略：日志写不进去只会让下一次重试重放会话，不会让本次结果失真。
         }
-        produced.set(summary.caseId, summary)
-        const entry = keys.get(summary.caseId)
-        if (entry === undefined) continue
         try {
           await ledger.run<ExecutorInvocationResult>({
             namespace: invocationNamespace,
-            key: entry.key,
-            fingerprint: entry.fingerprint,
+            key: item.key,
+            fingerprint: item.fingerprint,
             produce: async () => summary,
           })
         } catch {
@@ -936,12 +1152,27 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
         },
         {
           success: true,
-          caseCount: session.records.length,
-          failureCount: session.records.filter(record => record.status !== 'pass').length,
-          evidenceCount: session.evidence.length,
+          caseCount: executedRecords.length,
+          failureCount: executedRecords.filter(record => record.status !== 'pass').length,
+          evidenceCount: executedEvidence.length,
         },
       )
     },
+  }
+}
+
+/** 从已完成的执行片段取出该用例的记录摘要。 */
+function summaryOfFragment(fragment: InvocationFragment): ExecutorInvocationResult {
+  const record = fragment.records[fragment.records.length - 1]
+  if (record === undefined) {
+    return { seq: 0, caseId: '', status: 'fail', evidenceRefs: [], durationMs: 0 }
+  }
+  return {
+    seq: record.seq,
+    caseId: record.caseId,
+    status: record.status,
+    evidenceRefs: record.evidenceRefs,
+    durationMs: record.durationMs,
   }
 }
 
@@ -949,8 +1180,17 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
  * design 产物的步骤 → HttpExecutor 的步骤定义。
  * 容忍两种写法：`action: "POST /api/login"` 字符串，或显式 `method`/`url` 字段；
  * 相对路径统一拼上被测服务基址（executor 只认绝对 URL）。
+ *
+ * `extraHeaders` 用于注入**远端幂等键**（docs/11 P1-07）：它在步骤自带的 headers
+ * **之后**合并，因此宿主声明的幂等键不会被 design 产物里的同名字段顶掉——
+ * 那是宿主的安全边界，不是模型可以覆盖的内容。
  */
-function toHttpSteps(caseId: string, rawSteps: readonly Record<string, unknown>[], baseUrl: string): HttpStep[] {
+function toHttpSteps(
+  caseId: string,
+  rawSteps: readonly Record<string, unknown>[],
+  baseUrl: string,
+  extraHeaders?: Readonly<Record<string, string>>,
+): HttpStep[] {
   return rawSteps.map((raw, index) => {
     const action = typeof raw.action === 'string' ? raw.action : ''
     const match = /^(GET|POST|PUT|PATCH|DELETE)\s+(\/\S+)/i.exec(action)
@@ -959,9 +1199,10 @@ function toHttpSteps(caseId: string, rawSteps: readonly Record<string, unknown>[
     const expectedStatus = typeof raw.expectedStatus === 'number'
       ? raw.expectedStatus
       : Number(expectedValues.find(value => /^\d{3}$/.test(value))) || undefined
-    const headers = raw.headers !== null && typeof raw.headers === 'object' && !Array.isArray(raw.headers)
+    const declared = raw.headers !== null && typeof raw.headers === 'object' && !Array.isArray(raw.headers)
       ? Object.fromEntries(Object.entries(raw.headers as Record<string, unknown>).map(([key, value]) => [key, String(value)]))
       : undefined
+    const headers = extraHeaders === undefined ? declared : { ...(declared ?? {}), ...extraHeaders }
     const path = explicitUrl ?? match?.[2] ?? '/'
     return {
       kind: 'http-request' as const,
@@ -978,8 +1219,9 @@ function toHttpSteps(caseId: string, rawSteps: readonly Record<string, unknown>[
 }
 
 interface StoredSession {
-  readonly records: readonly { readonly seq: number; readonly ownHash: string; readonly segment: number }[]
-  readonly evidence: readonly unknown[]
+  /** 完整记录：续用（把 `received` 片段补进会话）需要原样保留内容字段。 */
+  readonly records: readonly ExecutionRecord[]
+  readonly evidence: readonly EvidenceEntry[]
 }
 
 /** 读既有会话；文件不存在 → undefined。损坏时抛错（不静默丢弃执行真相）。 */
@@ -991,7 +1233,7 @@ async function readSessionFile(path: string): Promise<StoredSession | undefined>
     if (isMissingFile(error)) return undefined
     throw error
   }
-  const parsed = JSON.parse(raw) as { records?: never[]; evidence?: never[] }
+  const parsed = JSON.parse(raw) as { records?: ExecutionRecord[]; evidence?: EvidenceEntry[] }
   return { records: parsed.records ?? [], evidence: parsed.evidence ?? [] }
 }
 

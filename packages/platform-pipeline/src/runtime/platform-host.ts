@@ -82,6 +82,14 @@ export interface PlatformHostOptions {
    * 由宿主注入（默认实现是 `assertTargetBaseUrlAllowed`）：runtime 层不反向依赖 web 层。
    */
   readonly assertTargetBaseUrl?: (url: string) => void
+  /**
+   * 远端幂等键的请求头名（docs/11 P1-07）。
+   *
+   * 声明它 = 宿主确认**被测服务支持幂等键**：executor 会在每个请求上带
+   * `Idempotency-Key: <稳定键>`，因此"请求已发出但结果未知"的用例可以安全重发。
+   * 缺省 = 远端不支持：那种情况下一律明确阻断，不假装 exactly-once。
+   */
+  readonly executorIdempotencyHeader?: string
   /** `env_diag` 的固定探针白名单（模型不能自行指定目标）。 */
   readonly diagProbes?: readonly DiagSpec[]
   readonly diagTimeoutMs?: number
@@ -304,6 +312,7 @@ function buildToolRegistry(
     checkpointRoot,
     ...(options.targetBaseUrl === undefined ? {} : { targetBaseUrl: options.targetBaseUrl }),
     ...(options.assertTargetBaseUrl === undefined ? {} : { assertTargetBaseUrl: options.assertTargetBaseUrl }),
+    ...(options.executorIdempotencyHeader === undefined ? {} : { executorIdempotencyHeader: options.executorIdempotencyHeader }),
     ...(options.diagProbes === undefined ? {} : { diagProbes: options.diagProbes }),
     ...(options.diagTimeoutMs === undefined ? {} : { diagTimeoutMs: options.diagTimeoutMs }),
     ...(options.env === undefined ? {} : { env: options.env }),
