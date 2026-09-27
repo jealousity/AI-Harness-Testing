@@ -26,6 +26,7 @@ import { artifactPath, loadCheckpoint } from '../checkpoint.ts'
 import {
   IDEMPOTENCY_NAMESPACES,
   fileIdempotencyLedger,
+  hostRecordIdempotencyLedger,
   idempotencyDir,
   idempotencyFingerprint,
   idempotencyKey,
@@ -68,6 +69,7 @@ import type {
   ArtifactStore,
   CaseStorePort,
   CheckpointPort,
+  HostRecordStore,
   KnowledgeStorePort,
 } from '../storage/ports.ts'
 import {
@@ -109,6 +111,13 @@ export interface PlatformToolContext {
   readonly cases?: CaseStorePort
   /** 检查点端口（`gate_check` 读它）；缺省回退到 `checkpointRoot` 的文件实现。 */
   readonly checkpoints?: CheckpointPort
+  /**
+   * 项目级键值记录端口（幂等台账用它；docs/11 §二「事实来源统一」）。
+   *
+   * 缺省回退到文件实现——那意味着**换后端只换了一半**（台账仍绑在本地盘上），
+   * 因此宿主装配必须注入它。
+   */
+  readonly records?: HostRecordStore
   /** markdown-fs 知识库目录；未配置 = `kb_query`/`kb_write` 返回 available=false。 */
   readonly knowledgeRoot?: string
   /** markdown-fs 用例库目录；未配置 = `case_query`/`case_archive` 返回 available=false。 */
@@ -842,7 +851,10 @@ function executorRunTool(ctx: PlatformToolContext): ToolDefinition<ExecutorRunAr
   const artifacts = ctx.artifacts ?? new FsArtifactStore(ctx.artifactsRoot)
   const sessionPath = executorSessionPath(ctx.projectRoot, ctx.pipelineId)
   const evidenceDir = executorEvidenceDir(ctx.projectRoot, ctx.pipelineId)
-  const ledger = fileIdempotencyLedger(idempotencyDir(ctx.projectRoot))
+  // 台账优先走后端端口（docs/11 §二）：外部后端部署里多副本才共享同一份幂等事实。
+  const ledger = ctx.records === undefined
+    ? fileIdempotencyLedger(idempotencyDir(ctx.projectRoot))
+    : hostRecordIdempotencyLedger(ctx.records)
   const invocationNamespace = IDEMPOTENCY_NAMESPACES.executorInvocation
   return {
     name: 'executor_run',

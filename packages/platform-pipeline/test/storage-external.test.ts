@@ -58,7 +58,7 @@ const CHECKPOINT_ROOT = 'checkpoints'
 
 // ── 组合夹具 ────────────────────────────────────────────────────────────────────
 
-const RECORD_PORTS = ['checkpoints', 'tasks', 'gateTasks', 'usage', 'audit', 'lock'] as const
+const RECORD_PORTS = ['checkpoints', 'tasks', 'gateTasks', 'usage', 'audit', 'lock', 'records'] as const
 const OBJECT_PORTS = ['artifacts', 'knowledge', 'cases'] as const
 
 interface Fixture {

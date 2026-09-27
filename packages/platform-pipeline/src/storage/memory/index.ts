@@ -45,6 +45,9 @@ import {
   type StorageBackend,
   type StorageDiagnostic,
   type StorageMigrationReport,
+  assertHostRecordKey,
+  type HostRecord,
+  type HostRecordStore,
   type StoragePorts,
   type StorageRecordKind,
   type VersionedCase,
@@ -79,6 +82,7 @@ const KEY = {
   knowledge: (id: string): string => `knowledge:${id}`,
   usage: (pipelineId: string): string => `usage:${pipelineId}`,
   audit: 'audit',
+  record: (collection: string, id: string): string => `record:${collection}:${id}`,
 } as const
 
 /** 内存后端。 */
@@ -130,6 +134,7 @@ export function createMemoryStorageBackend(): MemoryStorageBackend {
     gateTasks: memoryGateTaskStore(map),
     usage: memoryUsageStore(map),
     audit: memoryAuditStore(map),
+    records: memoryHostRecordStore(map),
 
     knowledge: {
       async read(query) {
@@ -264,7 +269,7 @@ export function createMemoryStorageBackend(): MemoryStorageBackend {
     raw,
     describe: () => ({
       name: 'memory',
-      implementedPorts: ['artifacts', 'checkpoints', 'tasks', 'gateTasks', 'usage', 'audit', 'knowledge', 'cases', 'lock'],
+      implementedPorts: ['artifacts', 'checkpoints', 'tasks', 'gateTasks', 'usage', 'audit', 'knowledge', 'cases', 'lock', 'records'],
       unavailablePorts: [],
       requiresExternalInfrastructure: false,
     }),
@@ -425,6 +430,53 @@ function memoryTaskStore(map: Map<string, string>): StoragePorts['tasks'] {
         }))
       }
       return recovered
+    },
+  }
+}
+
+// ── 宿主级键值记录 ──────────────────────────────────────────────────────────────
+
+/**
+ * 项目级键值记录的内存实现（docs/11 §二「事实来源统一」）。
+ *
+ * 与文件实现同语义：缺失 → null、**损坏 → 抛**（不降级成"没有记录"）、
+ * `createIfAbsent` 先写者胜。内存后端也要提供它，否则"换后端只换了一半"
+ * 会在测试里被掩盖——而测试正是用来发现这件事的。
+ */
+function memoryHostRecordStore(map: Map<string, string>): HostRecordStore {
+  return {
+    async read(collection, id) {
+      assertHostRecordKey(collection, id)
+      const key = KEY.record(collection, id)
+      const text = map.get(key)
+      if (text === undefined) return null
+      // 形状不校验（value 由调用方定义），但**损坏必须抛**：与文件实现同语义。
+      return readRecord(text, key, 'record', () => null)
+    },
+    async write(collection, id, value) {
+      assertHostRecordKey(collection, id)
+      map.set(KEY.record(collection, id), JSON.stringify(withSchemaVersion(value as Record<string, unknown>)))
+    },
+    async createIfAbsent(collection, id, value) {
+      assertHostRecordKey(collection, id)
+      const key = KEY.record(collection, id)
+      if (map.has(key)) return false
+      map.set(key, JSON.stringify(withSchemaVersion(value as Record<string, unknown>)))
+      return true
+    },
+    async list(collection) {
+      assertHostRecordKey(collection, 'collection-probe')
+      const prefix = `record:${collection}:`
+      const records: HostRecord[] = []
+      for (const key of [...map.keys()].filter(candidate => candidate.startsWith(prefix)).sort()) {
+        const id = key.slice(prefix.length)
+        records.push({ id, value: await this.read(collection, id) })
+      }
+      return records
+    },
+    async remove(collection, id) {
+      assertHostRecordKey(collection, id)
+      map.delete(KEY.record(collection, id))
     },
   }
 }

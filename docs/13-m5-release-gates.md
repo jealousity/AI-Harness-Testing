@@ -6,7 +6,7 @@
 > 只做了接口、只写了文档、只跑过一次人工验证的，一律写 ⬜ 或 🟡 并注明缺什么。
 > **不写"待补充"**——缺什么就写缺什么。
 
-基线：`node --test` **810/810 pass、0 fail、0 skip**；`tsc --noEmit` 与
+基线：`node --test` **819/819 pass、0 fail、0 skip**；`tsc --noEmit` 与
 `tsc -p tsconfig.build.json` 均通过。
 
 ---
@@ -28,6 +28,8 @@
 | 10 | Web 集成：**真实执行器的六阶段端到端** | ✅ | `test/m5-execute-e2e.test.ts`（2 项）：真实本地 HTTP 服务 + 真实 `executor_run`（真实请求/证据/会话链）+ `execute` 阶段 R4-08 用真实会话判过账 + 六阶段到 `completed`；配套负向用例证明"无数据时必须拦下且不得有会话文件" | — |
 | 10b | Web 集成：**公网可达的真实被测系统 + 真实模型** | ⬜ | — | 需要一台公网可达的专用被测系统与真实 provider；SSRF 判据默认拒绝本机/内网是**设计使然**，测试里必须覆写才能连本地服务 |
 | 11 | 外部后端：PostgreSQL / Object Store | ⬜ | `test/storage-external.test.ts` 只验证**接口层**与契约 | **未支持**：没有生产可用的实现 |
+| 11b | 事实来源统一（`records` 端口） | ✅ | 新增 `HostRecordStore` 端口（`read`/`write`/`createIfAbsent`/`list`/`remove`），文件/内存/组合三后端实现，契约套件 3 项（含"越界 collection 必须拒绝"）；幂等台账改走后端，运行时证据见 `test/storage-backend-wiring.test.ts` | — |
+| 11c | 流水线索引纳入后端 | ⬜ | — | dataRoot 级 vs 项目级的**作用域归属待裁决**（docs/11 §13.3） |
 | 12 | 提交合规（docs/11 §10 的 10 条模板） | ✅ | `docs/11` §13.1 | — |
 
 ---

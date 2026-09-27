@@ -43,6 +43,7 @@ import {
   IDEMPOTENCY_NAMESPACES,
   IdempotencyConflictError,
   fileIdempotencyLedger,
+  hostRecordIdempotencyLedger,
   idempotencyDir,
   idempotencyFingerprint,
   idempotencyKey,
@@ -418,6 +419,7 @@ export class FilePipelineRunService implements PipelineRunService {
     const namespace = IDEMPOTENCY_NAMESPACES.pipelineCreate
     // 键字段 = docs/10 §6.3 的 `tenantId/projectId/pipelineId`。
     return this.runIdempotent(
+      config,
       roots.projectRoot,
       namespace,
       idempotencyKey(namespace, [config.scope?.tenantId ?? '', config.projectId, input.pipelineId]),
@@ -690,7 +692,7 @@ export class FilePipelineRunService implements PipelineRunService {
       throw new PipelineRunError('invalid-request', `${input.action} 必须带非空 note`, { action: input.action })
     }
     if (input.decisionId !== undefined) assertSafeIdentifier(input.decisionId, 'decisionId')
-    const { store, task, projectRoot } = await this.requireGateTask(input, actor)
+    const { store, task, projectRoot, config } = await this.requireGateTask(input, actor)
 
     // 缺省不带 decisionId = 不启用幂等：行为与 M2 之前逐字一致（终态 → gate-not-decidable，
     // 已消费 → gate-consumed）。带上它以后，同一个 (gateTaskId, decisionId) 的重复投递
@@ -699,6 +701,7 @@ export class FilePipelineRunService implements PipelineRunService {
 
     const namespace = IDEMPOTENCY_NAMESPACES.gateDecision
     return this.runIdempotent(
+      config,
       projectRoot,
       namespace,
       idempotencyKey(namespace, [task.gateTaskId, input.decisionId]),
@@ -907,13 +910,19 @@ export class FilePipelineRunService implements PipelineRunService {
    * 属于调用方错误，不是服务故障。
    */
   private async runIdempotent<T>(
+    config: PipelineConfig,
     projectRoot: string,
     namespace: string,
     key: string,
     fingerprint: string,
     produce: () => Promise<T>,
   ): Promise<T> {
-    const ledger: IdempotencyLedger = fileIdempotencyLedger(idempotencyDir(projectRoot))
+    // 台账优先走**该项目的后端端口**（docs/11 §二「事实来源统一」）：否则换后端之后
+    // 检查点在后端里、台账还在本地盘上，多副本各记各的，幂等静默失效。
+    const records = this.backendOf(config).ports.records
+    const ledger: IdempotencyLedger = records === undefined
+      ? fileIdempotencyLedger(idempotencyDir(projectRoot))
+      : hostRecordIdempotencyLedger(records)
     try {
       return (await ledger.run({ namespace, key, fingerprint, produce })).result
     } catch (error) {
@@ -1074,10 +1083,16 @@ export class FilePipelineRunService implements PipelineRunService {
   private async requireGateTask(
     input: { readonly projectId?: string; readonly pipelineId: string; readonly gateTaskId: string },
     actor: ActorContext,
-  ): Promise<{ readonly store: HumanGateTaskStore; readonly task: HumanGateTask; readonly projectRoot: string }> {
+  ): Promise<{
+    readonly store: HumanGateTaskStore
+    readonly task: HumanGateTask
+    readonly projectRoot: string
+    /** 该流水线的配置：调用方（幂等台账）需要它来定位**同一个**存储后端。 */
+    readonly config: PipelineConfig
+  }> {
     assertSafeIdentifier(input.pipelineId, 'pipelineId')
     assertSafeIdentifier(input.gateTaskId, 'gateTaskId')
-    const { store, projectRoot } = await this.gateStoreOf(input.pipelineId, input.projectId, actor)
+    const { store, projectRoot, config } = await this.gateStoreOf(input.pipelineId, input.projectId, actor)
     const task = await store.get(input.gateTaskId)
     if (task === null) throw new PipelineRunError('not-found', `门任务不存在：${input.gateTaskId}`, { gateTaskId: input.gateTaskId })
     // 流水线归属是必检项：这是"用 A 流水线的身份裁决 B 流水线任务"的唯一防线。
@@ -1096,7 +1111,7 @@ export class FilePipelineRunService implements PipelineRunService {
         actualProject: task.projectId,
       })
     }
-    return { store, task, projectRoot }
+    return { store, task, projectRoot, config }
   }
 
   /**

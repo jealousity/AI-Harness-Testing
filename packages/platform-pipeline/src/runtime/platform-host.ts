@@ -357,6 +357,7 @@ function buildToolRegistry(
     // 端口优先（docs/11 P1-09）：工具不得绕过 backend 直接读本地文件。
     artifacts: backend.ports.artifacts,
     checkpoints: backend.ports.checkpoints,
+    ...(backend.ports.records === undefined ? {} : { records: backend.ports.records }),
     ...(backend.ports.knowledge === undefined ? {} : { knowledge: backend.ports.knowledge }),
     ...(backend.ports.cases === undefined ? {} : { cases: backend.ports.cases }),
     ...(roots.knowledgeRoot === undefined ? {} : { knowledgeRoot: roots.knowledgeRoot }),

@@ -28,6 +28,7 @@ import { dirname, join, relative, resolve } from 'node:path'
 import type { Dirent } from 'node:fs'
 import type { PlatformStorageRoots } from '../../platform-roots.ts'
 import { FsArtifactStore, FsCheckpointPort } from '../../stores/fs.ts'
+import { createFileHostRecordStore } from './records.ts'
 import { MarkdownCaseStore, MarkdownKnowledgeStore, decodeKnowledgeMeta } from '../../stores/markdown.ts'
 import { FileHumanGateTaskStore, FileTaskStore } from '../../runtime/persistence.ts'
 import { fileUsageStore } from '../../usage.ts'
@@ -132,6 +133,9 @@ export function createFileStorageBackend(options: FileStorageOptions): StorageBa
     tasks: new FileTaskStore(dirs.tasksDir),
     gateTasks: new FileHumanGateTaskStore(dirs.gateTasksDir),
     usage: fileUsageStore(dirs.usageDir),
+    // 幂等台账等宿主级记录与其它端口同域（项目级），必须一起走 backend
+    // （docs/11 §二「事实来源统一」）。
+    records: createFileHostRecordStore(dirs.projectRoot),
     audit: fileAuditStore(dirs.auditDir),
     ...(dirs.knowledgeRoot === undefined ? {} : { knowledge: new MarkdownKnowledgeStore(dirs.knowledgeRoot) }),
     ...(dirs.casesRoot === undefined ? {} : { cases: new MarkdownCaseStore(dirs.casesRoot) }),
@@ -149,7 +153,7 @@ export function createFileStorageBackend(options: FileStorageOptions): StorageBa
     describe: (): StorageBackendDescription => ({
       name: 'file',
       implementedPorts: [
-        'artifacts', 'checkpoints', 'tasks', 'gateTasks', 'usage', 'audit', 'lock',
+        'artifacts', 'checkpoints', 'tasks', 'gateTasks', 'usage', 'audit', 'lock', 'records',
         ...(dirs.knowledgeRoot === undefined ? [] : ['knowledge']),
         ...(dirs.casesRoot === undefined ? [] : ['cases']),
       ],

@@ -367,6 +367,68 @@ export function runStorageContract(options: StorageContractOptions): void {
     }
   })
 
+  // ── 宿主级键值记录（幂等台账等）──────────────────────────────────────────────
+
+  test(T(options, 'records：write → read 往返；缺失返回 null（不是抛错）'), async () => {
+    const { backend, cleanup } = await options.create()
+    try {
+      const store = backend.ports.records
+      assert.ok(store !== undefined, '后端必须提供 records 端口（否则"换后端只换了一半"）')
+
+      assert.equal(await store.read('idempotency/ns', 'k1'), null, '缺失必须返回 null')
+      await store.write('idempotency/ns', 'k1', { key: 'k1', fingerprint: 'f1' })
+      assert.deepEqual(await store.read('idempotency/ns', 'k1'), { key: 'k1', fingerprint: 'f1' })
+
+      // 覆盖写
+      await store.write('idempotency/ns', 'k1', { key: 'k1', fingerprint: 'f2' })
+      assert.deepEqual(await store.read('idempotency/ns', 'k1'), { key: 'k1', fingerprint: 'f2' })
+
+      // 集合隔离：同名 id 在不同集合里互不可见
+      assert.equal(await store.read('idempotency/other', 'k1'), null)
+      await store.write('idempotency/other', 'k1', { key: 'k1', fingerprint: 'other' })
+      assert.deepEqual(await store.read('idempotency/ns', 'k1'), { key: 'k1', fingerprint: 'f2' })
+      assert.deepEqual(await store.read('idempotency/other', 'k1'), { key: 'k1', fingerprint: 'other' })
+
+      // list 只列本集合
+      assert.deepEqual((await store.list('idempotency/ns')).map(record => record.id), ['k1'])
+      assert.deepEqual((await store.list('idempotency/absent')).map(record => record.id), [])
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test(T(options, 'records：createIfAbsent 先写者胜，且并发下最多一个成功'), async () => {
+    const { backend, cleanup } = await options.create()
+    try {
+      const store = backend.ports.records!
+      assert.equal(await store.createIfAbsent('ns', 'k', { v: 1 }), true, '第一次必须成功')
+      assert.equal(await store.createIfAbsent('ns', 'k', { v: 2 }), false, '第二次必须失败且不覆盖')
+      assert.deepEqual(await store.read('ns', 'k'), { v: 1 }, '先写者胜')
+
+      const results = await Promise.all([
+        store.createIfAbsent('race', 'k', { v: 'a' }),
+        store.createIfAbsent('race', 'k', { v: 'b' }),
+      ])
+      assert.equal(results.filter(Boolean).length, 1, '并发 createIfAbsent 只能有一个成功')
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test(T(options, 'records：collection 越界一律拒绝（跨后端行为一致）'), async () => {
+    const { backend, cleanup } = await options.create()
+    try {
+      const store = backend.ports.records!
+      for (const collection of ['../escape', 'a/../../b', '', '/absolute']) {
+        await assert.rejects(() => store.read(collection, 'k'), /安全标识符|绝对路径/,
+          `collection ${JSON.stringify(collection)} 必须被拒绝`)
+      }
+      await assert.rejects(() => store.write('ns', '../escape', {}), /安全标识符/, 'id 同样要校验')
+    } finally {
+      await cleanup()
+    }
+  })
+
   // ── 用量 ──────────────────────────────────────────────────────────────────────
 
   test(T(options, '用量 append → read；按 pipelineId 隔离'), async () => {

@@ -927,9 +927,11 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
   Web 六阶段端到端（脚本化宿主）。
 - **已收口（追加）**：预算跨批次 / 跨进程重启的累计（`test/m5-budget-soak.test.ts`）；
   真实执行器的六阶段端到端（`test/m5-execute-e2e.test.ts`，含"无数据必须拦下"的负向一半）。
+- **已收口（追加）**：**幂等台账的事实来源统一**（新增 `HostRecordStore` 端口，
+  文件/内存/组合三个后端都实现，台账改走后端）。
 - **未收口**：真实跨天（wall-clock）运行、公网可达的真实被测系统 + 真实模型、
-  可运行的外部后端（PostgreSQL / Object Store），以及约束书 §二 要求的
-  **`pipeline manifest/index/idempotency` 事实来源统一**（见下方冲突说明）。
+  可运行的外部后端（PostgreSQL / Object Store），以及**流水线索引**的事实来源统一
+  （dataRoot 级 vs 项目级的归属待裁决，见 §13.3）。
 
 ### 13.3 待用户裁决的设计冲突（约束书 §一.7 要求先报告）
 
@@ -939,15 +941,21 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 
 | | 作用域 | 现状 |
 |---|---|---|
-| `StoragePorts`（9 个端口） | **项目级**（file 后端绑死一个 `projectRoot`） | 检查点/产物/门任务/用量等 |
-| 流水线索引 / 运行清单 | **dataRoot 级**（`<dataRoot>/pipelines/<id>.json`，跨项目） | 仍是文件 |
-| 幂等台账 | **项目级**（`<projectRoot>/idempotency/**`） | 仍是文件 |
+| `StoragePorts` | **项目级**（file 后端绑死一个 `projectRoot`） | 检查点/产物/门任务/用量/锁/**records** |
+| 流水线索引 / 运行清单 | **dataRoot 级**（`<dataRoot>/pipelines/<id>.json`，跨项目） | **仍是文件** |
+| ~~幂等台账~~ | 项目级 | ✅ **已纳入后端**（见下） |
 
-两种改法：
+**已经做完的一半（不需要裁决）**：幂等台账与其它端口**同域**（项目级），因此新增了
+`HostRecordStore` 端口（`read` / `write` / `createIfAbsent` / `list` / `remove`），
+文件与内存后端都实现它，`pipeline-run-service` 与 `executor_run` 的台账改为优先走
+`backend.ports.records`。运行时证据：换内存后端之后本地**不再**出现 `idempotency/` 目录
+（`test/storage-backend-wiring.test.ts`），且记录确实落在后端里。
+
+**仍需裁决的一半**：流水线索引是 **dataRoot 级**，而 `StoragePorts` 是项目级，因此
+"把索引纳入后端"要先定作用域归属。两种改法：
 
 - **(a)** 把索引**搬到项目级**：改落盘布局 + 改恢复扫描语义（现在跨项目扫全部流水线）。
-- **(b)** 给 dataRoot 级的宿主记录**另开一个注入点**（与 `StoragePorts` 并列），
-  索引走它、幂等台账走现有的项目级后端。
+- **(b)** 给 dataRoot 级的宿主记录**另开一个注入点**（与 `StoragePorts` 并列）。
 
 按 §一.7「如果认为计划有冲突，先报告冲突和影响，不能自行选择一个'看起来合理'的解释」，
 **未自行选择**，等待裁决。

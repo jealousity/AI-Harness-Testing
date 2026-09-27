@@ -75,6 +75,8 @@ import { createHash } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
+import { StorageCorruptError, type HostRecordStore } from './storage/ports.ts'
+
 /** 幂等键的字段类型。故意只接受字符串与数字：对象/数组的 JSON 序列化不稳定。 */
 export type IdempotencyField = string | number
 
@@ -266,6 +268,72 @@ export function fileIdempotencyLedger(dir: string, options: FileIdempotencyLedge
       if (winner !== null) return replay(request, winner)
       // 先写者留下的文件损坏：原子覆盖，避免这个键永久不可用。
       await writeAtomic(record)
+      return { replayed: false, namespace: request.namespace, key: request.key, record, result }
+    },
+  }
+}
+
+/**
+ * 用**后端端口**实现的幂等台账（docs/11 §二「事实来源统一」）。
+ *
+ * 与 {@link fileIdempotencyLedger} 语义完全一致，唯一区别是记录落在
+ * `StorageBackend.ports.records` 里而不是本地磁盘。这样"换后端"才真的换干净：
+ * 外部后端部署里台账不再绑死在某个节点的本地盘上，多副本之间才共享同一份幂等事实。
+ *
+ * 与文件实现的**逐条对齐**（差异只允许出现在实现方式上）：
+ * - 记录损坏 → 按"无记录"处理（`create` 重执行只是重写同样的初始检查点，安全）；
+ *   但**版本高于当前进程必须抛**（`StorageSchemaVersionError` 不在这里被吞）——
+ *   "读不懂的新格式"与"文件坏了"是两件事，前者要人升级，不能当成没有记录。
+ * - `createIfAbsent` = 文件实现的 `wx`：**先写者胜**；竞争失败方回读胜者记录并重放。
+ * - 胜者记录损坏时原子覆盖，避免这个键永久不可用。
+ */
+export function hostRecordIdempotencyLedger(
+  records: HostRecordStore,
+  options: { readonly collectionPrefix?: string; readonly now?: () => number } = {},
+): IdempotencyLedger {
+  const prefix = options.collectionPrefix ?? 'idempotency'
+  const now = options.now ?? (() => Date.now())
+  const collectionOf = (namespace: string): string => `${prefix}/${namespace}`
+
+  async function lookup<T>(namespace: string, key: string): Promise<IdempotencyRecord<T> | null> {
+    let value: unknown
+    try {
+      value = await records.read(collectionOf(namespace), key)
+    } catch (error) {
+      // 只有"数据坏了"按无记录处理；基础设施故障与版本过高都必须向上抛。
+      if (error instanceof StorageCorruptError) return null
+      throw error
+    }
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+    const parsed = value as Partial<IdempotencyRecord<T>>
+    // 形状不完整的记录（半截写入、被手工改坏）按"无记录"处理：留着它只会让这个键
+    // 永久不可用，而重放一条字段缺失的记录会把错误结果当成首次结果返回。
+    if (parsed.key !== key || parsed.namespace !== namespace || typeof parsed.fingerprint !== 'string') return null
+    return parsed as IdempotencyRecord<T>
+  }
+
+  return {
+    lookup,
+    async run<T>(request: IdempotencyRequest<T>): Promise<IdempotencyOutcome<T>> {
+      const existing = await lookup<T>(request.namespace, request.key)
+      if (existing !== null) return replay(request, existing)
+
+      const result = await request.produce()
+      const record: IdempotencyRecord<T> = {
+        key: request.key,
+        namespace: request.namespace,
+        fingerprint: request.fingerprint,
+        createdAt: now(),
+        result,
+      }
+      if (await records.createIfAbsent(collectionOf(request.namespace), request.key, record)) {
+        return { replayed: false, namespace: request.namespace, key: request.key, record, result }
+      }
+      // 竞争失败：另一个进程先写了。以**先写者**的记录为准，本次结果作废。
+      const winner = await lookup<T>(request.namespace, request.key)
+      if (winner !== null) return replay(request, winner)
+      // 先写者留下的记录损坏：原子覆盖，避免这个键永久不可用。
+      await records.write(collectionOf(request.namespace), request.key, record)
       return { replayed: false, namespace: request.namespace, key: request.key, record, result }
     },
   }

@@ -93,12 +93,18 @@ test('注入内存后端后跑完整流程：端口拥有的目录一个都没�
     assert.equal(existsSync(owned), false, `${owned} 不该存在：它已被换成内存后端，出现即说明有人绕过了 backend`)
   }
 
-  // **已知边界**（docs/11 P1-09 第四步）：流水线索引与幂等台账仍是**宿主级文件记录**，
-  // 不在 docs/10 §8.2 的 9 个端口之内，因此换后端不会换它们。这条断言把边界钉死，
-  // 免得日后有人以为"换了后端就全都换了"；真要端掉它，就得先加端口（见 ADR-0002 §7）。
+  // **幂等台账已经不在这个边界里**（docs/11 §二「事实来源统一」）：它通过
+  // `ports.records` 走后端，因此换内存后端之后本地**不该**再出现 `idempotency/` 目录。
+  // 这条断言就是"换后端换干净了"的运行时证据。
   const roots = resolvePlatformRoots(dir, config)
-  assert.equal(existsSync(join(roots.projectRoot, 'idempotency')), true, '幂等台账当前仍是文件记录（已知边界）')
-  assert.equal(existsSync(join(dir, 'pipelines', 'pipe-1.json')), true, '流水线索引当前仍是文件记录（已知边界）')
+  assert.equal(existsSync(join(roots.projectRoot, 'idempotency')), false,
+    '幂等台账必须走 backend.ports.records，不得在本地留下目录')
+  assert.ok([...backend.raw.keys()].some(key => key.startsWith('record:idempotency/')),
+    `幂等台账必须落在注入的后端里：${[...backend.raw.keys()].filter(key => key.startsWith('record:')).join(', ')}`)
+
+  // **剩余边界**：流水线索引仍是 dataRoot 级的**宿主级文件记录**。它是 dataRoot 级、
+  // 而 `StoragePorts` 是项目级，因此纳入后端需要先定作用域归属（见 docs/11 §13.3）。
+  assert.equal(existsSync(join(dir, 'pipelines', 'pipe-1.json')), true, '流水线索引当前仍是文件记录（待裁决边界）')
 
   // 视图也必须从同一个后端重建。
   const view = await service.get('pipe-1', REVIEWER)

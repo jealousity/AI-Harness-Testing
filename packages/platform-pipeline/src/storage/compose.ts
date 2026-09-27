@@ -73,7 +73,7 @@ export interface ComposedStorageBackend extends StorageBackend {
 }
 
 /** 端口名清单（顺序即 `describe()` 的输出顺序）。 */
-const PORT_NAMES = ['artifacts', 'checkpoints', 'tasks', 'gateTasks', 'usage', 'audit', 'knowledge', 'cases', 'lock'] as const
+const PORT_NAMES = ['artifacts', 'checkpoints', 'tasks', 'gateTasks', 'usage', 'audit', 'knowledge', 'cases', 'lock', 'records'] as const
 
 /**
  * 把若干后端组合成一个。

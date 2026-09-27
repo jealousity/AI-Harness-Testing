@@ -52,6 +52,8 @@ export type StorageRecordKind =
   | 'gate-task'
   | 'case-record'
   | 'knowledge-entry'
+  /** 宿主级键值记录（幂等台账等；见 {@link HostRecordStore}）。 */
+  | 'record'
   | 'usage-event'
   | 'audit-event'
 
@@ -438,6 +440,70 @@ export interface CaseStorePort {
  * 不是每个部署形态都需要知识库（例如纯执行环境），也不需要一个跨进程锁
  * （例如把互斥交给数据库唯一约束的部署）。
  */
+/** 一条宿主级记录：`id` 是集合内唯一的键，`value` 是调用方自己的结构。 */
+export interface HostRecord {
+  readonly id: string
+  readonly value: unknown
+}
+
+/**
+ * 项目级**键值记录**端口（docs/11 §二「事实来源统一」）。
+ *
+ * 为什么需要它：检查点、产物、门任务、用量都已经在 `StoragePorts` 里，而**幂等台账**
+ * （`<projectRoot>/idempotency/<namespace>/<key>.json`）与它们**同域**（项目级）、
+ * 却一直是文件实现。于是"换后端"只换了一半：外部后端部署里台账仍绑死在某个节点的
+ * 本地盘上，多副本各记各的，幂等静默失效——这正是 docs/11 要求统一事实来源的原因。
+ *
+ * 语义（四个操作，缺一不可）：
+ * - `read`：不存在返回 `null`；**损坏必须抛** {@link StorageCorruptError}。
+ *   返回 `null` 会把"记录被改坏"降级成"没有这条记录"，而这两件事的处理方式完全不同
+ *   （前者要修，后者可以重建）；
+ * - `write`：原子覆盖（任何时刻要么没有记录，要么是一条完整记录）；
+ * - `createIfAbsent`：独占创建，已存在返回 `false`（**先写者胜**；幂等台账靠它）；
+ * - `list`：枚举一个集合（恢复与对账要用）。
+ *
+ * `collection` 是**命名空间**而不是路径：实现方负责把 `<collection>/<id>` 映射到自己的
+ * 存储结构（文件是两级目录，数据库是 `(collection, id)` 复合键）。实现必须拒绝
+ * 越出集合根的 `collection`（`..`、绝对路径）。
+ */
+export interface HostRecordStore {
+  read(collection: string, id: string): Promise<unknown | null>
+  write(collection: string, id: string, value: unknown): Promise<void>
+  createIfAbsent(collection: string, id: string, value: unknown): Promise<boolean>
+  list(collection: string): Promise<readonly HostRecord[]>
+  remove(collection: string, id: string): Promise<void>
+}
+
+const SAFE_RECORD_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+
+/**
+ * 校验一条记录坐标（`collection` + `id`）。
+ *
+ * **每个后端都必须调用它**，因为 `collection` 可能来自调用方（命名空间由调用方决定），
+ * 而记录会落盘/落库。少了这一步，文件后端上的 `../..` 就能把记录写到项目目录之外；
+ * 内存后端看不出问题，于是**跨后端行为不一致**——契约测试会在这里抓到差异。
+ *
+ * `collection` 允许一层 `/`（幂等台账用 `idempotency/<namespace>` 才能保持既有布局）。
+ */
+export function assertHostRecordKey(collection: string, id: string): void {
+  if (collection === '' || isAbsolutePath(collection)) {
+    throw new Error(`record collection 不能为空或绝对路径：${JSON.stringify(collection)}`)
+  }
+  for (const segment of collection.split('/')) assertSafeRecordSegment(segment, 'record collection 段')
+  assertSafeRecordSegment(id, 'record id')
+}
+
+function assertSafeRecordSegment(value: string, field: string): void {
+  if (!SAFE_RECORD_SEGMENT.test(value)) {
+    throw new Error(`${field} 必须是安全标识符（${SAFE_RECORD_SEGMENT.source}）：${JSON.stringify(value)}`)
+  }
+}
+
+/** 只判断"看起来像绝对路径"：这里不能 import node:path（ports 是平台无关的契约层）。 */
+function isAbsolutePath(value: string): boolean {
+  return value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value)
+}
+
 export interface StoragePorts {
   readonly artifacts: ArtifactStore
   readonly checkpoints: CheckpointPort
@@ -448,6 +514,13 @@ export interface StoragePorts {
   readonly knowledge?: KnowledgeStorePort
   readonly cases?: CaseStorePort
   readonly lock?: PipelineLockFactory
+  /**
+   * 项目级键值记录（幂等台账等宿主级事实）。
+   *
+   * 可选：未提供时调用方回退到文件实现——但那意味着**换后端只换了一半**，
+   * 因此文件后端与内存后端都必须提供它。
+   */
+  readonly records?: HostRecordStore
 }
 
 /**
