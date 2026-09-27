@@ -464,12 +464,18 @@ function memoryHostRecordStore(map: Map<string, string>): HostRecordStore {
       map.set(key, JSON.stringify(withSchemaVersion(value as Record<string, unknown>)))
       return true
     },
-    async list(collection) {
+    async listIds(collection) {
       assertHostRecordKey(collection, 'collection-probe')
       const prefix = `record:${collection}:`
+      return [...map.keys()]
+        .filter(candidate => candidate.startsWith(prefix))
+        .map(key => key.slice(prefix.length))
+        .sort()
+    },
+
+    async list(collection) {
       const records: HostRecord[] = []
-      for (const key of [...map.keys()].filter(candidate => candidate.startsWith(prefix)).sort()) {
-        const id = key.slice(prefix.length)
+      for (const id of await this.listIds(collection)) {
         records.push({ id, value: await this.read(collection, id) })
       }
       return records

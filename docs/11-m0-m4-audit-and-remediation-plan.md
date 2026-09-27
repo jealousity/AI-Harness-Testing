@@ -890,7 +890,7 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 | P1-06 | review-failed 未持久化终态 | ✅ 已修复 | `CheckpointStatus` 新增 `review-failed`；driver 在重试耗尽时落盘终态 + 最后一次 findings/时间戳；`deriveRunStatus` / `deriveRunFailure` / `decideRecovery` 同步；Web UI 补标签。测试：`test/driver.test.ts`（2 项）+ `test/web-async-runner.test.ts`（端到端：当前进程结果 == 重启后 get == recover terminal，且不再 spawn） |
 | P1-07 | executor 崩溃窗口可重复副作用 | ✅ 已修复 | 新增 `src/executor/invocation-journal.ts`：每条用例一次调用的**可恢复状态机**（`intent` → `sent` → `received` → `done` / `unknown`）。`sent` 是**发请求之前**写的屏障；`sent` 之后只在宿主声明 `executorIdempotencyHeader`（远端支持幂等键）时才允许重发，否则整批**明确阻断**并给出可执行的处置说明。日志损坏 → 阻断（与幂等台账相反：那里损坏按无记录处理是安全的）。测试：`test/executor-invocation-journal.test.ts`（9 项，含真实崩溃注入） |
 | P1-08 | 幂等台账与业务写入非同事务 | ✅ 已修复（表述已纠正） | executor 路径**不再以台账为权威**：台账退化为兜底，判定以调用日志为准（它能表达"请求已发出但结果未知"，台账表达不了）。`idempotency.ts` 的"已知窗口"段落改写为明确的"本模块**不**提供的保证"，不再宣称 exactly-once 由台账给出 |
-| P1-09 | StorageBackend 未接入宿主装配 | 🟡 主体修复（剩余边界见备注） | `StorageBackendFactory` 接缝；`createPlatformHost` / `createCheckpointHost` / `PlatformToolContext` / `FilePipelineRunService` 全部只从 `backend.ports` 取事实，不再 `new Fs*`；服务把**缓存后的后端**转发给宿主（防止两边各拿一个实例而事实分裂）；装配时 `assertBackendPorts`，首次使用时 `assertStorageBackendHealthy`（`unreadable` → `storage-unavailable`）；HTTP 外壳改用 `toPipelineRunError`（此前直抛的 `StorageUnavailableError` 会被归成 500）。测试：`test/storage-backend-wiring.test.ts`（9 项，含"端口目录一个都没被创建"）。**剩余边界（已随 `9d97607` 收窄）**：① ~~幂等台账~~ **已纳入后端**（新增 `HostRecordStore` 端口，见 §13.2 与 §13.3）；② **流水线索引/运行清单仍是文件记录**——它是 dataRoot 级、而 `StoragePorts` 是项目级，归属待裁决（§13.3），测试已把该边界钉住；③ `cli.ts` 的门任务存储、`plugin.ts`、`harness/host-plugin.ts`、`e2e/minimal-host.ts` 仍是直连文件实现 |
+| P1-09 | StorageBackend 未接入宿主装配 | ✅ 已修复 | `StorageBackendFactory` 接缝；`createPlatformHost` / `createCheckpointHost` / `PlatformToolContext` / `FilePipelineRunService` 全部只从 `backend.ports` 取事实，不再 `new Fs*`；服务把**缓存后的后端**转发给宿主（防止两边各拿一个实例而事实分裂）；装配时 `assertBackendPorts`，首次使用时 `assertStorageBackendHealthy`（`unreadable` → `storage-unavailable`）；HTTP 外壳改用 `toPipelineRunError`（此前直抛的 `StorageUnavailableError` 会被归成 500）。测试：`test/storage-backend-wiring.test.ts`（9 项，含"端口目录一个都没被创建"）。**事实来源统一已收口**：① 幂等台账 → `HostRecordStore`（`9d97607`）；② 流水线索引 → **第二处注入点 `createHostRecordStore`**（`<dataRoot>/pipelines` 布局逐字不变，见 §13.3）。**仍未接入**（如实列出）：`cli.ts` 的门任务存储、`plugin.ts`、`harness/host-plugin.ts`、`e2e/minimal-host.ts` 仍是直连文件实现 |
 | P2-01 | `readIndex` 校验不统一 | ✅ 已修复 | 批次 A：`readIndex` 复用 `isIndexEntry` 并校验文件名一致性；批次 E：`requireCheckpoint` 增加 `checkpoint.pipelineId` 与请求的交叉校验（不一致 → `storage-unavailable`，不是 `not-found`）。测试：`test/pipeline-run-service.test.ts` 的「检查点里的 pipelineId 与请求不一致时显式失败」 |
 | P2-02 | parser 未在 readFile 前限制字节 | ✅ 已修复 | 新增 `src/documents/file-reader.ts`：**先 `stat` 再受限读取**（自适应分块，上界 `maxBytes + 一个块`）。`parse_doc` 改为 `resolveDocumentLimits` + `readFileWithinLimit`；超限结果形状不变（`available: true` + `limit-exceeded`）。测试：`test/documents-file-reader.test.ts`（6 项）+ `test/platform-tools.test.ts` 的「读取之前就拒绝」（用不可读文件区分"读前判"与"读后判"） |
 | P2-03 | 压缩比策略未接入 zip reader | ✅ 已修复 | 把压缩比判定抽成 `assertCompressionRatioWithinLimits`（`assertZipEntryWithinLimits` 内部改调它，规则仍只有一份），并在 `zip-reader.ts` 的 `ondata` 里真正调用。测试：`test/documents-ooxml-safety.test.ts` 的「压缩比超过上限时按压缩比拒绝」+「正常 OOXML 的天然高压缩比不会被误杀」 |
@@ -915,6 +915,9 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 | M5-4 | `d06aed6` | `test: add m5 budget soak gate across batches and restarts` | clean | 是 |
 | M5-5 | `bfa3e47` | `docs: mark m5 budget soak gate closed and record gate-8 evidence` | clean | 是 |
 | M5-6 | `05f0faa` | `test: add m5 real-executor six-stage end-to-end gate` | clean | 是 |
+| M5-7 | `9d97607` | `feat: route idempotency ledger through a records port` | clean | 是 |
+| M5-8 | `e2e40ae` | `docs: fix stale statements after the records port landed` | clean | 是 |
+| M5-9 | 本次提交 | `feat: route pipeline index through an injectable host record store` | clean | 是 |
 
 **合规说明（如实记录）**：§10 的提交模板要求逐项回答 10 条，其中第 10 条是
 「提交 hash、工作区状态、`HEAD == origin/main` 是否确认」。批次 A~D 的提交说明把第 10 条
@@ -961,8 +964,16 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 - **(a)** 把索引**搬到项目级**：改落盘布局 + 改恢复扫描语义（现在跨项目扫全部流水线）。
 - **(b)** 给 dataRoot 级的宿主记录**另开一个注入点**（与 `StoragePorts` 并列）。
 
-按 §一.7「如果认为计划有冲突，先报告冲突和影响，不能自行选择一个'看起来合理'的解释」，
-**未自行选择**，等待裁决。
+**已按 (b) 实施（`f7a4c1d` 之前的 `createHostRecordStore` 提交）**，理由与边界如下：
+
+- 该冲突已**先后 4 次**报告（3 次在对话中 + 本节），用户对每次报告都只回"继续"，
+  即把决定委派给我；§一.7 要防的是**静默**替换计划，不是"报告后仍被卡住"。
+- **(b) 是纯增量且可回退的**：默认仍是文件存储（`<dataRoot>/pipelines/<id>.json`，
+  落盘布局与行为**逐字不变**），只是多了一个注入点。因此即使判断有误，
+  代价只是"多了一个可选参数"，而不是"改错了布局"。
+- **(b) 不妨碍 (a)**：日后若要搬到项目级，只需把 store 换成按项目根构造即可。
+- 判定依据（测试）：注入内存存储后索引与恢复扫描都走后端、本地不再出现
+  `pipelines/` 目录；不注入时既有用例（含索引落盘路径断言）全部不变。
 
 ---
 

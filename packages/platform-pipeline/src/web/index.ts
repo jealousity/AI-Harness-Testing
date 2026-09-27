@@ -9,11 +9,13 @@
 
 export {
   FilePipelineRunService,
+  PIPELINE_INDEX_COLLECTION,
   buildEventTimeline,
   combineSignals,
   deriveRunStatus,
   pipelineIndexDir,
   scanPipelineIndex,
+  scanPipelineIndexFrom,
   type PipelineIndexEntry,
   type PipelineIndexScan,
   type PipelineRunManifest,

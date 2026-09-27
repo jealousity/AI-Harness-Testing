@@ -31,6 +31,7 @@ import {
   type StorageBackendFactory,
   type StorageHealth,
 } from '../src/storage/index.ts'
+import { AsyncPipelineRunner } from '../src/web/async-runner.ts'
 import { FilePipelineRunService } from '../src/web/pipeline-run-service.ts'
 import { PipelineRunError } from '../src/web/pipeline-run-types.ts'
 import { CREATE, REVIEWER, ScriptedHost, baseConfig } from './web-fixtures.ts'
@@ -224,6 +225,38 @@ test('单条记录损坏（corrupt-json）不阻断服务启动，只在体检�
   // 坏的是**别的**记录：这条流水线照常可读（让整个服务起不来比坏一条记录更糟）。
   const view = await service.get('pipe-1', REVIEWER)
   assert.equal(view.status, 'queued')
+})
+
+test('注入 dataRoot 级记录存储后，流水线索引与恢复扫描也走后端（默认仍是文件、布局不变）', async () => {
+  // 索引是 **dataRoot 级、跨项目**的注册表，而 `StoragePorts` 是项目级的，
+  // 因此它是**第二处注入点**（`createHostRecordStore`）。这里验证"注入之后真的换掉了"。
+  const store = createMemoryStorageBackend().ports.records!
+  const host = new ScriptedHost()
+  const service = new FilePipelineRunService({
+    dataRoot: dir,
+    loadConfig: async () => config,
+    createHost: host.factory,
+    createHostRecordStore: () => store,
+  })
+  await service.create(CREATE, REVIEWER)
+
+  assert.deepEqual(await store.listIds('pipelines'), ['pipe-1'], '索引必须落在注入的存储里')
+  assert.equal(existsSync(join(dir, 'pipelines')), false, '注入之后本地不得再出现 pipelines/ 目录')
+
+  // 读回必须一致：`get` 要靠索引把 pipelineId 反解成作用域与配置。
+  const view = await service.get('pipe-1', REVIEWER)
+  assert.equal(view.pipelineId, 'pipe-1')
+  assert.equal(view.projectId, 'demo')
+
+  // 恢复扫描必须用**同一个**存储，否则它会"看不见任何流水线"（与 dataRoot 不一致同类错误）。
+  const runner = new AsyncPipelineRunner({
+    service, dataRoot: dir, actor: { actorId: 'runner', tenantId: 'acme' },
+    createHostRecordStore: () => store,
+  })
+  const outcomes = await runner.recover()
+  assert.deepEqual(outcomes.map(item => item.pipelineId), ['pipe-1'],
+    '恢复扫描必须能通过注入的存储看见这条流水线')
+  await runner.idle()
 })
 
 // ── "换后端只改装配" ────────────────────────────────────────────────────────

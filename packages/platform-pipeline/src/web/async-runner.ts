@@ -19,7 +19,9 @@
  * @module platform-pipeline/web/async-runner
  */
 
-import { scanPipelineIndex, type PipelineRunService } from './pipeline-run-service.ts'
+import { scanPipelineIndexFrom, type PipelineRunService } from './pipeline-run-service.ts'
+import { createFileHostRecordStore } from '../storage/file/records.ts'
+import type { HostRecordStore } from '../storage/ports.ts'
 import { PipelineRunRegistry, type PipelineRunHandle, type RunSettlement } from './pipeline-run-registry.ts'
 import {
   errorMessageOf,
@@ -97,6 +99,12 @@ export interface AsyncPipelineRunnerOptions {
    * 两处不一致会导致"恢复扫描看不见任何流水线"）。
    */
   readonly dataRoot: string
+  /**
+   * dataRoot 级宿主记录存储（流水线索引）。**必须与 service 用同一个**，
+   * 否则恢复扫描看不见任何流水线（与 `dataRoot` 不一致是同一类错误）。
+   * 缺省 = 文件存储。
+   */
+  readonly createHostRecordStore?: (dataRoot: string) => HostRecordStore
   /**
    * 后台运行的**兜底**身份。
    *
@@ -220,7 +228,9 @@ export class AsyncPipelineRunner {
    * 因此恢复永远不会替真人裁决人工门。
    */
   async recover(): Promise<readonly RecoveryOutcome[]> {
-    const scan = await scanPipelineIndex(this.options.dataRoot)
+    const scan = await scanPipelineIndexFrom(
+      (this.options.createHostRecordStore ?? createFileHostRecordStore)(this.options.dataRoot),
+    )
     const outcomes: RecoveryOutcome[] = scan.unreadable.map(item => ({
       pipelineId: item.file.replace(/\.json$/, ''),
       action: 'unreadable' as const,

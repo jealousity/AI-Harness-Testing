@@ -470,6 +470,15 @@ export interface HostRecordStore {
   read(collection: string, id: string): Promise<unknown | null>
   write(collection: string, id: string, value: unknown): Promise<void>
   createIfAbsent(collection: string, id: string, value: unknown): Promise<boolean>
+  /**
+   * 列出集合内的**键**（不读内容）。
+   *
+   * 为什么与 `list` 分开：`list` 要读每条记录，因此**一条损坏就会让整次枚举失败**。
+   * 恢复扫描恰恰需要"逐条读、逐条报告哪条坏了"（docs/11 P2-01 的 `unreadable`），
+   * 所以它必须能先拿到键、再自己逐条 try/catch。少了这个能力，扫描就只能在
+   * "整体失败"与"静默跳过坏记录"之间二选一——两者都不可接受。
+   */
+  listIds(collection: string): Promise<readonly string[]>
   list(collection: string): Promise<readonly HostRecord[]>
   remove(collection: string, id: string): Promise<void>
 }

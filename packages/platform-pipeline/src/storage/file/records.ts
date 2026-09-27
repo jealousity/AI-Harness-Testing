@@ -85,19 +85,21 @@ export function createFileHostRecordStore(baseDir: string): HostRecordStore {
       }
     },
 
-    async list(collection) {
+    async listIds(collection) {
       assertHostRecordKey(collection, 'collection-probe')
-      const dir = join(baseDir, collection)
       let names: string[]
       try {
-        names = await readdir(dir)
+        names = await readdir(join(baseDir, collection))
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
         throw new StorageUnavailableError('file', `list ${collection}`, errorMessage(error), { cause: error })
       }
+      return names.filter(name => name.endsWith('.json')).map(name => name.replace(/\.json$/, '')).sort()
+    },
+
+    async list(collection) {
       const records: HostRecord[] = []
-      for (const name of names.filter(candidate => candidate.endsWith('.json')).sort()) {
-        const id = name.replace(/\.json$/, '')
+      for (const id of await this.listIds(collection)) {
         records.push({ id, value: await this.read(collection, id) })
       }
       return records

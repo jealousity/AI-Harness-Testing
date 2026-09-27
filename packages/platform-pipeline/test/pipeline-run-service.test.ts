@@ -827,7 +827,9 @@ test('scanPipelineIndex 报告损坏索引而不是静默跳过（恢复必须�
   const scan = await scanPipelineIndex(dir)
   assert.deepEqual(scan.entries.map(entry => entry.pipelineId), ['good'])
   assert.deepEqual(scan.unreadable.map(item => item.file).sort(), ['broken-json.json', 'mismatch.json', 'missing-field.json'])
-  assert.match(scan.unreadable.find(item => item.file === 'mismatch.json')!.reason, /与文件名不一致/)
+  // 措辞随存储抽象化为"键"（文件后端里键就是文件名）：权威判据是**键**而不是
+  // 记录里自报的 `pipelineId`，两者不一致即视为记录被改写坏了。
+  assert.match(scan.unreadable.find(item => item.file === 'mismatch.json')!.reason, /与键不一致/)
 })
 
 // ── list：枚举调用者可见的流水线 ──────────────────────────────────────────────

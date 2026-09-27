@@ -54,9 +54,12 @@ import { resolvePlatformRoots, type PlatformStorageRoots } from '../platform-roo
 import { assertScopeMatch } from '../platform-scope.ts'
 import { assertTargetBaseUrlAllowed, assertTargetResolvedAllowed } from './ssrf-guard.ts'
 import { createFileStorageBackendFromRoots } from '../storage/file/index.ts'
+import { createFileHostRecordStore } from '../storage/file/records.ts'
 import {
+  StorageCorruptError,
   assertBackendPorts,
   assertStorageBackendHealthy,
+  type HostRecordStore,
   type StorageBackend,
   type StorageBackendFactory,
 } from '../storage/ports.ts'
@@ -146,6 +149,17 @@ export interface PipelineRunServiceOptions {
    * 换后端 = 换这一个函数：`create`/`run`/`get`/`gate`/`usage` 一行都不用改。
    */
   readonly createStorageBackend?: StorageBackendFactory
+  /**
+   * **dataRoot 级**宿主记录的存储工厂（流水线索引 / 运行清单用它）。
+   *
+   * 为什么与 `createStorageBackend` 分开：`StorageBackendFactory` 是**项目级**的
+   * （绑死一个 `projectRoot`），而流水线索引是 **dataRoot 级、跨项目**的注册表
+   * （恢复扫描要一次枚举全部流水线）。两者作用域不同，因此是两处注入点。
+   *
+   * 缺省 = `createFileHostRecordStore`（落在 `<dataRoot>/pipelines/<id>.json`，
+   * **与既有布局逐字相同**），因此不注入时行为与之前完全一致。
+   */
+  readonly createHostRecordStore?: (dataRoot: string) => HostRecordStore
 }
 
 /** `run()` 的每次调用选项。 */
@@ -271,10 +285,19 @@ export interface PipelineRunManifest {
  */
 export type PipelineIndexEntry = PipelineRunManifest
 
-/** 流水线索引目录：`<dataRoot>/pipelines`。集中在此处生成，调用点不得自行拼路径。 */
+/**
+ * 流水线索引目录：`<dataRoot>/pipelines`。集中在此处生成，调用点不得自行拼路径。
+ *
+ * 这是**默认（文件）实现**的落盘位置；索引本身走 {@link HostRecordStore}，
+ * `collection = 'pipelines'`。因此换一个 store 就能把索引搬到别的后端，
+ * 而默认行为与落盘布局逐字不变。
+ */
 export function pipelineIndexDir(dataRoot: string): string {
   return join(dataRoot, 'pipelines')
 }
+
+/** 索引所在的集合名（`HostRecordStore` 的 `collection`）。 */
+export const PIPELINE_INDEX_COLLECTION = 'pipelines'
 
 /**
  * 索引扫描结果。
@@ -288,38 +311,42 @@ export interface PipelineIndexScan {
 }
 
 /**
- * 扫描全部流水线索引项（按 `pipelineId` 排序，保证恢复顺序确定）。
+ * 从**任意记录存储**扫描全部流水线索引项（按 `pipelineId` 排序，保证恢复顺序确定）。
  *
- * 索引目录不存在 = 尚无任何流水线，返回空结果而不是报错。
- * 单个索引文件损坏只影响它自己，不会让整次扫描失败。
+ * 逐条读、逐条 catch：单条索引损坏只影响它自己，**不让整次扫描失败**。
+ * 这正是端口要提供 `listIds` 而不是只有 `list` 的原因——`list` 会在第一条坏记录上抛错，
+ * 于是扫描只能在"整体失败"与"静默跳过坏记录"之间二选一，两者都不可接受。
  */
-export async function scanPipelineIndex(dataRoot: string): Promise<PipelineIndexScan> {
-  const dir = pipelineIndexDir(dataRoot)
-  let names: string[]
-  try {
-    names = await readdir(dir)
-  } catch (error) {
-    if (isMissingFile(error)) return { entries: [], unreadable: [] }
-    throw error
-  }
-
+export async function scanPipelineIndexFrom(store: HostRecordStore): Promise<PipelineIndexScan> {
+  const ids = await store.listIds(PIPELINE_INDEX_COLLECTION)
   const entries: PipelineIndexEntry[] = []
   const unreadable: { file: string; reason: string }[] = []
-  for (const name of names.filter(candidate => candidate.endsWith('.json')).sort()) {
+  for (const id of ids) {
     try {
-      const parsed = JSON.parse(await readFile(join(dir, name), 'utf8')) as unknown
-      if (!isIndexEntry(parsed)) throw new Error('索引字段缺失或类型不符')
-      // 文件名才是权威键（readIndex 按文件名读取）；两者不一致说明索引被改写坏了。
-      const expected = name.replace(/\.json$/, '')
-      if (parsed.pipelineId !== expected) {
-        throw new Error(`索引 pipelineId 与文件名不一致：${parsed.pipelineId} ≠ ${expected}`)
+      const value = await store.read(PIPELINE_INDEX_COLLECTION, id)
+      if (!isIndexEntry(value)) throw new Error('索引字段缺失或类型不符')
+      // 键才是权威：记录里的 `pipelineId` 与键不一致说明它被改写坏了，
+      // 继续用就会去解析另一个流水线的作用域与配置。
+      if (value.pipelineId !== id) {
+        throw new Error(`索引 pipelineId 与键不一致：${value.pipelineId} ≠ ${id}`)
       }
-      entries.push(parsed)
+      entries.push(value)
     } catch (error) {
-      unreadable.push({ file: name, reason: errorMessageOf(error) })
+      unreadable.push({ file: `${id}.json`, reason: errorMessageOf(error) })
     }
   }
   return { entries, unreadable }
+}
+
+/**
+ * 扫描全部流水线索引项（**文件存储**的便捷入口）。
+ *
+ * 保留这个签名是为了让既有调用方与测试不必跟着改；它等价于
+ * `scanPipelineIndexFrom(createFileHostRecordStore(dataRoot))`。
+ * 目录不存在 = 尚无任何流水线，返回空结果而不是报错。
+ */
+export async function scanPipelineIndex(dataRoot: string): Promise<PipelineIndexScan> {
+  return scanPipelineIndexFrom(createFileHostRecordStore(dataRoot))
 }
 
 /**
@@ -375,6 +402,12 @@ export class FilePipelineRunService implements PipelineRunService {
   private readonly options: PipelineRunServiceOptions
   private readonly loadConfig: (configRef: string) => Promise<PipelineConfig>
   private readonly createHost: PlatformHostFactory
+  /**
+   * 流水线索引的记录存储（dataRoot 级）。
+   *
+   * 构造时固定一次：索引是**跨项目**的注册表，不需要按项目缓存（那是项目级后端的事）。
+   */
+  private readonly indexStore: HostRecordStore
   private readonly assertTargetBaseUrl: (url: string) => void
   /** 建连前的解析后复核（docs/11 P2-04）。 */
   private readonly assertResolvedTargetAllowed: (url: string) => Promise<void>
@@ -396,6 +429,7 @@ export class FilePipelineRunService implements PipelineRunService {
     this.options = options
     this.loadConfig = options.loadConfig ?? (async ref => loadPipelineConfig(ref))
     this.createHost = options.createHost ?? createPlatformHost
+    this.indexStore = (options.createHostRecordStore ?? createFileHostRecordStore)(options.dataRoot)
     this.assertTargetBaseUrl = options.assertTargetBaseUrl ?? assertTargetBaseUrlAllowed
     this.assertResolvedTargetAllowed = options.assertResolvedTargetAllowed ?? assertTargetResolvedAllowed
   }
@@ -1160,19 +1194,17 @@ export class FilePipelineRunService implements PipelineRunService {
    * 确实存在（不是 404 谎称不存在），需要运维去修那条记录。
    */
   private async readIndex(pipelineId: string): Promise<PipelineRunManifest | null> {
-    let raw: string
-    try {
-      raw = await readFile(join(pipelineIndexDir(this.options.dataRoot), `${pipelineId}.json`), 'utf8')
-    } catch (error) {
-      if (isMissingFile(error)) return null
-      throw error
-    }
     let parsed: unknown
     try {
-      parsed = JSON.parse(raw) as unknown
+      parsed = await this.indexStore.read(PIPELINE_INDEX_COLLECTION, pipelineId)
     } catch (error) {
-      throw corruptIndex(pipelineId, `不是合法 JSON（${errorMessageOf(error)}）`)
+      // 记录损坏（端口**必须抛**，不返回 null）→ 归成 `storage-unavailable`：
+      // 调用方没做错任何事（不是 400），这条流水线也确实存在（不是 404 谎称不存在），
+      // 需要运维去修那条记录。
+      if (error instanceof StorageCorruptError) throw corruptIndex(pipelineId, errorMessageOf(error))
+      throw error
     }
+    if (parsed === null) return null
     if (!isIndexEntry(parsed)) throw corruptIndex(pipelineId, '字段缺失或类型不符')
     // 文件名才是权威键：清单里的 pipelineId 与文件名不一致说明记录被改写坏了，
     // 继续用它就会去解析另一个流水线的作用域与配置。
@@ -1182,14 +1214,11 @@ export class FilePipelineRunService implements PipelineRunService {
     return parsed
   }
 
-  /** 原子写（tmp → rename），与检查点同一口径：任何时刻磁盘上要么是旧版要么是新版。 */
+  /**
+   * 写索引（`HostRecordStore.write` 由实现保证原子：任何时刻要么是旧版要么是新版）。
+   */
   private async writeIndex(entry: PipelineRunManifest): Promise<void> {
-    const dir = pipelineIndexDir(this.options.dataRoot)
-    await mkdir(dir, { recursive: true })
-    const target = join(dir, `${entry.pipelineId}.json`)
-    const tmp = `${target}.tmp`
-    await writeFile(tmp, `${JSON.stringify(entry, null, 2)}\n`, 'utf8')
-    await rename(tmp, target)
+    await this.indexStore.write(PIPELINE_INDEX_COLLECTION, entry.pipelineId, entry)
   }
 
   // ── 内部：视图重建（docs/10 §4.2 M0-3「必须能从 checkpoint/artifact store 重建页面状态」）──
