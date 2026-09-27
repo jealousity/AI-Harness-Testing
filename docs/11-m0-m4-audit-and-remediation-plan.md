@@ -865,9 +865,13 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 
 ### 最终状态表述
 
+> ⚠️ **本节是"审计时点"的结论，不是当前状态。** 当前状态以 §13（含 §13.1~§13.3）为准。
+
 > **DeepSeek 已完成 M0-M4 的大量主体代码和测试，但未完成所有 M0-M4 的正确性闭环。当前最准确的状态是：M0 主体完成、M1/M2 存在 P1 阻断项、M3 主体完成、M4-A 完成、M4-B 仅接口层完成、M5 未开始收口。**
 
 在 P1-01、P1-02、P1-03、P1-04、P1-05、P1-06、P1-07、P1-09 修复并通过新增验收前，不得对外宣称“平台化 M0-M4 全部完成”。
+
+**该禁令至今仍然有效**，原因已从"M1/M2 阻断项"变为"M4-B 仅接口层 + M5 三项门槛未收口"（见 §13.2/§13.3）。
 
 ---
 
@@ -886,7 +890,7 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 | P1-06 | review-failed 未持久化终态 | ✅ 已修复 | `CheckpointStatus` 新增 `review-failed`；driver 在重试耗尽时落盘终态 + 最后一次 findings/时间戳；`deriveRunStatus` / `deriveRunFailure` / `decideRecovery` 同步；Web UI 补标签。测试：`test/driver.test.ts`（2 项）+ `test/web-async-runner.test.ts`（端到端：当前进程结果 == 重启后 get == recover terminal，且不再 spawn） |
 | P1-07 | executor 崩溃窗口可重复副作用 | ✅ 已修复 | 新增 `src/executor/invocation-journal.ts`：每条用例一次调用的**可恢复状态机**（`intent` → `sent` → `received` → `done` / `unknown`）。`sent` 是**发请求之前**写的屏障；`sent` 之后只在宿主声明 `executorIdempotencyHeader`（远端支持幂等键）时才允许重发，否则整批**明确阻断**并给出可执行的处置说明。日志损坏 → 阻断（与幂等台账相反：那里损坏按无记录处理是安全的）。测试：`test/executor-invocation-journal.test.ts`（9 项，含真实崩溃注入） |
 | P1-08 | 幂等台账与业务写入非同事务 | ✅ 已修复（表述已纠正） | executor 路径**不再以台账为权威**：台账退化为兜底，判定以调用日志为准（它能表达"请求已发出但结果未知"，台账表达不了）。`idempotency.ts` 的"已知窗口"段落改写为明确的"本模块**不**提供的保证"，不再宣称 exactly-once 由台账给出 |
-| P1-09 | StorageBackend 未接入宿主装配 | 🟡 主体修复（剩余边界见备注） | `StorageBackendFactory` 接缝；`createPlatformHost` / `createCheckpointHost` / `PlatformToolContext` / `FilePipelineRunService` 全部只从 `backend.ports` 取事实，不再 `new Fs*`；服务把**缓存后的后端**转发给宿主（防止两边各拿一个实例而事实分裂）；装配时 `assertBackendPorts`，首次使用时 `assertStorageBackendHealthy`（`unreadable` → `storage-unavailable`）；HTTP 外壳改用 `toPipelineRunError`（此前直抛的 `StorageUnavailableError` 会被归成 500）。测试：`test/storage-backend-wiring.test.ts`（9 项，含"端口目录一个都没被创建"）。**剩余边界**：流水线索引/清单与幂等台账仍是宿主级文件记录，不在 §8.2 的 9 个端口内（测试已把边界钉住，见 ADR-0002 §7）；`cli.ts` 的门任务存储、`plugin.ts`、`harness/host-plugin.ts`、`e2e/minimal-host.ts` 仍是直连文件实现 |
+| P1-09 | StorageBackend 未接入宿主装配 | 🟡 主体修复（剩余边界见备注） | `StorageBackendFactory` 接缝；`createPlatformHost` / `createCheckpointHost` / `PlatformToolContext` / `FilePipelineRunService` 全部只从 `backend.ports` 取事实，不再 `new Fs*`；服务把**缓存后的后端**转发给宿主（防止两边各拿一个实例而事实分裂）；装配时 `assertBackendPorts`，首次使用时 `assertStorageBackendHealthy`（`unreadable` → `storage-unavailable`）；HTTP 外壳改用 `toPipelineRunError`（此前直抛的 `StorageUnavailableError` 会被归成 500）。测试：`test/storage-backend-wiring.test.ts`（9 项，含"端口目录一个都没被创建"）。**剩余边界（已随 `9d97607` 收窄）**：① ~~幂等台账~~ **已纳入后端**（新增 `HostRecordStore` 端口，见 §13.2 与 §13.3）；② **流水线索引/运行清单仍是文件记录**——它是 dataRoot 级、而 `StoragePorts` 是项目级，归属待裁决（§13.3），测试已把该边界钉住；③ `cli.ts` 的门任务存储、`plugin.ts`、`harness/host-plugin.ts`、`e2e/minimal-host.ts` 仍是直连文件实现 |
 | P2-01 | `readIndex` 校验不统一 | ✅ 已修复 | 批次 A：`readIndex` 复用 `isIndexEntry` 并校验文件名一致性；批次 E：`requireCheckpoint` 增加 `checkpoint.pipelineId` 与请求的交叉校验（不一致 → `storage-unavailable`，不是 `not-found`）。测试：`test/pipeline-run-service.test.ts` 的「检查点里的 pipelineId 与请求不一致时显式失败」 |
 | P2-02 | parser 未在 readFile 前限制字节 | ✅ 已修复 | 新增 `src/documents/file-reader.ts`：**先 `stat` 再受限读取**（自适应分块，上界 `maxBytes + 一个块`）。`parse_doc` 改为 `resolveDocumentLimits` + `readFileWithinLimit`；超限结果形状不变（`available: true` + `limit-exceeded`）。测试：`test/documents-file-reader.test.ts`（6 项）+ `test/platform-tools.test.ts` 的「读取之前就拒绝」（用不可读文件区分"读前判"与"读后判"） |
 | P2-03 | 压缩比策略未接入 zip reader | ✅ 已修复 | 把压缩比判定抽成 `assertCompressionRatioWithinLimits`（`assertZipEntryWithinLimits` 内部改调它，规则仍只有一份），并在 `zip-reader.ts` 的 `ondata` 里真正调用。测试：`test/documents-ooxml-safety.test.ts` 的「压缩比超过上限时按压缩比拒绝」+「正常 OOXML 的天然高压缩比不会被误杀」 |
