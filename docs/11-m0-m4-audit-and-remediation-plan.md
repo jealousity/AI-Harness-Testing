@@ -904,9 +904,30 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 | D | `8753e51` | `refactor: wire the storage backend into host and web assembly` | clean | 是 |
 | E-1 | `131a8cc` | `fix: enforce document limits before reading and wire compression ratio` | clean | 是 |
 | E-2 | `d384a69` | `fix: harden ssrf guard against userinfo, mapped ipv6 and dns rebinding` | clean | 是 |
+| E-3 | `4a165a5` | `docs: refresh docs/10 baseline and add deployment runbook` | clean | 是 |
+| M5-1 | `d6efdeb` | `fix: add m5 security gate and stop leaking scope via 403 vs 404` | clean | 是 |
+| M5-2 | `7b47578` | `fix: add m5 recovery and multiprocess gates, fix lock mutual exclusion` | clean | 是 |
 
 **合规说明（如实记录）**：§10 的提交模板要求逐项回答 10 条，其中第 10 条是
 「提交 hash、工作区状态、`HEAD == origin/main` 是否确认」。批次 A~D 的提交说明把第 10 条
 误写成「新增测试是否覆盖失败路径」，**漏了该条**；hash 与 HEAD 状态当时只在对话里报告，
 未写进提交说明。按 §10「缺一项视为未完成」，这 4 个提交在**格式**上不满足模板。
 未改写历史（约束倾向新建提交而非 amend）；上表即为该条的补记，批次 E 起已按模板补齐。
+
+### 13.2 M5 发布门槛
+
+门槛的逐项状态、证据与"缺什么"见 **`docs/13-m5-release-gates.md`**。要点：
+
+- **已收口**：安全（越权/凭据/存在性/SSRF/解析限额）、恢复演练（自动化）、
+  并发（跨进程 CAS 与运行锁，4 个真实子进程，连跑 8 次全绿）、预算终止与查询、
+  Web 六阶段端到端（脚本化宿主）。
+- **未收口**：预算跨天长跑验证、真实被测系统（非脚本化宿主）的六阶段端到端、
+  可运行的外部后端（PostgreSQL / Object Store）。
+
+门槛推进过程中由**门槛测试本身**抓出并修复了 4 个真实缺陷（不是读代码发现的）：
+
+1. `assertScopeMatch` 的消息回显目标作用域（泄露对方属于哪个项目）；
+2. 跨作用域读取返回 403 而"不存在"返回 404 —— 两者可区分即可枚举；
+3. **运行锁互斥破坏**：`mkdir` 到写 `owner.json` 之间的窗口被当成崩溃残留抢占，
+   导致两个进程同时持有同一把锁；
+4. 写 owner 期间锁目录被抢走时抛裸 `ENOENT`，上层归成 500 而不是 409。
