@@ -106,7 +106,7 @@ await ctx.plugin(platformPipelineHost, {
 ## 状态
 
 - 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）+ 2 份 ADR（docs/adr/0001 文档解析库选型、docs/adr/0002 存储后端选型与事务边界）
-- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **805 项测试全绿**
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **808 项测试全绿**
   - 注：在受限沙箱里跑全量 `node --test` 时，`test/fs-tools.test.ts` 的清理步骤可能被宿主 `safe-delete` 批量删除守卫拦下（按「每轮删除次数 > 阈值」判定，与代码无关）。单独运行该文件即通过。
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
 - Web 运行服务（M0 契约层）：`platform-pipeline/web` 提供无 HTTP 框架依赖的 `PipelineRunService`，覆盖 create/get/list/run/reenter 与人工门 list/claim/decide/cancel，以及 `getStageArtifact`/`listEvents`/`scanPipelineIndex`；Web 状态与阶段视图全部由检查点、产物与人工门任务重建，服务层不复制阶段逻辑。
@@ -180,7 +180,8 @@ await ctx.plugin(platformPipelineHost, {
   - **安全门槛**（`test/m5-security-gate.test.ts`）：越权矩阵 × **逐文件 sha256 零副作用**、凭据**递归穷举**（含错误详情）、存在性不泄露、绝不自动批准。**抓出并修掉两个真实泄露**：`assertScopeMatch` 的消息回显目标作用域；跨作用域读取返回 403 而"不存在"返回 404 —— 403/404 可区分即可枚举，改为统一按"不存在"回应。
   - **恢复门槛**（`test/m5-recovery-drill.test.ts`）：`cp -r` 备份 → 恢复进全新 dataRoot → 新 service/host → 视图 **deepEqual** 备份前 → `recover` 判定 → 批准后继续跑。三条硬断言：视图逐字相同、停在人工门必须是 `await-human` 且 `started: false`、恢复后**不重跑已完成阶段**。
   - **并发门槛**（`test/m5-multiprocess-concurrency.test.ts`）：4 个**真实 node 子进程**同时 claim / decide 同一条门任务、同时抢同一条流水线的运行锁。**抓出一个真实的互斥破坏**：`mkdir` 到写 `owner.json` 之间的窗口被竞争者当成崩溃残留抢占 → 两个进程同时持锁（实测到持有区间重叠）。修法：owner 文件**不存在**且目录很新（5s 宽限）判定为"正在获取"，与"文件存在但损坏"严格区分。同时修掉"写 owner 期间被抢走抛裸 `ENOENT` → 上层归成 500 而不是 409"。修后**连跑 8 次全绿**。
-  - **未收口**（如实标注，不写成已完成）：预算跨天长跑验证、真实被测系统（非脚本化宿主）的六阶段端到端、可运行的外部后端。发布范围限制见 `docs/13` §3。
+  - **预算长跑门槛**（`test/m5-budget-soak.test.ts`）：多批次 + 中途换 service 实例，判据全部来自**原始用量日志与聚合结果的对照**——换实例后累计必须逐字相同、打回重跑一批后必须精确等于两批之和、汇总值必须等于日志里的事件条数。判据刻意**不写死每批多少个 step**（那是聚合口径的实现细节），只钉住关系。
+  - **未收口**（如实标注，不写成已完成）：真实跨天（wall-clock）运行、真实被测系统（非脚本化宿主）的六阶段端到端、可运行的外部后端。发布范围限制见 `docs/13` §3。
 - 文档解析（P0-A1 完成）：`documents/` 已提供注册表 + 统一中间表示 + **PDF/DOCX/XLSX/Markdown 四类必支持格式** + 文本族与分隔符表格解析器；`parse_doc` 走注册表，返回 `status`/`confidence`/`sections`/`tables`/`plainText`/`sourceRefs`/`diagnostics`/`limits`，并按 §5.6.8 不回传原始字节。`.doc`/`.xls` 按 ADR-0001 §9 显式 `unsupported` 并给出定向转换提示。
   - `sourceRef` 四级可追溯：`requirements.pdf#page=3`、`spec.docx#heading=1.1,table=1,row=2`、`cases.xlsx#sheet=接口!A2:F20`、`cases.csv#table=1,row=2`。
   - 不伪装：无文本层 → `partial` + `NO_TEXT_LAYER`；无缓存公式值 → `FORMULA_VALUE_UNAVAILABLE` 且**绝不自行计算**；无解析器 → `unsupported`；二进制族 magic 不匹配 → **绝不退回按文本读**。

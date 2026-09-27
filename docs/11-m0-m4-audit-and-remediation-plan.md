@@ -907,6 +907,8 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 | E-3 | `4a165a5` | `docs: refresh docs/10 baseline and add deployment runbook` | clean | 是 |
 | M5-1 | `d6efdeb` | `fix: add m5 security gate and stop leaking scope via 403 vs 404` | clean | 是 |
 | M5-2 | `7b47578` | `fix: add m5 recovery and multiprocess gates, fix lock mutual exclusion` | clean | 是 |
+| M5-3 | `77098fd` | `docs: record m5 release gate status with evidence` | clean | 是 |
+| M5-4 | `d06aed6` | `test: add m5 budget soak gate across batches and restarts` | clean | 是 |
 
 **合规说明（如实记录）**：§10 的提交模板要求逐项回答 10 条，其中第 10 条是
 「提交 hash、工作区状态、`HEAD == origin/main` 是否确认」。批次 A~D 的提交说明把第 10 条
@@ -921,7 +923,8 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 - **已收口**：安全（越权/凭据/存在性/SSRF/解析限额）、恢复演练（自动化）、
   并发（跨进程 CAS 与运行锁，4 个真实子进程，连跑 8 次全绿）、预算终止与查询、
   Web 六阶段端到端（脚本化宿主）。
-- **未收口**：预算跨天长跑验证、真实被测系统（非脚本化宿主）的六阶段端到端、
+- **已收口（追加）**：预算跨批次 / 跨进程重启的累计（`test/m5-budget-soak.test.ts`）。
+- **未收口**：真实跨天（wall-clock）运行、真实被测系统（非脚本化宿主）的六阶段端到端、
   可运行的外部后端（PostgreSQL / Object Store）。
 
 门槛推进过程中由**门槛测试本身**抓出并修复了 4 个真实缺陷（不是读代码发现的）：
