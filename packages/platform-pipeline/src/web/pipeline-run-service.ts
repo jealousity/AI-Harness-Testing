@@ -1026,12 +1026,15 @@ export class FilePipelineRunService implements PipelineRunService {
       // 也只用租户与项目。把它放进比较的后果不是"更严格"，而是**任何声明了
       // `scope.environment` 的配置永久不可用**（`expected staging, got (missing)`），
       // 示例配置 `examples/pipeline.yaml` 正是这种情况。
+      // 参数顺序很关键：`expected` 必须是**调用者自己的**作用域。
+      // 反过来的话，`assertScopeMatch` 的消息（它只回显 `expected`）就会把**目标**的
+      // 项目/租户标识打出来——正好泄露了它本该隐藏的东西。
       assertScopeMatch(
+        { projectId, ...(actor.tenantId === undefined ? {} : { tenantId: actor.tenantId }) },
         {
           projectId: config.projectId,
           ...(config.scope?.tenantId === undefined ? {} : { tenantId: config.scope.tenantId }),
         },
-        { projectId, ...(actor.tenantId === undefined ? {} : { tenantId: actor.tenantId }) },
       )
     } catch (error) {
       if (onMismatch.kind === 'expose') throw toPipelineRunError(error, 'scope-mismatch')

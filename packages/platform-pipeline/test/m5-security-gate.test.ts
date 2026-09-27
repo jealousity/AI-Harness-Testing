@@ -206,6 +206,23 @@ test('门槛3：越权与不存在都不泄露"另一条流水线存在"这件�
     `"不存在"(${notFound.code}/${notFound.httpStatus}) 与"越权"(${forbidden.code}/${forbidden.httpStatus}) 的状态码必须一致，否则可枚举`)
 })
 
+test('门槛3b：作用域不匹配的消息只回显**调用者自己**的作用域，不回显目标的', async () => {
+  // `create` 路径用 `expose`：这条消息会**原样出网**（不像读取路径会被 `not-found` 吞掉），
+  // 因此它必须只含调用者自己声明的值。参数顺序传反过一次——那样消息里出现的其实是
+  // **配置（目标）**的租户标识，既是错误措辞又是泄露。这里把它钉住。
+  const service = serviceOf(new ScriptedHost())
+  const error = await service
+    .create(CREATE, { actorId: 'bob', tenantId: 'other-tenant' })
+    .catch((thrown: unknown) => thrown as PipelineRunError)
+
+  assert.ok(error instanceof PipelineRunError, `期望 PipelineRunError，实际 ${String(error)}`)
+  assert.equal(error.code, 'scope-mismatch')
+  assert.ok(!error.message.includes('acme'),
+    `不得回显目标租户（acme）：${error.message}`)
+  assert.ok(error.message.includes('other-tenant'),
+    `必须回显调用者自己的租户，否则调用方无法纠错：${error.message}`)
+})
+
 // ── 门槛 4：绝不自动批准 ────────────────────────────────────────────────────
 
 test('门槛4：等待超时与任务被取消都不会让阶段自动推进', async () => {
