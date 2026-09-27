@@ -8,7 +8,9 @@
 
 仓库：`/Users/zhangzhixiong/Downloads/harness/test-platform-design`
 
-当前远程版本：`ee4a016 feat: implement harness-free platform tool set and execution reconciliation`
+当前远程版本：以 `git rev-parse origin/main` 为准。整改期间的最新提交序列见
+`docs/11-m0-m4-audit-and-remediation-plan.md` §13（每一项都带提交与测试证据）；
+**该节是当前状态的唯一权威来源**，本文的基线段只记录"平台主体能力"。
 
 当前状态：
 
@@ -22,12 +24,22 @@
   - `OpenAIStageRunner`；
   - `OpenAIReviewRunner`；
   - 文件任务与人工门持久化；
-  - 可恢复人工门；
+  - 可恢复人工门（门任务绑定 `artifactDigest`，per-task 互斥保证并发裁决最多一个成功）；
   - CLI `run` / `reenter` / `gate-list` / `gate-claim` / `gate-decide` / `gate-cancel`；
   - `parse_doc`、`kb_query`、`kb_write`、`case_query`、`case_archive`、`executor_run`、`env_diag`、`req_pull`、`gate_check`；
-  - execute 阶段的执行会话加载和 R4-08/09/10 对账。
-- 当前验证：295/295 测试通过，typecheck/build 通过，CLI 六阶段「挂起 → 裁决 → 续跑」冒烟通过。
-- 当前 Web 仍是独立的浏览器演示应用：`web-app/server.mjs` 自己维护内存 run、自己调用模型、自己生成 Markdown 文本，尚未接入 `PipelineDriver`、检查点、人工门、工具注册表和真实 executor。
+  - execute 阶段的执行会话加载和 R4-08/09/10 对账；
+  - executor 调用的可恢复状态机（`intent` → `sent` → `received` → `done`），
+    崩溃后不会对"结果未知"的请求盲目重发。
+- **Web 已接入真实运行时**：`web-app/server.mjs` → `FilePipelineRunService` →
+  `createPlatformHost` → `PipelineDriver`，检查点、人工门、工具注册表、真实 executor
+  与用量预算全部走同一份持久化事实（不再是"自己维护内存 run 的浏览器演示应用"）。
+  存储端口由 `StorageBackendFactory` 统一装配，换后端只改宿主装配。
+- 当前验证：**792/792 测试通过、0 失败、0 跳过**；`tsc --noEmit` 与
+  `tsc -p tsconfig.build.json` 均通过；Web 端到端 12 项（含重启续跑、越权拒绝、
+  用量对账）包含在全量运行内。
+- **仍未完成**（详见 docs/11 §12/§13）：M4-B 的可运行 PostgreSQL/Object Store
+  （外部后端目前仅接口层）、M5 的安全/恢复/并发/预算/Web 集成发布门槛。
+  在这两项收口之前，不得对外宣称"平台化 M0-M4 全部完成"。
 
 ### 明确保留的原则
 
@@ -1015,7 +1027,9 @@ NODE_OPTIONS="--max-old-space-size=6144" ./node_modules/.bin/tsc -p tsconfig.bui
 
 以下清单可以直接逐项交给实现模型。每完成一项，都要先补测试再改实现，并保持小提交。
 
-进度：P0-A / P0-A1 / P0-B / P0-C / P1-A **已完成**（对应提交见 §12）；P1-B、P0-D **待做**。状态细节以 `packages/platform-pipeline/README.md` 的「状态」节为准。
+进度：P0-A / P0-A1 / P0-B / P0-C / P1-A **已完成**（对应提交见 §12）；P1-B、P0-D **待做**。
+另有整改批次 A~E 修复了审计发现的 P1/P2 项，**当前状态与逐项证据以
+`docs/11-m0-m4-audit-and-remediation-plan.md` §13 为准**（本节只记录 P0/P1 任务清单的进度）。
 
 ### P0-A：M0 契约
 

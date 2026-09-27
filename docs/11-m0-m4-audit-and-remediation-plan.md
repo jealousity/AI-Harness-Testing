@@ -887,9 +887,26 @@ docs/prompts/deepseek-m0-m5-execution-constraints.md
 | P1-07 | executor 崩溃窗口可重复副作用 | ✅ 已修复 | 新增 `src/executor/invocation-journal.ts`：每条用例一次调用的**可恢复状态机**（`intent` → `sent` → `received` → `done` / `unknown`）。`sent` 是**发请求之前**写的屏障；`sent` 之后只在宿主声明 `executorIdempotencyHeader`（远端支持幂等键）时才允许重发，否则整批**明确阻断**并给出可执行的处置说明。日志损坏 → 阻断（与幂等台账相反：那里损坏按无记录处理是安全的）。测试：`test/executor-invocation-journal.test.ts`（9 项，含真实崩溃注入） |
 | P1-08 | 幂等台账与业务写入非同事务 | ✅ 已修复（表述已纠正） | executor 路径**不再以台账为权威**：台账退化为兜底，判定以调用日志为准（它能表达"请求已发出但结果未知"，台账表达不了）。`idempotency.ts` 的"已知窗口"段落改写为明确的"本模块**不**提供的保证"，不再宣称 exactly-once 由台账给出 |
 | P1-09 | StorageBackend 未接入宿主装配 | 🟡 主体修复（剩余边界见备注） | `StorageBackendFactory` 接缝；`createPlatformHost` / `createCheckpointHost` / `PlatformToolContext` / `FilePipelineRunService` 全部只从 `backend.ports` 取事实，不再 `new Fs*`；服务把**缓存后的后端**转发给宿主（防止两边各拿一个实例而事实分裂）；装配时 `assertBackendPorts`，首次使用时 `assertStorageBackendHealthy`（`unreadable` → `storage-unavailable`）；HTTP 外壳改用 `toPipelineRunError`（此前直抛的 `StorageUnavailableError` 会被归成 500）。测试：`test/storage-backend-wiring.test.ts`（9 项，含"端口目录一个都没被创建"）。**剩余边界**：流水线索引/清单与幂等台账仍是宿主级文件记录，不在 §8.2 的 9 个端口内（测试已把边界钉住，见 ADR-0002 §7）；`cli.ts` 的门任务存储、`plugin.ts`、`harness/host-plugin.ts`、`e2e/minimal-host.ts` 仍是直连文件实现 |
-| P2-01 | `readIndex` 校验不统一 | 🟡 部分修复 | `readIndex` 已复用 `isIndexEntry` 并校验文件名一致性（P1-01 的"不静默降级"依赖它）；**checkpoint.pipelineId 交叉校验仍未做**，见批次 E |
-| P2-02 | parser 未在 readFile 前限制字节 | ⬜ 未修复 | 批次 E |
-| P2-03 | 压缩比策略未接入 zip reader | ⬜ 未修复 | 批次 E |
-| P2-04 | SSRF userinfo / mapped IPv6 | ⬜ 未修复 | 批次 E |
-| P2-05 | 更新 docs/10 旧基线 | ⬜ 未修复 | 批次 E |
-| P2-06 | 部署与恢复 runbook | ⬜ 未修复 | 批次 E |
+| P2-01 | `readIndex` 校验不统一 | ✅ 已修复 | 批次 A：`readIndex` 复用 `isIndexEntry` 并校验文件名一致性；批次 E：`requireCheckpoint` 增加 `checkpoint.pipelineId` 与请求的交叉校验（不一致 → `storage-unavailable`，不是 `not-found`）。测试：`test/pipeline-run-service.test.ts` 的「检查点里的 pipelineId 与请求不一致时显式失败」 |
+| P2-02 | parser 未在 readFile 前限制字节 | ✅ 已修复 | 新增 `src/documents/file-reader.ts`：**先 `stat` 再受限读取**（自适应分块，上界 `maxBytes + 一个块`）。`parse_doc` 改为 `resolveDocumentLimits` + `readFileWithinLimit`；超限结果形状不变（`available: true` + `limit-exceeded`）。测试：`test/documents-file-reader.test.ts`（6 项）+ `test/platform-tools.test.ts` 的「读取之前就拒绝」（用不可读文件区分"读前判"与"读后判"） |
+| P2-03 | 压缩比策略未接入 zip reader | ✅ 已修复 | 把压缩比判定抽成 `assertCompressionRatioWithinLimits`（`assertZipEntryWithinLimits` 内部改调它，规则仍只有一份），并在 `zip-reader.ts` 的 `ondata` 里真正调用。测试：`test/documents-ooxml-safety.test.ts` 的「压缩比超过上限时按压缩比拒绝」+「正常 OOXML 的天然高压缩比不会被误杀」 |
+| P2-04 | SSRF userinfo / mapped IPv6 | ✅ 已修复 | 新增 `src/web/ssrf-guard.ts`：拒绝 URL userinfo；错误消息不再回显原始 URL（凭据与 query 令牌不出网）；`isPrivateAddress` 覆盖 IPv4-mapped/compatible IPv6 与保留/组播网段；新增 `assertTargetResolvedAllowed`（建连前解析后复核，防 DNS rebinding），由 `executor_run` 在发请求前调用。测试：`test/ssrf-guard.test.ts`（12 项）+ `test/platform-tools.test.ts` 的建连前复核 |
+| P2-05 | 更新 docs/10 旧基线 | ✅ 已修复 | `docs/10` §1 重写：远程版本改为"以 `origin/main` 为准 + 指向 §13"，测试基线 295 → 792，删除"Web 仍是独立浏览器演示应用"的过期结论；§10 的进度行改为指向本文件 §13。**本文件 §13 是当前状态的唯一权威来源** |
+| P2-06 | 部署与恢复 runbook | ✅ 已修复 | 新增 `docs/12-deployment-and-recovery-runbook.md`：数据根布局与"哪些目录绝不能删"、后端当前支持范围（含**未支持**的可运行外部后端）、首次部署与冒烟、角色表、恢复判定表、`invocation-unknown` / `GateTaskBusyError` / 检查点损坏的逐步处置、备份与演练、回滚风险表、M5 发布门槛现状 |
+
+### 13.1 批次提交与合规补记
+
+| 批次 | 提交 | 内容 | 工作区 | HEAD == origin/main |
+|---|---|---|---|---|
+| A | `0f6bc3d` | `fix: persist run manifest and close operator role gaps` | clean | 是（推送后复核） |
+| B | `fa07142` | `fix: bind human gate to artifact digest and make gate tasks atomic` | clean | 是 |
+| C | `0389322` | `fix: make executor invocations a recoverable state machine` | clean | 是 |
+| D | `8753e51` | `refactor: wire the storage backend into host and web assembly` | clean | 是 |
+| E-1 | `131a8cc` | `fix: enforce document limits before reading and wire compression ratio` | clean | 是 |
+| E-2 | `d384a69` | `fix: harden ssrf guard against userinfo, mapped ipv6 and dns rebinding` | clean | 是 |
+
+**合规说明（如实记录）**：§10 的提交模板要求逐项回答 10 条，其中第 10 条是
+「提交 hash、工作区状态、`HEAD == origin/main` 是否确认」。批次 A~D 的提交说明把第 10 条
+误写成「新增测试是否覆盖失败路径」，**漏了该条**；hash 与 HEAD 状态当时只在对话里报告，
+未写进提交说明。按 §10「缺一项视为未完成」，这 4 个提交在**格式**上不满足模板。
+未改写历史（约束倾向新建提交而非 amend）；上表即为该条的补记，批次 E 起已按模板补齐。

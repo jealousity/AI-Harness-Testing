@@ -106,7 +106,7 @@ await ctx.plugin(platformPipelineHost, {
 ## 状态
 
 - 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）+ 2 份 ADR（docs/adr/0001 文档解析库选型、docs/adr/0002 存储后端选型与事务边界）
-- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **769 项测试全绿**
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **792 项测试全绿**
   - 注：在受限沙箱里跑全量 `node --test` 时，`test/fs-tools.test.ts` 的清理步骤可能被宿主 `safe-delete` 批量删除守卫拦下（按「每轮删除次数 > 阈值」判定，与代码无关）。单独运行该文件即通过。
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
 - Web 运行服务（M0 契约层）：`platform-pipeline/web` 提供无 HTTP 框架依赖的 `PipelineRunService`，覆盖 create/get/list/run/reenter 与人工门 list/claim/decide/cancel，以及 `getStageArtifact`/`listEvents`/`scanPipelineIndex`；Web 状态与阶段视图全部由检查点、产物与人工门任务重建，服务层不复制阶段逻辑。
@@ -169,6 +169,13 @@ await ctx.plugin(platformPipelineHost, {
   - **装配即校验**：`assertBackendPorts`（缺必需端口立刻失败）；首次使用时 `assertStorageBackendHealthy`——只有 `unreadable`（基础设施读不了）算后端不可用并报 `storage-unavailable`，单条记录损坏/待迁移只在体检里报告（让整个服务起不来比坏一条记录更糟）。
   - **HTTP 外壳改用统一错误映射**（`toPipelineRunError`）：此前它自己手搓兜底、只认 `PipelineRunError`，任何直抛的 `StorageUnavailableError` 都会被归成 `run-failed`(500)，而它应当是 `storage-unavailable`(503)——运维动作完全不同。
   - **已知边界（如实声明，测试已钉住）**：流水线索引/清单与幂等台账仍是**宿主级文件记录**，不在 docs/10 §8.2 的 9 个端口内，因此换后端不会换它们；`cli.ts` 的门任务存储、`plugin.ts`、`harness/host-plugin.ts`、`e2e/minimal-host.ts` 仍是直连文件实现。见 `docs/adr/0002-storage-backends.md` §7。
+- **审计整改批次 E 完成（docs/11 P2-01 剩余 / P2-02 / P2-03 / P2-04 / P2-05 / P2-06）**：
+  - **字节上限在读取之前生效（P2-02）**：新增 `src/documents/file-reader.ts`。`readFile()` 会无条件把整个文件读进内存，因此"读了之后再判上限"等于没有上限——一份 10 GiB 的"文档"在判据生效前就把进程打爆了。现在**先 `stat` 再受限读取**：`stat` 判一次直接拒，读取按自适应分块（64 KiB ~ 4 MiB）进行，上界是 `maxBytes + 一个块`，且分块读到 EOF 所以不会把"被截断的前缀"当成完整文档。超限结果的形状不变（`available: true` + `status: 'limit-exceeded'`），调用方不需要区分"读前拒"与"读后拒"。
+  - **压缩比判据真正参与判定（P2-03）**：`assertZipEntryWithinLimits` 里的压缩比规则此前**从未被调用**——解包路径自己手写了两条逐字节判断，于是"小文件解压成几个 G"只能靠单条目上限兜，一个刚好卡在上限之下的高压缩比条目可以合法地膨胀上千倍。现在把规则抽成 `assertCompressionRatioWithinLimits`（两处入口共用同一份实现），并在 `zip-reader.ts` 的 `ondata` 里真正调用。
+  - **SSRF 加固（P2-04）**：新增 `src/web/ssrf-guard.ts`。拒绝 URL userinfo（凭据不得写进配置）；**错误消息不再回显原始 URL**（此前密码与 query 令牌会随错误响应、日志、agent 上下文出网），改为只保留 `协议//主机/路径`；`isPrivateAddress` 覆盖 IPv4-mapped/compatible IPv6（`::ffff:127.0.0.1` 曾是现成的绕过写法）与保留/组播网段；新增 `assertTargetResolvedAllowed` 做**建连前的解析后复核**（防 DNS rebinding），由 `executor_run` 在发出任何请求之前调用——解析结果里只要有一个私有地址就整体拒绝。
+  - **检查点与请求的 pipelineId 交叉校验（P2-01 剩余）**：`requireCheckpoint` 现在校验记录内容与请求一致。检查点路径由 `<checkpointRoot>/<pipelineId>` 拼出，但检查点是磁盘文件——被改坏或放错位置时，继续按请求的 id 往下走会让产物路径、门任务归属、用量 scope 全部建立在一条错位的记录上。归类为 `storage-unavailable`（登记记录损坏）而不是 `not-found`（会让人去建一条新的）。
+  - **文档收口**：`docs/10` §1 基线重写（测试数 295 → 792，删除"Web 仍是独立浏览器演示应用"的过期结论）；新增 `docs/12-deployment-and-recovery-runbook.md`（数据根布局、后端支持范围含**未支持**项、恢复判定表、`invocation-unknown` / `GateTaskBusyError` / 检查点损坏的逐步处置、回滚风险表、M5 发布门槛现状）。
+  - **仍未完成**：M4-B 的可运行 PostgreSQL/Object Store（仅接口层）、M5 的安全/恢复/并发/预算/Web 集成发布门槛。**在这两项收口前不得对外宣称"平台化 M0-M4 全部完成"**。
 - 文档解析（P0-A1 完成）：`documents/` 已提供注册表 + 统一中间表示 + **PDF/DOCX/XLSX/Markdown 四类必支持格式** + 文本族与分隔符表格解析器；`parse_doc` 走注册表，返回 `status`/`confidence`/`sections`/`tables`/`plainText`/`sourceRefs`/`diagnostics`/`limits`，并按 §5.6.8 不回传原始字节。`.doc`/`.xls` 按 ADR-0001 §9 显式 `unsupported` 并给出定向转换提示。
   - `sourceRef` 四级可追溯：`requirements.pdf#page=3`、`spec.docx#heading=1.1,table=1,row=2`、`cases.xlsx#sheet=接口!A2:F20`、`cases.csv#table=1,row=2`。
   - 不伪装：无文本层 → `partial` + `NO_TEXT_LAYER`；无缓存公式值 → `FORMULA_VALUE_UNAVAILABLE` 且**绝不自行计算**；无解析器 → `unsupported`；二进制族 magic 不匹配 → **绝不退回按文本读**。
