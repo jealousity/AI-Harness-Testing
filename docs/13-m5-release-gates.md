@@ -126,12 +126,33 @@ pid 35509 持有到 1790514928756，pid 35510 从 1790514926253 就开始  ← �
 以及 `beforeStage` 里抛错会被 driver 的 spawn try/catch 吞成 `outcome: 'failed'`
 （因此驱动真实执行必须在正确时点显式调用，不能挂在钩子里）。
 
-### 门槛 11 为什么是 ⬜
+### 门槛 11 为什么是 ⬜，以及**下一轮可以直接开工的路径**
 
 `docs/adr/0002` §7 与 `docs/12` §1.3 都写明：**当前生产部署只能用文件后端 + 本地磁盘**。
 `storage-external.test.ts` 验证的是"外部后端该满足什么契约"，不是一个可运行实现。
-要让索引与幂等台账也随后端切换，需要**新增端口**（带集合的键值记录），
-那是对 `docs/10 §8.2` 九端口清单的扩展，属新的设计决定。
+
+**已探明的现实路径（本轮实测，未动手）**：`node:sqlite`（Node 22 内置 `DatabaseSync`）
+在本机可用——**真实驱动、真实连接、真实 CRUD、真实事务**，无需外部服务、不加任何依赖：
+
+```bash
+node -e "console.log(Object.keys(require('node:sqlite')))"
+# [ 'DatabaseSync', 'StatementSync', 'Session', 'constants', 'backup' ]
+```
+
+它能同时满足两件事：
+1. 批次 D 的验收「**同一份 contract test 在 file 和第二个真实可运行 backend 通过**」——
+   目前只有 memory 满足，而 memory **不可生产**（锁只在进程内有效）；
+2. 端口抽象在**事务型**存储上的第一次真实验证（file 与 memory 都不具备真正的多语句事务）。
+
+**为什么本轮没做**：一个完整后端要覆盖 10 个端口（artifacts / checkpoints / tasks /
+gateTasks / usage / audit / knowledge / cases / lock / records），约 600+ 行。
+**半成品比不做更糟**——那正是约束书 §3 禁止的"接口层冒充真实后端"。
+因此只记录路径与证据，不动手。
+
+**注意与审计书口径的差异**：审计书 §12 要的是 **PostgreSQL / Object Store**，
+SQLite 两者都不是。它能收口的是"第二个真实可运行 backend"这条验收，
+**不能**替代"多副本共享的外部后端"（SQLite 是单节点文件库）。
+若目标是多租户 SaaS，仍需真正的 PG/Object Store。
 
 ---
 
