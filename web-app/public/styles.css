@@ -101,6 +101,15 @@ main {
   border-radius: var(--radius); padding: 12px 14px;
 }
 .side-block > h2 { margin: 0 0 8px; font-size: 14px; }
+/* 通用配置是可折叠的 details：标题即折叠开关。 */
+.side-block > summary {
+  cursor: pointer; font-weight: 600; font-size: 14px;
+  list-style: none; display: flex; align-items: center; gap: 6px;
+}
+.side-block > summary::-webkit-details-marker { display: none; }
+.side-block > summary::before { content: "\25B8"; color: var(--muted); font-size: 12px; }
+.side-block[open] > summary::before { content: "\25BE"; }
+.side-block > summary + * { margin-top: 8px; }
 .side-block > label { margin-bottom: 8px; }
 .side-block > button { width: 100%; }
 .side-block .filters { flex-direction: column; gap: 8px; margin: 10px 0 8px; }

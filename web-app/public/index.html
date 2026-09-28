@@ -20,6 +20,8 @@
       <span class="conn" id="conn" role="status" aria-live="polite">连接中…</span>
       <button type="button" id="btn-poll">暂停自动刷新</button>
       <button type="button" id="btn-refresh">立即刷新</button>
+      <!-- 流水线列表入口：**始终可见**，避免停在详情页后找不到列表 -->
+      <button type="button" id="btn-show-list">流水线列表</button>
       <!-- 新建流水线：右上角主操作 -->
       <button type="button" class="primary" id="btn-new-pipeline">＋ 新建流水线</button>
     </div>
@@ -28,8 +30,10 @@
   <div class="shell">
     <!-- ── 左侧一级菜单：通用配置 + 流水线 ──────────────────────────────────── -->
     <aside class="sidebar" aria-label="一级菜单">
-      <section class="side-block">
-        <h2>通用配置</h2>
+      <!-- 通用配置：**可折叠**（点标题展开/收起）。这里只放对所有流水线都通用的项；
+           每条流水线自己的字段（含标识）在新建对话框里。 -->
+      <details class="side-block" id="general-config" open>
+        <summary>通用配置</summary>
         <p class="hint">对本会话内新建的流水线生效；不写入任何运行状态。</p>
 
         <label for="g-project">项目 ID<span class="req">必填</span>
@@ -50,7 +54,7 @@
         <label for="g-ttl">门任务 TTL / 毫秒（可选）
           <input id="g-ttl" type="number" min="0" step="1" autocomplete="off">
         </label>
-      </section>
+      </details>
 
     </aside>
 

@@ -1129,6 +1129,11 @@ $('create-form').addEventListener('submit', async event => {
 })
 
 $('btn-new-pipeline').addEventListener('click', () => { openCreateDialog() })
+// 始终可见的流水线列表入口：从详情页一键回到列表。
+$('btn-show-list').addEventListener('click', () => {
+  if (state.pipelineId === null) void refresh()
+  else closePipeline()
+})
 $('btn-create-cancel').addEventListener('click', () => { closeCreateDialog() })
 // 通用配置变化时同步对话框里的摘要。
 for (const id of ['g-project', 'g-provider', 'g-ruleset', 'g-retries', 'g-gatewait', 'g-ttl']) {

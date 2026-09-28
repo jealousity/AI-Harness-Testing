@@ -476,7 +476,9 @@ async function serveStatic(req, res, pathname) {
     const body = await readFile(target)
     res.writeHead(200, {
       'content-type': CONTENT_TYPES[extname(target)] || 'application/octet-stream',
-      'cache-control': 'no-cache',
+      // `no-store`：本地单机控制台，改了 UI 必须立刻可见。
+      // 用 `no-cache` 时浏览器仍可能拿旧副本（它只要求重新验证，而我们不发 ETag）。
+      'cache-control': 'no-store',
       'x-content-type-options': 'nosniff',
       'x-frame-options': 'DENY',
       'referrer-policy': 'no-referrer',
