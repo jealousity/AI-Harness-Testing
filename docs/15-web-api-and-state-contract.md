@@ -601,6 +601,48 @@ type RunResult =
 
 ---
 
+## 8.4 W4 落地记录（Web UI 信息架构与交互）
+
+`web-app/public/` 三个文件重写（`index.html` 230 行 / `app.js` 1026 行 / `styles.css` 260 行），
+无框架、无外部资源（本地单机可离线）。落地要点与证据（`test/web-ui-contract.test.ts`，12 项）：
+
+| 规划书要求 | 落地方式 |
+|---|---|
+| 首屏向导而非空表格 | `#wizard` 与 `#workspace` 互斥显示 |
+| 创建表单分四组 | 四个 `<fieldset>`：基本信息 / 需求输入 / 被测服务 / 运行选项 |
+| 不接收 API Key | 页面无凭据输入；有测试断言**表单控件**不含 `apiKey` |
+| 创建成功自动打开 | `createPipeline()` 末尾调用 `openPipeline()` |
+| URL 只存导航上下文 | `#pipeline=<id>`；运行状态一律重新拉取 |
+| 列表按项目/状态筛选 | `#list-filters` + `renderList()` 本地过滤 |
+| 轮询不覆盖用户输入 | `gatesFrozen()`：有焦点或非空输入则冻结门面板并提示 |
+| 请求中禁用按钮 | `state.busy` + 汇总渲染时同步 `disabled` |
+| 409 自动刷新 | 三个动作的 catch 里按 `httpStatus === 409` 触发 `refresh()` |
+| 503 不当成"没数据" | `describeError()` 单独识别 503 并给出重试入口 |
+| 刷新恢复同一流水线 | 启动时从 `location.hash` 还原 `pipelineId` |
+| 阶段变化不打断阅读 | 当前任务卡整块重绘；产物查看器保留展开状态 |
+| 产物可折叠 | `renderValue()`：数组/对象/长文本用 `<details>` |
+| 安全渲染 | **全程 `textContent`**；有测试断言 app.js 无 `innerHTML`/`insertAdjacentHTML` |
+| 键盘/焦点/禁用态 | `:focus-visible`、`button:disabled`、`aria-current="step"` |
+| 窄屏不溢出 | `.stepper { overflow-x: auto }` + 窄屏媒体查询 |
+| aria-live | 连接状态、当前任务、门任务提示均为 `aria-live="polite"` |
+| 自动刷新可暂停 | `#btn-poll` + "已暂停，数据可能过期" |
+
+### 已知缺口（W4 冒烟实测，**需要后端改动，本轮未修**）
+
+**后台运行的"前置失败"在 UI 上完全不可见。**
+
+实测：配置缺 `PLATFORM_LLM_API_KEY` 时，`POST /api/pipelines/:id/run` 返回 `202`（已受理），
+随后后台运行以 `provider-unavailable` 失败；该失败**只出现在服务端日志**——
+检查点没写、事件流里没有、视图仍显示 `queued`，页面只说"尚未开始：触发运行"。
+用户会反复点"触发运行"而得不到任何解释。
+
+**为什么不在这里修**：让 `deriveRunStatus` 产出 `failed` 需要把运行期失败**持久化**
+（审计事件或检查点），那是 driver/host 的改动。用"进程内记一下上次失败"来补是
+**被架构禁止的**——进程内 registry 刻意不导出任何状态查询，否则会变成第二份事实来源。
+已列为 `docs/14` W5 的任务。
+
+---
+
 ## 9. 本轮计划新增/变更的契约
 
 > 以下为 `docs/14` W1~W3 的计划内容，**冻结稿确认它们尚未存在**。实现时必须
@@ -619,6 +661,8 @@ type RunResult =
 | `PipelineRunView.stale` | 新增（派生） | W3 | ❌ **有意不实现**，理由见 §8.3（服务端无诚实依据，等价信息已由 `running` 表达） |
 | 门任务 `isEscalation` | 新增（派生） | W3 | ✅ 已实现（`1f15943`）｜同文件 |
 | 两个 cancel 端点响应形状统一 | **变更（破坏性）** | W3 | ✅ 已实现（`1f15943`）｜`web-app/server.mjs` |
+| Web UI 信息架构与交互重做 | 重写（前端） | W4 | ✅ 已实现（`9611476`）｜`test/web-ui-contract.test.ts`（12 项） |
+| 后台运行前置失败对 UI 可见 | 新增（需后端持久化） | W5 | ⬜ **未实现**，理由见 §8.4 |
 | `list()` 改用注入的 `indexStore` | **缺陷修复（W-01）** | W2 | ✅ 已实现（`f46cf37`）｜`test/web-index-and-creation.test.ts` |
 | `records` 缺失时显式区分 legacy fallback 与失败关闭 | 变更 | W2 | ✅ 已实现（`f46cf37`）｜`assertBackendPorts` 对"外部后端"失败关闭；同文件 |
 | 索引扫描区分数据损坏与基础设施不可用 | 变更 | W2 | ✅ 已实现（`f46cf37`）｜`scanPipelineIndexFrom` 只把数据问题放进 `unreadable` |
