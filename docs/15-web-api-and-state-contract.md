@@ -677,8 +677,11 @@ type RunResult =
 - `preflight` **不取运行锁**（锁要留给真正的 `run()`），因此它只保证"明显跑不起来的配置
   在启动后台任务之前被拦下"，**不保证**"校验通过后 run 一定能开始"。
 - **运行期**异常仍不持久化（见 §8.4 末尾），属 M3 遥测范围。
-- **数据根体检接口（规划书 W5 第 9 条）本轮未做**：`backend.diagnose()` 已存在，
-  但没有把它暴露成 HTTP 接口或 CLI 命令。缺它时排障只能看服务端日志与手工看文件。
+- **数据根体检已实现**（`GET /api/pipelines/:id/diagnostics`）：把 `backend.diagnose()`
+  的六类诊断码、索引不可读项、用量坏行、创建中间态与运行锁现状汇总成一份只读报告。
+  覆盖规划书要求的七类。证据：`test/web-diagnostics.test.ts`（8 项）。
+  已知边界：**索引自身损坏的那条流水线无法通过本接口体检**——反解不出它的配置与项目根；
+  此时改体检同项目的另一条流水线，`index.unreadable` 会把它列出来。
 
 ---
 
@@ -703,7 +706,8 @@ type RunResult =
 | Web UI 信息架构与交互重做 | 重写（前端） | W4 | ✅ 已实现（`9611476`）｜`test/web-ui-contract.test.ts`（12 项） |
 | 后台运行**前置**失败对 UI 可见 | 新增 | W5 | ✅ 已实现（`67c4f5c`）｜`preflight` 前移，见 §8.4 |
 | 后台运行**运行期**失败对 UI 可见 | 新增（需 M3 遥测持久化） | — | ⬜ **未实现**，理由见 §8.5 |
-| 数据根体检接口 / 命令 | 新增 | W5 | ⬜ **未实现**，理由见 §8.5 |
+| 数据根体检接口 | 新增 | W5 | ✅ 已实现（本次提交）｜`GET /api/pipelines/:id/diagnostics` + `test/web-diagnostics.test.ts`（8 项） |
+| 数据根体检 **CLI 命令** | 新增 | — | ⬜ 未实现：接口已够用，CLI 命令未加 |
 | `list()` 改用注入的 `indexStore` | **缺陷修复（W-01）** | W2 | ✅ 已实现（`f46cf37`）｜`test/web-index-and-creation.test.ts` |
 | `records` 缺失时显式区分 legacy fallback 与失败关闭 | 变更 | W2 | ✅ 已实现（`f46cf37`）｜`assertBackendPorts` 对"外部后端"失败关闭；同文件 |
 | 索引扫描区分数据损坏与基础设施不可用 | 变更 | W2 | ✅ 已实现（`f46cf37`）｜`scanPipelineIndexFrom` 只把数据问题放进 `unreadable` |

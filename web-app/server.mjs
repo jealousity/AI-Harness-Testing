@@ -361,6 +361,12 @@ const ROUTES = [
     json(res, 200, artifact)
   }],
 
+  ['GET', /^\/api\/pipelines\/([^/]+)\/diagnostics$/, async (req, res, pipelineId) => {
+    // 数据根体检（docs/14 W5 第 9 条）：只读，不取锁、不改记录。
+    // 排障入口，因此要求 operator 角色（service 层再校验一次）。
+    json(res, 200, await service.diagnose(pipelineId, actorOf(req)))
+  }],
+
   ['POST', /^\/api\/pipelines\/([^/]+)\/reenter$/, async (req, res, pipelineId) => {
     const body = await readJsonBody(req)
     const checkpoint = await service.reenter({

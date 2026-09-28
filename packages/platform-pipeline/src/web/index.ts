@@ -102,6 +102,7 @@ export {
   type GateTaskView,
   type NextActionDecision,
   type NextActionFacts,
+  type PipelineDiagnostics,
   type PipelineEventKind,
   type PipelineEventView,
   type PipelineRunErrorCode,

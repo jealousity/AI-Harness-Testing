@@ -215,8 +215,15 @@
         </div>
         <div class="actions">
           <button type="button" id="btn-reenter">登记重入</button>
+          <button type="button" id="btn-diagnostics">体检数据根</button>
         </div>
         <p class="out" id="out-reenter" role="alert" hidden></p>
+        <h3>数据根体检</h3>
+        <p class="hint">
+          只读检查：后端诊断、索引不可读项、用量坏行、创建是否收口、运行锁现状。
+          不判定锁是否 stale（要判断能不能抢，就真的触发一次运行）。
+        </p>
+        <div id="diagnostics-panel"></div>
         <h3>机器违规与审核明细</h3>
         <div id="advanced-violations"></div>
         <h3>原始视图</h3>

@@ -741,6 +741,74 @@ function syncReenterDigest() {
   $('f-reenter-digest').value = stage?.digest ?? ''
 }
 
+// ── 渲染：数据根体检（docs/14 W5 第 9 条）─────────────────────────────────────
+
+function renderDiagnostics(report) {
+  const root = $('diagnostics-panel')
+  root.replaceChildren()
+  if (report === null) {
+    root.append(el('p', { className: 'muted', text: '点「体检数据根」运行一次只读检查。' }))
+    return
+  }
+
+  root.append(el('p', {
+    className: 'reason',
+    text: report.attentionNeeded
+      ? '体检发现需要处置的项（见下）。'
+      : '体检未发现需要处置的项。',
+  }))
+
+  root.append(el('ul', { className: 'events' }, [
+    el('li', {}, [el('span', { className: 'muted small', text: '后端' }),
+      el('span', { className: 'mono small', text: `${report.backend.name} · schemaVersion ${report.backend.schemaVersion} · ok=${report.backend.ok}` })]),
+    el('li', {}, [el('span', { className: 'muted small', text: '索引' }),
+      el('span', { className: 'mono small', text: `${report.index.entries} 条，不可读 ${report.index.unreadable.length} 条` })]),
+    el('li', {}, [el('span', { className: 'muted small', text: '用量坏行' }),
+      el('span', { className: 'mono small', text: String(report.usageSkippedLines) })]),
+    el('li', {}, [el('span', { className: 'muted small', text: '创建状态' }),
+      el('span', { className: 'mono small', text: report.creationState })]),
+    el('li', {}, [el('span', { className: 'muted small', text: '运行锁' }),
+      el('span', {
+        className: 'mono small',
+        text: report.lock.present
+          ? `存在（owner ${report.lock.ownerId ?? '不可确认'}`
+            + `${report.lock.ageMs === null ? '' : `，心跳距今 ${report.lock.ageMs}ms`}）`
+          : '不存在',
+      })]),
+  ]))
+
+  if (report.creationState === 'creating') {
+    root.append(el('p', {
+      className: 'reason',
+      text: '创建未完成：索引已写但检查点未确认。用同一 pipelineId 重新创建即可接管。',
+    }))
+  }
+
+  if (report.storage.length > 0) {
+    root.append(el('ul', { className: 'violations' }, report.storage.map(item =>
+      el('li', {
+        text: `[${item.code}] ${item.kind} ${item.ref}：${item.detail}`
+          + (item.recoverable ? '（可被 migrate 修复）' : ''),
+        attrs: { 'data-level': item.recoverable ? 'WARNING' : 'BLOCKING' },
+      }))))
+  }
+  if (report.index.unreadable.length > 0) {
+    root.append(el('ul', { className: 'violations' }, report.index.unreadable.map(item =>
+      el('li', { text: `索引不可读 ${item.file}：${item.reason}`, attrs: { 'data-level': 'BLOCKING' } }))))
+  }
+}
+
+async function runDiagnostics() {
+  const root = $('diagnostics-panel')
+  root.replaceChildren(el('p', { className: 'muted', text: '正在体检…' }))
+  try {
+    const report = await api('GET', `/api/pipelines/${encodeURIComponent(state.pipelineId)}/diagnostics`)
+    renderDiagnostics(report)
+  } catch (error) {
+    root.replaceChildren(el('p', { className: 'muted', text: describeError(error) }))
+  }
+}
+
 // ── 刷新 ─────────────────────────────────────────────────────────────────────
 
 /**
@@ -832,6 +900,8 @@ function openPipeline(pipelineId) {
   state.artifact = null
   state.artifactError = null
   clearOut('out-wizard')
+  // 体检报告是**手动触发**的快照：换流水线时必须清掉，否则会显示上一条的结论。
+  renderDiagnostics(null)
   // 导航上下文进 URL（只存 pipelineId，不存任何运行状态）；刷新后能回到同一条流水线。
   location.hash = `pipeline=${encodeURIComponent(pipelineId)}`
   void refresh()
@@ -1003,6 +1073,7 @@ $('btn-cancel-run').addEventListener('click', () => { void cancelRun() })
 $('btn-recover').addEventListener('click', () => { void recover() })
 $('btn-close').addEventListener('click', () => { closePipeline() })
 $('btn-reenter').addEventListener('click', () => { void reenter() })
+$('btn-diagnostics').addEventListener('click', () => { void runDiagnostics() })
 $('btn-refresh').addEventListener('click', () => { void refresh() })
 
 $('btn-poll').addEventListener('click', () => {
@@ -1032,5 +1103,6 @@ void (async () => {
   if (match !== null) state.pipelineId = decodeURIComponent(match[1])
   else $('list-filters').hidden = false
   renderPollingState()
+  renderDiagnostics(null)
   await refresh()
 })()

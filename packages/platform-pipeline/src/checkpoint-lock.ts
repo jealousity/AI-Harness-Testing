@@ -181,6 +181,30 @@ export function pipelineLockPath(checkpointRoot: string, pipelineId: string): st
   return join(pipelineCheckpointDir(checkpointRoot, pipelineId), LOCK_DIR_NAME)
 }
 
+/**
+ * **只读**地检查运行锁现状（供数据根体检使用，docs/14 W5 第 9 条）。
+ *
+ * 与 `acquirePipelineLock` 的区别：它**不获取、不修改**任何东西，因此可以安全地放在
+ * 体检/排障路径上。
+ *
+ * 刻意只回"目录是否存在 + owner 是什么"，**不判定 stale**：stale 的判据（心跳窗口、
+ * 同主机 pid 是否存活）属于获取路径的策略，体检复刻一遍的话，两处判据一旦分叉就会出现
+ * "体检说没事、实际抢不到锁"。要判断能不能抢，就去真的抢一次（会拿到明确错误）。
+ */
+export async function inspectPipelineLock(
+  checkpointRoot: string,
+  pipelineId: string,
+): Promise<{ readonly present: boolean; readonly owner: PipelineLockOwner | null }> {
+  const path = pipelineLockPath(checkpointRoot, pipelineId)
+  try {
+    await stat(path)
+  } catch {
+    return { present: false, owner: null }
+  }
+  // owner 文件缺失/损坏时 `readOwner` 返回 null——这正是"身份不可确认"的如实表达。
+  return { present: true, owner: await readOwner(path) }
+}
+
 /** 取得该 pipeline 的运行锁；已被他人持有时抛 {@link PipelineLockHeldError}。 */
 export async function acquirePipelineLock(
   checkpointRoot: string,

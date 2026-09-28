@@ -85,6 +85,7 @@ import {
 } from '../runtime/platform-host.ts'
 import { type HumanGateTask, type HumanGateTaskStore } from '../runtime/persistence.ts'
 import { HumanGateWaitAbortedError } from '../runtime/persistent-human-gate.ts'
+import { inspectPipelineLock } from '../checkpoint-lock.ts'
 import {
   PipelineRunError,
   assertGateRole,
@@ -101,6 +102,7 @@ import {
   type GateTaskFilter,
   type GateTaskKind,
   type GateTaskView,
+  type PipelineDiagnostics,
   type PipelineEventKind,
   type PipelineEventView,
   type PipelineRunFailure,
@@ -217,6 +219,13 @@ export interface PipelineRunService {
    * 而不是只写进服务端日志。详见实现处的文档注释。
    */
   preflight(pipelineId: string, actor: ActorContext): Promise<void>
+  /**
+   * 数据根体检（`GET /api/pipelines/:pipelineId/diagnostics`，docs/14 W5 第 9 条）。
+   *
+   * 汇总后端诊断、索引不可读项、用量坏行、创建中间态与运行锁现状。
+   * 要求 `operator`：它是只读的，但暴露的是部署层面的排障信息。
+   */
+  diagnose(pipelineId: string, actor: ActorContext): Promise<PipelineDiagnostics>
   /**
    * 回读某阶段的产物文件（`GET /api/pipelines/:pipelineId/stages/:stageId/artifact`）。
    *
@@ -740,6 +749,58 @@ export class FilePipelineRunService implements PipelineRunService {
     }
   }
 
+  /**
+   * 数据根体检（docs/14 W5 第 9 条）。
+   *
+   * 刻意**只读**：不获取运行锁、不修改任何记录。排障路径上做写操作是最糟的设计。
+   *
+   * `allowCreating: true`：体检必须能诊断"创建未完成"这种状态——那正是最需要被
+   * 诊断的情况之一，若沿用 `requireIndex` 的中间态拒绝就会永远看不到它。
+   */
+  async diagnose(pipelineId: string, actor: ActorContext): Promise<PipelineDiagnostics> {
+    assertActor(actor)
+    // 只读，但暴露的是部署层面的排障信息，因此要运维角色。
+    assertOperatorRole(actor, '数据根体检')
+    assertSafeIdentifier(pipelineId, 'pipelineId')
+
+    const { manifest, config, backend, checkpointBase } = await this.locate(pipelineId, actor, { allowCreating: true })
+    const health = await backend.diagnose()
+    // 索引扫描：不可读项**显式列出**（不静默跳过），否则"恢复扫描看不见某条"无从解释。
+    const scan = await scanPipelineIndexFrom(this.indexStore)
+    // 用量坏行：**直接读用量日志**，不走 `getUsage`。
+    //
+    // 为什么不能用 `getUsage`：它要 `loadRun`（检查点 + 索引都必须可读）。而体检恰恰
+    // 要在**数据坏了的时候**能跑——实测中"检查点损坏"与"创建未完成"两种情况下，
+    // `getUsage` 会先抛 `StorageCorruptError` / `conflict`，于是体检永远报不出那件事。
+    // 排障工具依赖被排查的对象健康，是自相矛盾的。
+    const usageRead = await backend.ports.usage.read(pipelineId)
+    const lock = await inspectPipelineLock(checkpointBase, pipelineId)
+
+    const creationState: 'creating' | 'ready' = manifest.creationState === 'creating' ? 'creating' : 'ready'
+    const now = Date.now()
+    const heartbeatAt = lock.owner?.heartbeatAt ?? null
+    return {
+      pipelineId,
+      projectId: config.projectId,
+      tenantId: config.scope?.tenantId ?? null,
+      backend: { name: health.backend, schemaVersion: health.schemaVersion, ok: health.ok },
+      storage: health.diagnostics,
+      index: { entries: scan.entries.length, unreadable: scan.unreadable },
+      usageSkippedLines: usageRead.skipped.length,
+      creationState,
+      lock: {
+        present: lock.present,
+        ownerId: lock.owner?.ownerId ?? null,
+        heartbeatAt,
+        ageMs: heartbeatAt === null ? null : now - heartbeatAt,
+      },
+      attentionNeeded: !health.ok
+        || scan.unreadable.length > 0
+        || usageRead.skipped.length > 0
+        || creationState === 'creating',
+    }
+  }
+
   async reenter(input: ReenterInput, actor: ActorContext): Promise<Checkpoint> {
     assertActor(actor)
     // 重入会回退 cursor 并把下游标 needs-reentry——这是**运维动作**，不是只读查询
@@ -962,7 +1023,11 @@ export class FilePipelineRunService implements PipelineRunService {
   }
 
   /** 解析流水线所在项目、检查点路径与运行清单，并校验调用者作用域。 */
-  private async locate(pipelineId: string, actor: ActorContext): Promise<{
+  private async locate(
+    pipelineId: string,
+    actor: ActorContext,
+    options: { readonly allowCreating?: boolean } = {},
+  ): Promise<{
     readonly manifest: PipelineRunManifest
     readonly config: PipelineConfig
     readonly backend: StorageBackend
@@ -970,7 +1035,7 @@ export class FilePipelineRunService implements PipelineRunService {
     /** checkpoints 根（不含 pipelineId）：锁路径由它与 pipelineId 一起拼出。 */
     readonly checkpointBase: string
   }> {
-    const manifest = await this.requireIndex(pipelineId)
+    const manifest = await this.requireIndex(pipelineId, options.allowCreating === true)
     const config = await this.configOf(manifest.configRef)
     // 索引与配置漂移（改配置里的 projectId 后没重建索引）在这里被拦下，而不是串到别的项目目录。
     this.assertScope(config, manifest.projectId, actor, { kind: 'hide', pipelineId })
@@ -1293,11 +1358,14 @@ export class FilePipelineRunService implements PipelineRunService {
 
   // ── 内部：流水线索引（pipelineId → 作用域 + 配置引用）────────────────────────
 
-  private async requireIndex(pipelineId: string): Promise<PipelineRunManifest> {
+  private async requireIndex(pipelineId: string, allowCreating = false): Promise<PipelineRunManifest> {
     const entry = await this.readIndex(pipelineId)
     if (entry === null) {
       throw new PipelineRunError('not-found', `未登记的 pipeline：${pipelineId}`, { pipelineId })
     }
+    // `allowCreating` 只给**体检**用：排障恰恰要看"创建未完成"这种状态，
+    // 若这里一律抛 conflict，体检就永远诊断不了最需要诊断的情况。
+    if (entry.creationState === 'creating' && allowCreating) return entry
     // 创建中间态（索引已写、检查点未确认）**不能当成正常流水线**：
     // 它的检查点可能还不存在，继续往下走会得到莫名其妙的 not-found/storage-unavailable。
     // 这里给出**可操作**的答复，而不是把它混进 404（那会让运维以为"从来没建过"）。

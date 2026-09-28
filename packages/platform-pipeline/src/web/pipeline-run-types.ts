@@ -17,7 +17,7 @@
 
 import type { HumanGateTask, HumanGateTaskStatus } from '../runtime/persistence.ts'
 import { GateTaskBusyError } from '../runtime/persistence.ts'
-import { isStorageInfrastructureError, type StorageUnavailableError } from '../storage/ports.ts'
+import { isStorageInfrastructureError, type StorageDiagnostic, type StorageUnavailableError } from '../storage/ports.ts'
 import type { CheckpointStatus, InputLocks, ReentryRecord, StageId } from '../types.ts'
 
 // ── 作用域与身份（docs/10 §10 P0-A「明确 actor/tenant/project/pipeline scope 类型」）──
@@ -350,6 +350,54 @@ export function deriveNextAction(facts: NextActionFacts): NextActionDecision {
         ? { action: 'run', reason: '重入已登记：触发运行会级联重跑该阶段及其下游' }
         : { action: 'run', reason: '尚未开始：触发运行' }
   }
+}
+
+/**
+ * 数据根体检结果（`GET /api/pipelines/:pipelineId/diagnostics`，docs/14 W5 第 9 条）。
+ *
+ * 为什么需要它：单机部署里出问题时，运维只能看服务端日志或手工翻文件。
+ * 把已有的 `StorageBackend.diagnose()`（六类诊断码）、索引扫描、用量日志坏行、
+ * 创建中间态与运行锁现状**汇总成一份可读报告**，排障才有起点。
+ *
+ * 覆盖规划书要求的七类：配置不可读 / checkpoint 损坏 / 门任务损坏 / 索引损坏 /
+ * usage 损坏行 / 锁残留 / 版本过高。其中前两类由 `storage` 的诊断码表达
+ * （`unreadable` / `corrupt-json` / `schema-invalid`），版本问题由
+ * `unsupported-version` 与 `migration-needed` 表达。
+ */
+export interface PipelineDiagnostics {
+  readonly pipelineId: string
+  readonly projectId: string
+  readonly tenantId: string | null
+  readonly backend: {
+    readonly name: string
+    readonly schemaVersion: number
+    /** 后端自评：无任何非 `missing` 诊断时为 true。 */
+    readonly ok: boolean
+  }
+  /** 后端诊断明细。`ref` 是**相对项目根**的路径，不含绝对路径。 */
+  readonly storage: readonly StorageDiagnostic[]
+  /** 索引扫描：条数与不可读项（不可读项**显式列出**，不静默跳过）。 */
+  readonly index: {
+    readonly entries: number
+    readonly unreadable: readonly { readonly file: string; readonly reason: string }[]
+  }
+  /** 用量日志里无法解析的行数；`> 0` 表示计量不完整，不能读成"用量为 0"。 */
+  readonly usageSkippedLines: number
+  /** 创建是否收口（`creating` = 索引已写、检查点未确认，可用同一 id 重新 create 接管）。 */
+  readonly creationState: 'creating' | 'ready'
+  /**
+   * 运行锁现状。**不判定 stale**（见 `inspectPipelineLock` 的说明）：
+   * 这里只如实报告"锁目录在不在、owner 是谁、心跳多久没动"。
+   */
+  readonly lock: {
+    readonly present: boolean
+    readonly ownerId: string | null
+    readonly heartbeatAt: number | null
+    /** 心跳距今毫秒数；`heartbeatAt` 不可读时为 `null`。 */
+    readonly ageMs: number | null
+  }
+  /** 汇总：有任何需要处置的项时为 true。**不代替**逐项判断，只是给页面一个入口信号。 */
+  readonly attentionNeeded: boolean
 }
 
 /**
