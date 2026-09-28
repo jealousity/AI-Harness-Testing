@@ -125,7 +125,9 @@ function showError(container, error) {
 async function refreshHealth() {
   try {
     const health = await api('GET', '/health')
-    $('health').textContent = `服务正常 · configRef=${health.configRef} · 运行中 ${health.running.length}`
+    // `/health` 只回固定健康信息（不再回显运行中的 pipeline ID，避免未鉴权枚举旁路）。
+    // 单条流水线是否在跑，看 `GET /api/pipelines/:id` 的 `running` 字段。
+    $('health').textContent = `服务正常 · configRef=${health.configRef}`
     $('health').dataset.state = 'ok'
     if (health.trustActorHeaders) {
       $('credential-notice').textContent =

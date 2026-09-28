@@ -801,3 +801,102 @@ test('验收9：Web 与 CLI 都能查询用量与预算，读的是同一份持�
     assert.equal(missing.status, 404, JSON.stringify(missing.body))
   })
 })
+
+// ── 验收 10：Web 外壳启动与安全硬化（docs/14 W1）───────────────────────────────
+
+test('验收10a：/health 只回固定健康信息，不回显运行中的 pipeline ID（W-05）', async () => {
+  await withApp(async app => {
+    // 先造一条**正在运行/存在**的流水线：如果 /health 回显运行中 ID，这里就能观察到。
+    await createPipeline(app)
+    await app.request('POST', `/api/pipelines/${PIPELINE_ID}/run`)
+
+    const res = await app.request('GET', '/health')
+    assert.equal(res.status, 200)
+    assert.deepEqual(
+      Object.keys(res.body).sort(),
+      ['app', 'configRef', 'ok', 'trustActorHeaders'],
+      `健康响应字段被改动了：${JSON.stringify(res.body)}`,
+    )
+    assert.equal('running' in res.body, false, '不得回显运行中的 pipeline ID（未鉴权枚举旁路）')
+    assert.equal(JSON.stringify(res.body).includes(PIPELINE_ID), false,
+      `/health 不得包含任何 pipelineId：${JSON.stringify(res.body)}`)
+
+    // 单条流水线的运行状态仍可从**已鉴权**的详情接口读到，能力没有丢。
+    const detail = await app.request('GET', `/api/pipelines/${PIPELINE_ID}`)
+    assert.equal(detail.status, 200)
+    assert.equal(typeof detail.body.running, 'boolean')
+    await app.settle()
+  })
+})
+
+test('验收10b：默认关闭信任请求头时，伪造 x-actor-* 不能提权', async () => {
+  // 把服务端身份降级为 viewer：此时 admin 专属的恢复接口必须 403。
+  await withApp(async app => {
+    const forged = await fetch(`${app.baseUrl}/api/admin/recover`, {
+      method: 'POST',
+      headers: { 'x-actor-id': 'attacker', 'x-actor-roles': 'admin', 'x-actor-tenant': TENANT_ID },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    })
+    assert.equal(forged.status, 403,
+      '未开启 PLATFORM_TRUST_ACTOR_HEADERS 时请求头必须被完全忽略（伪造 admin 无效）')
+  }, {}, { PLATFORM_ACTOR_ROLES: 'viewer' })
+})
+
+test('验收10c：PLATFORM_MAX_BODY 真的生效，超大请求体被拒（W-06）', async () => {
+  await withApp(async app => {
+    // 上限压到 1 KiB：默认 64 KiB 的请求体会被拒。
+    const oversized = await fetch(`${app.baseUrl}/api/projects/${PROJECT_ID}/pipelines`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pipelineId: 'x'.repeat(4096) }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    })
+    assert.equal(oversized.status, 400, `超大请求体必须被拒，实际 ${oversized.status}`)
+    const payload = await oversized.json() as any
+    assert.equal(payload?.error?.code, 'invalid-request')
+
+    // 上限内的请求仍然正常。
+    const ok = await app.request('POST', `/api/projects/${PROJECT_ID}/pipelines`, { pipelineId: PIPELINE_ID })
+    assert.equal(ok.status, 202, JSON.stringify(ok.body))
+  }, {}, { PLATFORM_MAX_BODY: '1024' })
+})
+
+test('验收10d：非法启动配置让服务**启动即失败**，不留假健康的半启动状态', async () => {
+  // `PLATFORM_MAX_BODY=NaN` 是 W-06 的原型：`Number('NaN')` 得到 NaN，
+  // 而 `size > NaN` 恒为 false，请求体上限静默失效。修复后它必须在启动时炸掉。
+  const app = await WebApp.create({}, { PLATFORM_MAX_BODY: 'NaN' })
+  try {
+    await assert.rejects(
+      () => app.start(),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error)
+        assert.match(message, /PLATFORM_MAX_BODY/, `启动失败信息应指出具体变量：${message}`)
+        return true
+      },
+    )
+  } finally {
+    await app.stop()
+    await rm(app.dir, { recursive: true, force: true })
+  }
+})
+
+test('验收10e：非回环绑定 + 信任请求头 + 未声明可信代理 → 拒绝启动（W-07）', async () => {
+  const app = await WebApp.create({}, {
+    HOST: '0.0.0.0',
+    PLATFORM_TRUST_ACTOR_HEADERS: '1',
+  })
+  try {
+    await assert.rejects(
+      () => app.start(),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error)
+        assert.match(message, /PLATFORM_TRUST_ACTOR_HEADERS/, `应指出具体变量：${message}`)
+        assert.match(message, /PLATFORM_TRUSTED_PROXY/, `应给出出路：${message}`)
+        return true
+      },
+    )
+  } finally {
+    await app.stop()
+    await rm(app.dir, { recursive: true, force: true })
+  }
+})

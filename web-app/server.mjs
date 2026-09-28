@@ -33,8 +33,11 @@ import {
   PipelineRunError,
   assertAdminRole,
   assertOperatorRole,
+  assertStartupConfigUsable,
   errorMessageOf,
+  parseWebServerConfig,
   redactSecrets,
+  startupLogLines,
   toPipelineRunError,
 } from '../packages/platform-pipeline/src/web/index.ts'
 
@@ -43,25 +46,34 @@ const PUBLIC_DIR = join(ROOT, 'public')
 
 // ── 服务端配置（全部来自环境变量；浏览器不可覆盖）────────────────────────────
 
-const PORT = Number(process.env.PORT || 3080)
-const HOST = process.env.HOST || '127.0.0.1'
-const MAX_BODY = Number(process.env.PLATFORM_MAX_BODY || 64 * 1024)
-
+/**
+ * 全部启动配置一次性解析并校验（docs/14 W1）。
+ *
+ * **不再使用 `Number(process.env.X)`**：它会把 `NaN` / `'1e3'` / `'0x10'` 当成合法值，
+ * 而 `NaN` 参与比较恒为 false，会让请求体上限静默失效。严格解析放在
+ * `src/web/server-config.ts` 里（可被失败路径测试直接覆盖），这里只解构结果。
+ *
+ * 危险组合（非回环绑定 + 信任请求头身份且未声明可信代理）会在这一步**拒绝启动**。
+ */
+const webConfig = parseWebServerConfig(process.env)
+const PORT = webConfig.port
+const HOST = webConfig.host
+const MAX_BODY = webConfig.maxBodyBytes
 /** 平台数据根：检查点、产物、门任务、知识库都落在这里。**必填**。 */
-const DATA_ROOT = requireEnv('PLATFORM_DATA_ROOT')
+const DATA_ROOT = webConfig.dataRoot
 /** 流水线配置文件路径。**必填**：API Key 的 `apiKeyEnv` 就声明在这份配置里。 */
-const CONFIG_PATH = requireEnv('PLATFORM_CONFIG_PATH')
+const CONFIG_PATH = webConfig.configPath
 /**
  * 客户端必须使用的逻辑配置引用（docs/10 §5.3）。
  *
  * 浏览器传的是**逻辑名**而不是路径：服务端把它映射到 {@link CONFIG_PATH}。
  * 因此改配置指向不需要（也不能）由浏览器决定，路径穿越在类型上就不成立。
  */
-const CONFIG_REF = process.env.PLATFORM_CONFIG_REF || 'default'
+const CONFIG_REF = webConfig.configRef
 
 /** 人工门等待上限；缺省 `0` = 只轮询一次就让出控制权，HTTP 不挂住等真人（§5.4）。 */
-const GATE_WAIT_TIMEOUT_MS = Number(process.env.PLATFORM_GATE_WAIT_TIMEOUT_MS || 0)
-const GATE_TASK_TTL_MS = optionalNumber(process.env.PLATFORM_GATE_TASK_TTL_MS)
+const GATE_WAIT_TIMEOUT_MS = webConfig.gateWaitTimeoutMs
+const GATE_TASK_TTL_MS = webConfig.gateTaskTtlMs
 
 /**
  * 是否信任请求头里的调用者身份。
@@ -70,15 +82,10 @@ const GATE_TASK_TTL_MS = optionalNumber(process.env.PLATFORM_GATE_TASK_TTL_MS)
  * 客户端无法通过伪造请求头提权。只有在反向代理已完成真实鉴权、并会**剥除**
  * 客户端自带的同名头时才应开启。
  */
-const TRUST_ACTOR_HEADERS = process.env.PLATFORM_TRUST_ACTOR_HEADERS === '1'
+const TRUST_ACTOR_HEADERS = webConfig.trustActorHeaders
 
 /** 单操作者模式下使用的身份（默认只有 viewer：不能裁决人工门）。 */
-const SERVER_ACTOR = {
-  actorId: process.env.PLATFORM_ACTOR_ID || 'web-operator',
-  ...(process.env.PLATFORM_ACTOR_TENANT ? { tenantId: process.env.PLATFORM_ACTOR_TENANT } : {}),
-  roles: splitList(process.env.PLATFORM_ACTOR_ROLES, ['viewer']),
-  ...(process.env.PLATFORM_ACTOR_PROJECTS ? { projectIds: splitList(process.env.PLATFORM_ACTOR_PROJECTS, []) } : {}),
-}
+const SERVER_ACTOR = webConfig.serverActor
 
 /**
  * 后台运行身份：**刻意不声明任何角色**。
@@ -87,22 +94,7 @@ const SERVER_ACTOR = {
  * 因此这个身份即使被误用到裁决路径上也批准不了任何东西（"后台不得替人裁决"
  * 的机器保证，docs/10 §1 原则）。
  */
-const RUNNER_ACTOR = { actorId: process.env.PLATFORM_RUNNER_ACTOR_ID || 'web-runner' }
-
-function requireEnv(name) {
-  const value = process.env[name]
-  if (value === undefined || value.trim() === '') {
-    throw new Error(`缺少必需的环境变量 ${name}（Web 外壳不做隐式兜底）`)
-  }
-  return value
-}
-
-function optionalNumber(raw) {
-  if (raw === undefined || raw.trim() === '') return undefined
-  const value = Number(raw)
-  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`环境变量必须是非负整数：${raw}`)
-  return value
-}
+const RUNNER_ACTOR = webConfig.runnerActor
 
 function splitList(raw, fallback) {
   if (raw === undefined || raw.trim() === '') return fallback
@@ -144,8 +136,16 @@ async function loadHostFactory() {
 
 const createHost = await loadHostFactory()
 
-// 启动即加载配置：配置非法要在启动时失败，而不是等第一个请求才 500。
-await loadConfig(CONFIG_REF)
+/**
+ * 启动即加载配置并做**完整**校验（docs/14 W1 第 6 条）。
+ *
+ * `loadPipelineConfig` 只做结构解析；阶段 ACL、审批工具覆盖、规则引用、provider 引用
+ * 都推迟到第一次业务请求。只调 `loadConfig` 的后果是：`/health` 报"健康"，
+ * 而第一条 `create` 才 400/422 —— 健康检查**假绿**，运维会以为部署没问题。
+ * 因此这里把 `assertStartupConfigUsable` 一起跑，任何一条不满足都**启动失败**。
+ */
+const startupConfig = await loadConfig(CONFIG_REF)
+assertStartupConfigUsable(startupConfig)
 
 const service = new FilePipelineRunService({
   dataRoot: DATA_ROOT,
@@ -479,13 +479,19 @@ const server = createServer(async (req, res) => {
   try {
     pathname = pathnameOf(req)
     if (req.method === 'GET' && pathname === '/health') {
-      // 只回显可公开的运行时事实；不回显 dataRoot / configPath（不泄露部署布局）。
+      // 只回显**固定**健康信息（docs/14 W1 第 4 条）。
+      //
+      // 刻意不回显：
+      // - `dataRoot` / `configPath`：泄露部署布局；
+      // - **正在运行的 pipeline ID**：本服务其它路径都刻意把"存在但无权限"伪装成
+      //   `not-found` 以防枚举，而未鉴权的 `/health` 若回显运行中 ID，就是一个
+      //   绕过该设计的枚举旁路（W-05）。单条流水线的运行状态走
+      //   `GET /api/pipelines/:id` 的 `running` 字段（已鉴权、已作用域校验）。
       return json(res, 200, {
         ok: true,
         app: 'harness-web-app',
         configRef: CONFIG_REF,
         trustActorHeaders: TRUST_ACTOR_HEADERS,
-        running: runner.runningIds(),
       })
     }
 
@@ -510,8 +516,9 @@ const server = createServer(async (req, res) => {
 })
 
 server.listen(PORT, HOST, () => {
-  // 只打印监听地址与逻辑配置引用，不打印 dataRoot / configPath / 任何凭据。
-  console.log(`Harness Web listening at http://${HOST}:${PORT} (configRef=${CONFIG_REF}, trustActorHeaders=${TRUST_ACTOR_HEADERS})`)
+  // 启动日志由 `startupLogLines` 统一产出：只含监听地址、逻辑 configRef 与危险模式警告，
+  // 不含 dataRoot / configPath / 任何凭据（有测试钉住这一点）。
+  for (const line of startupLogLines(webConfig)) console.log(line)
 })
 
 function shutdown() {

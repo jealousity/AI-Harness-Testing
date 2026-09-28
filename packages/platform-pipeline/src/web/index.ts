@@ -26,6 +26,20 @@ export {
 } from './pipeline-run-service.ts'
 
 export {
+  GATE_TTL_CEILING_MS,
+  GATE_WAIT_CEILING_MS,
+  MAX_BODY_CEILING,
+  WebServerConfigError,
+  assertStartupConfigUsable,
+  assertTrustActorHeadersDeployment,
+  isLoopbackHost,
+  parseWebServerConfig,
+  startupLogLines,
+  type EnvRecord,
+  type WebServerConfig,
+} from './server-config.ts'
+
+export {
   assertTargetBaseUrlAllowed,
   assertTargetResolvedAllowed,
   isPrivateAddress,
