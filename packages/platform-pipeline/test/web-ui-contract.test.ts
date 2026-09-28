@@ -151,7 +151,11 @@ test('UI：刷新后能恢复同一条流水线（pipelineId 只进 URL，不作
   assert.match(js, /hashchange/, '需要监听 hashchange（浏览器前进/后退、手改 URL）')
   assert.match(js, /#pipeline=|pipeline=\(\[\^&\]\+\)/, 'URL 里要能解析出 pipelineId')
   // 反向：不得把运行状态存进 localStorage/sessionStorage（那会成为第二份事实来源）。
-  assert.equal(/localStorage|sessionStorage/.test(js), false,
+  //
+  // 注意断言形式：匹配 `localStorage.` 这样的**实际调用**，而不是裸词。
+  // 裸词会命中注释里"不写 localStorage"这类**反面说明**——本文件已经在 CSS 的
+  // `outline: none` 上踩过一次，这里是第二次。判据要指向"用了什么"，不是"提到了什么"。
+  assert.equal(/localStorage\s*\.|sessionStorage\s*\./.test(js), false,
     'app.js 不得使用 localStorage/sessionStorage 缓存运行状态')
 })
 

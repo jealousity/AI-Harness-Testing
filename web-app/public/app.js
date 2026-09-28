@@ -219,9 +219,71 @@ function renderPollingState() {
 
 // ── 渲染：向导与流水线列表 ───────────────────────────────────────────────────
 
-function renderWizard() {
-  $('wizard').hidden = false
+function renderEmptyState() {
+  $('empty-state').hidden = false
   $('workspace').hidden = true
+}
+
+// ── 通用配置（左侧一级菜单）与新建对话框 ────────────────────────────────────
+
+/**
+ * 读取左侧「通用配置」。
+ *
+ * 这些值只活在**本次会话的内存里**（不写 localStorage）：运行状态一律来自服务端，
+ * 浏览器不做第二份事实来源。刷新页面后需要重新填一次——这是刻意的取舍。
+ */
+function generalConfig() {
+  const text = id => $(id).value.trim()
+  const nonNegative = id => {
+    const raw = text(id)
+    if (raw === '') return undefined
+    const value = Number(raw)
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new ApiError('invalid-request', `${id} 必须是非负整数`, 400, {})
+    }
+    return value
+  }
+  return {
+    projectId: text('g-project'),
+    providerName: text('g-provider'),
+    rulesetVersion: text('g-ruleset'),
+    maxGateRetries: nonNegative('g-retries'),
+    gateWaitTimeoutMs: nonNegative('g-gatewait'),
+    gateTaskTtlMs: nonNegative('g-ttl'),
+  }
+}
+
+/** 把当前通用配置摘到对话框里，避免用户以为漏填了。 */
+function renderCreateContext() {
+  const general = generalConfig()
+  const parts = [
+    `项目 ${general.projectId === '' ? '（未填）' : general.projectId}`,
+    `provider ${general.providerName === '' ? '默认' : general.providerName}`,
+    `规则集 ${general.rulesetVersion === '' ? '默认' : general.rulesetVersion}`,
+    `重试 ${general.maxGateRetries ?? '默认'}`,
+    `门等待 ${general.gateWaitTimeoutMs ?? '默认'}`,
+    `TTL ${general.gateTaskTtlMs ?? '默认'}`,
+  ]
+  $('create-context').textContent = `将使用：${parts.join(' · ')}`
+}
+
+function openCreateDialog() {
+  clearOut('out-create')
+  $('p-pipeline').value = ''
+  $('p-requirement').value = ''
+  $('p-target').value = ''
+  $('p-diag').value = ''
+  renderCreateContext()
+  const dialog = $('create-dialog')
+  if (typeof dialog.showModal === 'function') dialog.showModal()
+  else dialog.setAttribute('open', '')
+  $('p-pipeline').focus()
+}
+
+function closeCreateDialog() {
+  const dialog = $('create-dialog')
+  if (typeof dialog.close === 'function') dialog.close()
+  else dialog.removeAttribute('open')
 }
 
 function renderList() {
@@ -822,7 +884,7 @@ async function refresh() {
   state.busy = true
   try {
     if (state.pipelineId === null) {
-      renderWizard()
+      renderEmptyState()
       state.list = (await api('GET', '/api/pipelines')).pipelines
       renderList()
       state.lastError = null
@@ -843,7 +905,7 @@ async function refresh() {
     state.events = events.events
     state.lastError = null
 
-    $('wizard').hidden = true
+    $('empty-state').hidden = true
     $('workspace').hidden = false
 
     renderSummary()
@@ -876,7 +938,7 @@ async function refresh() {
     // 503 不显示成"没有流水线"：给出明确的基础设施提示 + 重试入口。
     if (state.pipelineId === null) {
       $('pipeline-list').replaceChildren()
-      showOut('out-wizard', describeError(error), 'error')
+      showOut('out-main', describeError(error), 'error')
     } else {
       $('conn').dataset.state = 'error'
       $('conn').textContent = '读取失败'
@@ -915,27 +977,34 @@ function closePipeline() {
 }
 
 async function createPipeline(form) {
+  const general = generalConfig()
+  if (general.projectId === '') {
+    throw new ApiError('invalid-request', '请先在左侧「通用配置」里填项目 ID', 400, {})
+  }
+
   const data = new FormData(form)
-  const body = { pipelineId: String(data.get('pipelineId') ?? '').trim() }
-  for (const field of ['requirementInput', 'providerName', 'targetBaseUrl', 'rulesetVersion']) {
+  const pipelineId = String(data.get('pipelineId') ?? '').trim()
+  if (pipelineId === '') throw new ApiError('invalid-request', '流水线 ID 必填', 400, {})
+
+  // 通用配置来自左侧一级菜单；这里只补**每条流水线特有**的字段。
+  const body = {
+    pipelineId,
+    ...(general.providerName === '' ? {} : { providerName: general.providerName }),
+    ...(general.rulesetVersion === '' ? {} : { rulesetVersion: general.rulesetVersion }),
+    ...(general.maxGateRetries === undefined ? {} : { maxGateRetries: general.maxGateRetries }),
+    ...(general.gateWaitTimeoutMs === undefined ? {} : { gateWaitTimeoutMs: general.gateWaitTimeoutMs }),
+    ...(general.gateTaskTtlMs === undefined ? {} : { gateTaskTtlMs: general.gateTaskTtlMs }),
+  }
+  for (const field of ['requirementInput', 'targetBaseUrl']) {
     const value = String(data.get(field) ?? '').trim()
     if (value !== '') body[field] = value
-  }
-  for (const field of ['maxGateRetries', 'gateWaitTimeoutMs', 'gateTaskTtlMs']) {
-    const raw = String(data.get(field) ?? '').trim()
-    if (raw === '') continue
-    const value = Number(raw)
-    if (!Number.isSafeInteger(value) || value < 0) {
-      throw new ApiError('invalid-request', `${field} 必须是非负整数`, 400, {})
-    }
-    body[field] = value
   }
   const diag = String(data.get('diagCredentials') ?? '').split(',').map(item => item.trim()).filter(item => item !== '')
   if (diag.length > 0) body.diagCredentials = diag
 
-  const projectId = String(data.get('projectId') ?? '').trim()
-  const summary = await api('POST', `/api/projects/${encodeURIComponent(projectId)}/pipelines`, body)
-  showOut('out-wizard', `已创建：${summary.pipelineId}（status=${summary.status}）`, 'ok')
+  const summary = await api('POST', `/api/projects/${encodeURIComponent(general.projectId)}/pipelines`, body)
+  closeCreateDialog()
+  showOut('out-main', `已创建并打开：${summary.pipelineId}（status=${summary.status}）`, 'ok')
   // 创建成功自动打开该流水线（要求 4）。
   openPipeline(summary.pipelineId)
 }
@@ -944,21 +1013,21 @@ async function triggerRun() {
   try {
     const result = await api('POST', `/api/pipelines/${encodeURIComponent(state.pipelineId)}/run`)
     if (result.started) {
-      showOut('out-wizard',
+      showOut('out-main',
         '已在后台触发运行。人工门等待超时后本次运行以 waiting-human 结束；裁决后再次触发即续跑。', 'ok')
     } else if (result.reason === 'already-running') {
-      showOut('out-wizard', '该流水线已有后台运行在进行，等它结束或停在人工门后再操作。', 'warn')
+      showOut('out-main', '该流水线已有后台运行在进行，等它结束或停在人工门后再操作。', 'warn')
     } else {
       // **前置校验失败**：服务端在启动后台任务之前就拦下了它。
       // 这是配置/环境问题——重复点击不会变好，必须说清楚，否则用户只会反复点。
-      showOut('out-wizard',
+      showOut('out-main',
         `未启动运行：${result.reason}\n\n`
         + '这是配置或环境问题（例如 provider 凭据环境变量没设），重复点击不会变好；'
         + '请先按上面的提示修好再重试。', 'error')
     }
     await refresh()
   } catch (error) {
-    showOut('out-wizard', describeError(error), 'error')
+    showOut('out-main', describeError(error), 'error')
     if (error instanceof ApiError && error.httpStatus === 409) await refresh()
   }
 }
@@ -966,26 +1035,26 @@ async function triggerRun() {
 async function cancelRun() {
   try {
     const result = await api('POST', `/api/pipelines/${encodeURIComponent(state.pipelineId)}/cancel`)
-    showOut('out-wizard', result.cancelled
+    showOut('out-main', result.cancelled
       ? '已发送取消信号（后台运行会在下一个安全点退出）。'
       : '当前没有本进程内的后台运行可取消。', 'warn')
     await refresh()
   } catch (error) {
-    showOut('out-wizard', describeError(error), 'error')
+    showOut('out-main', describeError(error), 'error')
   }
 }
 
 async function recover() {
   try {
     const { outcomes } = await api('POST', '/api/admin/recover')
-    showOut('out-wizard', outcomes.length === 0
+    showOut('out-main', outcomes.length === 0
       ? '没有需要恢复的流水线。'
       : outcomes.map(item => `${item.pipelineId} → ${item.action}`
         + `${item.started ? '（已续跑）' : ''}`
         + `${item.detail === null ? '' : `：${item.detail}`}`).join('\n'), 'ok')
     await refresh()
   } catch (error) {
-    showOut('out-wizard', describeError(error), 'error')
+    showOut('out-main', describeError(error), 'error')
   }
 }
 
@@ -1017,10 +1086,10 @@ async function decideGate(task, action, note, decisionId) {
       expectedUpdatedAt: task.updatedAt,
       decisionId,
     })
-    showOut('out-wizard', `已裁决 ${task.stageId} → ${action}；再次触发运行即消费该裁决。`, 'ok')
+    showOut('out-main', `已裁决 ${task.stageId} → ${action}；再次触发运行即消费该裁决。`, 'ok')
     await refresh()
   } catch (error) {
-    showOut('out-wizard', describeError(error), 'error')
+    showOut('out-main', describeError(error), 'error')
     if (error instanceof ApiError && error.httpStatus === 409) await refresh()
   }
 }
@@ -1031,31 +1100,40 @@ async function cancelGate(task, note) {
       pipelineId: state.pipelineId,
       note,
     })
-    showOut('out-wizard', result.cancelled ? `已取消门任务 ${result.task.gateTaskId}。` : '取消未生效。', 'warn')
+    showOut('out-main', result.cancelled ? `已取消门任务 ${result.task.gateTaskId}。` : '取消未生效。', 'warn')
     await refresh()
   } catch (error) {
-    showOut('out-wizard', describeError(error), 'error')
+    showOut('out-main', describeError(error), 'error')
   }
 }
 
 // ── 事件绑定 ─────────────────────────────────────────────────────────────────
 
 $('create-form').addEventListener('submit', async event => {
+  // `method="dialog"` 会在提交时自动关闭对话框；这里必须拦下来，
+  // 否则创建失败时错误提示会随对话框一起消失。
   event.preventDefault()
   try {
     await createPipeline(event.target)
   } catch (error) {
-    showOut('out-wizard', describeError(error), 'error')
+    showOut('out-create', describeError(error), 'error')
   }
 })
+
+$('btn-new-pipeline').addEventListener('click', () => { openCreateDialog() })
+$('btn-empty-new').addEventListener('click', () => { openCreateDialog() })
+$('btn-create-cancel').addEventListener('click', () => { closeCreateDialog() })
+// 通用配置变化时同步对话框里的摘要。
+for (const id of ['g-project', 'g-provider', 'g-ruleset', 'g-retries', 'g-gatewait', 'g-ttl']) {
+  $(id).addEventListener('input', () => { renderCreateContext() })
+}
 
 $('btn-list').addEventListener('click', async () => {
   try {
     state.list = (await api('GET', '/api/pipelines')).pipelines
-    $('list-filters').hidden = false
     renderList()
   } catch (error) {
-    showOut('out-wizard', describeError(error), 'error')
+    showOut('out-main', describeError(error), 'error')
   }
 })
 
@@ -1101,8 +1179,8 @@ void (async () => {
   // 要求 11：刷新页面后恢复到同一条流水线（pipelineId 来自 URL，不是本地缓存的状态）。
   const match = /pipeline=([^&]+)/.exec(location.hash)
   if (match !== null) state.pipelineId = decodeURIComponent(match[1])
-  else $('list-filters').hidden = false
   renderPollingState()
+  renderCreateContext()
   renderDiagnostics(null)
   await refresh()
 })()

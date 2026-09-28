@@ -73,10 +73,51 @@ html, body {
 
 /* ── 布局 ─────────────────────────────────────────────────────────────────── */
 
-main {
-  max-width: 1100px; margin: 0 auto; padding: 16px 20px 64px;
-  display: flex; flex-direction: column; gap: 14px;
+/* 一级菜单（左）+ 主内容（右）的两栏布局。窄屏退化为单栏。 */
+.shell {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 16px;
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 16px 20px 64px;
+  align-items: start;
 }
+main {
+  display: flex; flex-direction: column; gap: 14px;
+  min-width: 0;   /* 允许内部的长内容收缩，不把栅格撑破 */
+}
+
+/* ── 左侧一级菜单 ─────────────────────────────────────────────────────────── */
+
+.sidebar {
+  position: sticky; top: 72px;
+  display: flex; flex-direction: column; gap: 12px;
+  max-height: calc(100vh - 92px);
+  overflow-y: auto;
+}
+.side-block {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 12px 14px;
+}
+.side-block > h2 { margin: 0 0 8px; font-size: 14px; }
+.side-block > label { margin-bottom: 8px; }
+.side-block > button { width: 100%; }
+.side-block .filters { flex-direction: column; gap: 8px; margin: 10px 0 8px; }
+.side-block .pipeline-list { margin-top: 8px; }
+/* 侧栏窄，列表项竖排，避免横向溢出。 */
+.side-block .pipeline-list li { flex-direction: column; align-items: stretch; gap: 4px; }
+
+/* ── 新建流水线对话框 ─────────────────────────────────────────────────────── */
+
+dialog#create-dialog {
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 0; width: min(560px, calc(100vw - 40px));
+}
+dialog#create-dialog::backdrop { background: rgb(28 31 36 / 35%); }
+dialog#create-dialog form { padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
+dialog#create-dialog h2 { margin: 0; font-size: 16px; }
+dialog#create-dialog .actions { margin-top: 4px; }
 
 .panel {
   background: var(--panel); border: 1px solid var(--line);
@@ -252,8 +293,13 @@ table.usage th { color: var(--muted); font-weight: 500; font-size: 12px; }
 .out[data-kind="ok"] { background: #eaf7ee; border-color: #b7dfc2; color: var(--ok); }
 .out[data-kind="warn"] { background: #fdf6e3; border-color: #f0d9a8; color: var(--warn); }
 
+@media (max-width: 900px) {
+  /* 单栏：侧栏回到文档流顶部，不再 sticky（否则小屏上它会占掉半屏）。 */
+  .shell { grid-template-columns: 1fr; padding: 12px 12px 48px; }
+  .sidebar { position: static; max-height: none; }
+}
+
 @media (max-width: 560px) {
-  main { padding: 12px 12px 48px; }
   .topbar { padding: 10px 12px; }
   .stepper li { min-width: 132px; }
   .actions button { flex: 1 1 auto; }
