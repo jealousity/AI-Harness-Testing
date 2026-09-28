@@ -11,11 +11,13 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { appendFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { readdir, stat } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 
 import type { PipelineConfig } from '../src/types.ts'
 import { resolvePlatformRoots } from '../src/platform-roots.ts'
@@ -23,6 +25,8 @@ import { createFileStorageBackendFromRoots } from '../src/storage/file/index.ts'
 import { FilePipelineRunService } from '../src/web/pipeline-run-service.ts'
 import { PipelineRunError } from '../src/web/pipeline-run-types.ts'
 import { CREATE, REVIEWER, SCOPE, ScriptedHost, baseConfig } from './web-fixtures.ts'
+
+const here = dirname(fileURLToPath(import.meta.url))
 
 const OPERATOR = { actorId: 'ops-1', tenantId: 'acme', roles: ['operator'] as const }
 const VIEWER = { actorId: 'viewer-1', tenantId: 'acme', roles: ['viewer'] as const }
@@ -187,4 +191,59 @@ test('W5：体检要求 operator 角色（viewer 被拒），不存在返回 404
   const missing = await service.diagnose('nope', OPERATOR).then(() => null, (error: unknown) => error)
   assert.ok(missing instanceof PipelineRunError)
   assert.equal(missing.code, 'not-found')
+})
+
+// ── CLI 形态：数据根体检命令（docs/14 W5 第 9 条"命令/接口"）─────────────────
+
+/**
+ * 跑一次 `cli.ts diagnose`，返回退出码与解析后的输出。
+ *
+ * 为什么 CLI 形态值得单独测：它是**服务起不来时**唯一能用的排障手段，
+ * 因此必须能独立跑（不依赖 service / 角色 / HTTP），并且要有**可判断的退出码**——
+ * 否则巡检脚本只能靠人去读 JSON。
+ */
+async function runDiagnoseCli(): Promise<{ readonly code: number | null; readonly output: any }> {
+  const cli = join(here, '..', 'src', 'cli.ts')
+  const configPath = join(dir, 'pipeline.json')
+  await writeFile(configPath, JSON.stringify(config, null, 2), 'utf8')
+  const child = spawn(process.execPath, [cli, 'diagnose', '--config', configPath, '--data-root', dir], {
+    cwd: join(here, '..'),
+  })
+  let out = ''
+  let err = ''
+  child.stdout.on('data', chunk => { out += chunk.toString('utf8') })
+  child.stderr.on('data', chunk => { err += chunk.toString('utf8') })
+  const code = await new Promise<number | null>(resolve => { child.on('close', resolve) })
+  assert.notEqual(out.trim(), '', `CLI 没有输出：stderr=${err}`)
+  return { code, output: JSON.parse(out) }
+}
+
+test('W5：CLI 体检命令在健康数据根上退出码 0，并逐条列出流水线', async () => {
+  const service = serviceOf(new ScriptedHost())
+  await service.create(CREATE, REVIEWER)
+
+  const { code, output } = await runDiagnoseCli()
+  assert.equal(code, 0, `健康数据根必须退出 0：${JSON.stringify(output)}`)
+  assert.equal(output.attentionNeeded, false)
+  assert.deepEqual(output.pipelines.map((item: any) => item.pipelineId), ['pipe-1'])
+  assert.equal(output.index.entries, 1)
+  // 输出不得包含数据根的绝对路径（不泄露部署布局）。
+  assert.equal(JSON.stringify(output).includes(dir), false)
+})
+
+test('W5：CLI 体检命令在坏数据根上退出码 2，并把损坏项报出来', async () => {
+  const service = serviceOf(new ScriptedHost())
+  await service.create(CREATE, REVIEWER)
+  // 先跑一次：用量日志是**运行之后才存在**的，直接 appendFile 会 ENOENT。
+  await service.run('pipe-1', REVIEWER)
+  // 弄坏检查点与用量日志：两类问题都要出现在同一份报告里。
+  await writeFile(join(projectRoot(), 'checkpoints', 'pipe-1', 'checkpoint.json'), '{ 坏 JSON', 'utf8')
+  await appendFile(join(projectRoot(), 'usage', 'pipe-1.jsonl'), '{ 坏行\n', 'utf8')
+
+  const { code, output } = await runDiagnoseCli()
+  assert.equal(code, 2, `有问题时必须退出 2（巡检脚本要能判断）：${JSON.stringify(output)}`)
+  assert.equal(output.attentionNeeded, true)
+  assert.ok(output.storage.some((item: any) => item.code === 'corrupt-json'),
+    `必须报出 checkpoint 损坏：${JSON.stringify(output.storage)}`)
+  assert.equal(output.pipelines[0].usageSkippedLines, 1, '用量坏行也要报出来')
 })

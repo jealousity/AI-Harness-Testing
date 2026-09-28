@@ -15,7 +15,7 @@
 import { join } from 'node:path'
 
 import { loadCheckpoint } from './checkpoint.ts'
-import { acquirePipelineLock, fileLockAudit, lockAuditPath } from './checkpoint-lock.ts'
+import { acquirePipelineLock, fileLockAudit, inspectPipelineLock, lockAuditPath } from './checkpoint-lock.ts'
 import { loadPipelineConfig } from './config.ts'
 import { validatePipelineAcl } from './acl.ts'
 import { STAGE_ORDER, type StageId } from './types.ts'
@@ -23,6 +23,8 @@ import { budgetFailuresOf, fileUsageStore, retryFactsOf, summarizeUsage, usageDi
 import { ingestKnowledgeFile } from './knowledge-import.ts'
 import { MarkdownKnowledgeStore } from './stores/markdown.ts'
 import { resolvePlatformRoots } from './platform-roots.ts'
+import { createFileStorageBackendFromRoots } from './storage/file/index.ts'
+import { scanPipelineIndex } from './web/pipeline-run-service.ts'
 import {
   buildGateEngine,
   createCheckpointHost,
@@ -160,6 +162,69 @@ async function usage(args: readonly string[]): Promise<void> {
     skippedLines: read.skipped.length,
   })
   printJson({ ...summary, checkpointFound: checkpoint !== null, events: read.events.length })
+}
+
+/**
+ * 数据根体检（docs/14 W5 第 9 条的命令行形态）。
+ *
+ * 与 `GET /api/pipelines/:id/diagnostics` **同一套判据**，但刻意不依赖服务：
+ * 出事的时候服务可能根本起不来，排障工具必须能独立跑。因此它直接读文件后端。
+ *
+ * 覆盖规划书要求的七类：配置不可读 / checkpoint 损坏 / 门任务损坏（后两类由后端
+ * `diagnose()` 的诊断码表达）/ 索引损坏 / usage 损坏行 / 锁残留 / 版本过高
+ * （`unsupported-version` 与 `migration-needed`）。
+ *
+ * **退出码**：`0` = 未发现需要处置的项；`2` = 有。给巡检脚本留一个可判断的信号
+ * ——否则"体检通过"只能靠人去读 JSON。
+ */
+async function diagnose(args: readonly string[]): Promise<void> {
+  const cfg = await loadPipelineConfig(requireArg(args, '--config'))
+  const dataRoot = requireArg(args, '--data-root')
+  const roots = resolvePlatformRoots(dataRoot, cfg)
+  const backend = createFileStorageBackendFromRoots(roots)
+  const only = argValue(args, '--pipeline-id')
+
+  const health = await backend.diagnose()
+  const scan = await scanPipelineIndex(dataRoot)
+  const entries = only === undefined
+    ? [...scan.entries]
+    : scan.entries.filter(entry => entry.pipelineId === only)
+  if (only !== undefined && entries.length === 0) {
+    throw new Error(`未登记的 pipeline：${only}（索引里没有它）`)
+  }
+
+  const pipelines = []
+  for (const entry of entries.sort((a, b) => (a.pipelineId < b.pipelineId ? -1 : 1))) {
+    const read = await backend.ports.usage.read(entry.pipelineId)
+    const lock = await inspectPipelineLock(roots.checkpointRoot, entry.pipelineId)
+    pipelines.push({
+      pipelineId: entry.pipelineId,
+      creationState: entry.creationState === 'creating' ? 'creating' : 'ready',
+      usageSkippedLines: read.skipped.length,
+      lock: {
+        present: lock.present,
+        ownerId: lock.owner?.ownerId ?? null,
+        heartbeatAt: lock.owner?.heartbeatAt ?? null,
+        // 只报"心跳距今多久"，**不判定 stale**——判据属于获取路径（见 inspectPipelineLock）。
+        ageMs: lock.owner === null ? null : Date.now() - lock.owner.heartbeatAt,
+      },
+    })
+  }
+
+  const attentionNeeded = !health.ok
+    || scan.unreadable.length > 0
+    || pipelines.some(item => item.creationState === 'creating' || item.usageSkippedLines > 0)
+
+  printJson({
+    projectId: cfg.projectId,
+    tenantId: cfg.scope?.tenantId ?? null,
+    backend: { name: health.backend, schemaVersion: health.schemaVersion, ok: health.ok },
+    storage: health.diagnostics,
+    index: { entries: scan.entries.length, unreadable: scan.unreadable },
+    pipelines,
+    attentionNeeded,
+  })
+  if (attentionNeeded) process.exitCode = 2
 }
 
 // ── 无 Harness 运行通道 ─────────────────────────────────────────────────────
@@ -345,6 +410,7 @@ const USAGE = [
   '  node src/cli.ts status --config <pipeline.yaml> --data-root <dir> --pipeline-id <id>',
   '  node src/cli.ts status --checkpoint-root <dir> --pipeline-id <id>',
   '  node src/cli.ts usage --config <pipeline.yaml> --data-root <dir> --pipeline-id <id>',
+  '  node src/cli.ts diagnose --config <pipeline.yaml> --data-root <dir> [--pipeline-id <id>]  # 数据根体检；有问题时退出码 2',
   '  node src/cli.ts reenter --config <pipeline.yaml> --data-root <dir> --pipeline-id <id> --stage <id> --by <actor> --reason <text>',
   '  node src/cli.ts gate-list --config <pipeline.yaml> --data-root <dir> [--pipeline-id <id>] [--status <s>] [--sweep]',
   '  node src/cli.ts gate-claim --config <pipeline.yaml> --data-root <dir> --task <id> --actor <actor> [--ttl-ms <n>]',
@@ -360,6 +426,7 @@ async function main(): Promise<void> {
   if (command === 'validate') { await validate(requireArg(args, '--config')); return }
   if (command === 'status') { await status(args); return }
   if (command === 'usage') { await usage(args); return }
+  if (command === 'diagnose') { await diagnose(args); return }
   if (command === 'run') { await run(args); return }
   if (command === 'reenter') { await reenter(args); return }
   if (command === 'gate-list') { await gateList(args); return }
