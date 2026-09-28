@@ -48,7 +48,20 @@ export interface TriggerResult {
 }
 
 /** 恢复扫描对单条流水线应采取的动作。 */
-export type RecoveryAction = 'resume' | 'await-human' | 'terminal' | 'unreadable'
+export type RecoveryAction =
+  | 'resume'
+  | 'await-human'
+  | 'terminal'
+  | 'unreadable'
+  /**
+   * 创建停在中间态（`creationState === 'creating'`）：索引已写、检查点未确认
+   * （docs/14 W2 第 5 条）。
+   *
+   * **不是** `unreadable`：记录本身完全可读，只是创建没写完。两者处置不同——
+   * `unreadable` 要去修那条记录，`creation-incomplete` 只需要用同一 pipelineId
+   * 重新 create（服务层会接管中间态）。
+   */
+  | 'creation-incomplete'
 
 /**
  * 恢复动作判定（纯函数，便于单测）。
@@ -240,6 +253,19 @@ export class AsyncPipelineRunner {
     }))
 
     for (const entry of scan.entries) {
+      // 创建中间态必须在**调用 service.get 之前**判掉：`requireIndex` 会因中间态抛
+      // `conflict`，落到下面的笼统 catch 里就会被误报成 `unreadable`——
+      // 而"记录读不了"和"创建没写完"是完全不同的两件事。
+      if (entry.creationState === 'creating') {
+        outcomes.push({
+          pipelineId: entry.pipelineId,
+          action: 'creation-incomplete',
+          status: null,
+          started: false,
+          detail: '创建在写入检查点前中断；用同一 pipelineId 重新 create 即可接管',
+        })
+        continue
+      }
       // 按每条流水线的真实租户补齐身份：assertScopeMatch 要求租户精确匹配。
       const actor = withTenant(this.options.actor, entry.tenantId)
       try {

@@ -57,6 +57,7 @@ import { createFileStorageBackendFromRoots } from '../storage/file/index.ts'
 import { createFileHostRecordStore } from '../storage/file/records.ts'
 import {
   StorageCorruptError,
+  StorageUnavailableError,
   assertBackendPorts,
   assertStorageBackendHealthy,
   type HostRecordStore,
@@ -259,6 +260,18 @@ export interface PipelineRunManifest {
   readonly tenantId: string | null
   readonly projectId: string
   readonly configRef: string
+  /**
+   * 创建过程是否已收口（docs/14 W2 第 5 条）。
+   *
+   * `'creating'` = **索引已写、检查点尚未确认**的中间态。它必须**可见**：
+   * 创建要在"索引"与"检查点"两处落盘，两处之间崩溃时，若索引后写就会留下
+   * 一份谁也看不见的孤儿检查点（列表查不到、恢复扫描扫不到、`get` 说 404），
+   * 运维只能看到"凭空消失的一次创建"。改为索引先写 `creating`、检查点成功后再翻成
+   * `ready`，中间态就始终可被恢复扫描报告（`creation-incomplete`）。
+   *
+   * 历史索引没有这个字段，按 `'ready'` 解释（向后兼容，无需迁移）。
+   */
+  readonly creationState?: 'creating' | 'ready'
   /** 创建时生效的规则集版本；历史索引没有这个字段。 */
   readonly rulesetVersion?: string
   /** 创建时间（毫秒）；历史索引没有这个字段。 */
@@ -332,6 +345,11 @@ export async function scanPipelineIndexFrom(store: HostRecordStore): Promise<Pip
       }
       entries.push(value)
     } catch (error) {
+      // **基础设施故障必须整体抛出**，不能降级成"这一条读不了"（docs/14 W2 第 4 条）。
+      // 否则外部后端断开时，列表会返回一个**空的成功结果**、恢复扫描会报几条 unreadable，
+      // 运维看到的是"没有流水线"而不是"存储挂了"——两件事的处置完全不同。
+      // 只有数据层面的问题（记录损坏、形状不符、键不一致）才只影响这一条。
+      if (error instanceof StorageUnavailableError) throw error
       unreadable.push({ file: `${id}.json`, reason: errorMessageOf(error) })
     }
   }
@@ -372,6 +390,18 @@ function isIndexEntry(value: unknown): value is PipelineRunManifest {
     && optionalFiniteNumber(candidate, 'gateWaitTimeoutMs')
     && optionalFiniteNumber(candidate, 'gateTaskTtlMs')
     && optionalNonEmptyStringArray(candidate, 'diagCredentials')
+    && optionalCreationState(candidate)
+}
+
+/**
+ * `creationState` 的形状校验。
+ *
+ * 出现即必须是两个合法取值之一——**不能静默忽略**：把 `creationState: 'createing'`
+ * 当成"没写"，会让一次拼写错误表现为"这条流水线已就绪"，而它其实停在中间态。
+ */
+function optionalCreationState(candidate: Record<string, unknown>): boolean {
+  const value = candidate.creationState
+  return value === undefined || value === 'creating' || value === 'ready'
 }
 
 function optionalNonEmptyString(record: Record<string, unknown>, key: string): boolean {
@@ -492,12 +522,30 @@ export class FilePipelineRunService implements PipelineRunService {
     // pipelineId 在租户/项目作用域内唯一（docs/10 §5.3）：已存在即冲突，绝不静默复用。
     // 走到这里说明台账里没有本次请求的记录，磁盘上的同 id 流水线是别人/旧版本建的。
     // 已存在但记录损坏时 readIndex 抛 storage-unavailable：宁可拒绝创建，也不覆盖坏记录。
-    if (await this.readIndex(input.pipelineId) !== null) {
+    //
+    // **例外：上一次创建停在中间态**（`creationState === 'creating'`）。那是"同一意图的
+    // 前一次尝试没写完"，指纹相同（否则走不到这里），因此允许**接管**——
+    // 否则一次崩溃就会让这个 pipelineId 永久不可用。
+    const existing = await this.readIndex(input.pipelineId)
+    if (existing !== null && existing.creationState !== 'creating') {
       throw new PipelineRunError('conflict', `pipeline 已存在：${input.pipelineId}`, { pipelineId: input.pipelineId })
     }
-    // 先落盘后返回（docs/10 §1 原则 5）：创建成功 = 磁盘上已有可恢复的初始检查点 + 清单。
-    await checkpoint.save(checkpointRoot, initialCheckpoint(input.pipelineId, config.templateVersion, rulesetVersion))
-    await this.writeIndex(manifestOf(input, config, rulesetVersion))
+
+    // 落盘顺序（docs/14 W2 第 5 条）：**索引先写 `creating`，检查点成功后翻 `ready`**。
+    //
+    // 反过来（检查点先写）的失败模式是：检查点已落盘、索引写失败 → 这条流水线
+    // 列表查不到、恢复扫描扫不到、`get` 说 404，**没有任何报告**。先写索引则最坏情况
+    // 是"一条可见的中间态记录"，恢复扫描能报 `creation-incomplete`，也能被重新 create 接管。
+    const manifest = manifestOf(input, config, rulesetVersion)
+    await this.writeIndex({ ...manifest, creationState: 'creating' })
+    try {
+      await checkpoint.save(checkpointRoot, initialCheckpoint(input.pipelineId, config.templateVersion, rulesetVersion))
+    } catch (error) {
+      // 检查点写失败：索引停在 `creating`（**故意不清理**）。删掉它反而会回到
+      // "两处都看不见"的状态；留着它，恢复扫描与 `get` 都能如实报告这次失败。
+      throw error
+    }
+    await this.writeIndex({ ...manifest, creationState: 'ready' })
 
     return {
       pipelineId: input.pipelineId,
@@ -518,7 +566,10 @@ export class FilePipelineRunService implements PipelineRunService {
 
   async list(actor: ActorContext): Promise<readonly PipelineRunSummary[]> {
     assertActor(actor)
-    const scan = await scanPipelineIndex(this.options.dataRoot)
+    // 必须用**注入的**索引存储（docs/14 W2 第 1 条）：此前这里调 `scanPipelineIndex(dataRoot)`
+    // 会重新构造一个默认文件存储，于是换了后端之后 `create/get/recover` 看外部索引、
+    // 而 `list` 看本地文件目录——同一条流水线"详情能打开、列表里没有"。
+    const scan = await scanPipelineIndexFrom(this.indexStore)
     const summaries: PipelineRunSummary[] = []
     for (const entry of scan.entries) {
       try {
@@ -953,7 +1004,22 @@ export class FilePipelineRunService implements PipelineRunService {
   ): Promise<T> {
     // 台账优先走**该项目的后端端口**（docs/11 §二「事实来源统一」）：否则换后端之后
     // 检查点在后端里、台账还在本地盘上，多副本各记各的，幂等静默失效。
-    const records = this.backendOf(config).ports.records
+    const backend = this.backendOf(config)
+    const records = backend.ports.records
+    if (records === undefined && backend.describe().requiresExternalInfrastructure) {
+      // **失败关闭**（docs/14 W2 第 3 条）：声明依赖外部基础设施的后端却不提供 `records`，
+      // 说明它的端口面不完整。此时回退到本地文件会让"检查点在外部后端、台账在本地磁盘"，
+      // 多副本各记各的 —— 幂等静默失效，且**没有任何报错**。宁可 503。
+      throw new PipelineRunError(
+        'storage-unavailable',
+        `后端 ${backend.name} 声明依赖外部基础设施，但未提供 records 端口：`
+        + '幂等台账会静默落回本地磁盘，多副本之间不再共享同一份幂等事实',
+        { backend: backend.name },
+      )
+    }
+    // 非外部后端（file/memory/自定义本地后端）仍允许 legacy 文件回退：它与其它端口
+    // 落在同一台机器上，不产生跨副本分裂。文件后端本身已提供 `records`，因此这条
+    // 回退在实践中只服务于"没实现 records 的自定义本地后端"。
     const ledger: IdempotencyLedger = records === undefined
       ? fileIdempotencyLedger(idempotencyDir(projectRoot))
       : hostRecordIdempotencyLedger(records)
@@ -1182,6 +1248,17 @@ export class FilePipelineRunService implements PipelineRunService {
     const entry = await this.readIndex(pipelineId)
     if (entry === null) {
       throw new PipelineRunError('not-found', `未登记的 pipeline：${pipelineId}`, { pipelineId })
+    }
+    // 创建中间态（索引已写、检查点未确认）**不能当成正常流水线**：
+    // 它的检查点可能还不存在，继续往下走会得到莫名其妙的 not-found/storage-unavailable。
+    // 这里给出**可操作**的答复，而不是把它混进 404（那会让运维以为"从来没建过"）。
+    if (entry.creationState === 'creating') {
+      throw new PipelineRunError('conflict', `流水线创建未完成：${pipelineId}`, {
+        pipelineId,
+        creationState: 'creating',
+        hint: '上一次 create 在写入检查点前中断。用同一 pipelineId 重新 create 即可接管；'
+          + '恢复扫描也会把它报成 creation-incomplete。',
+      })
     }
     return entry
   }

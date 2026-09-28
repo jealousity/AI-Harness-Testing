@@ -642,6 +642,24 @@ export function assertBackendPorts(backend: StorageBackend): void {
       throw new StorageUnavailableError(backend.name, 'assertBackendPorts', `必需端口缺失：${port}`)
     }
   }
+
+  // **声明依赖外部基础设施的后端必须提供 `records`**（docs/14 W2 第 3 条）。
+  //
+  // 为什么单独一条：缺 `records` 的后果不是"某个功能不可用"，而是**幂等静默失效**——
+  // 调用方会回退到本地文件台账，于是"检查点/门任务在外部后端、幂等台账在某个节点的
+  // 本地磁盘"，多副本各记各的，重复请求可能被执行两次而**没有任何报错**。
+  // 这类"静默降级"必须在装配时就炸掉，而不是等到线上才发现。
+  //
+  // 非外部后端（file / memory / 自定义本地后端）不受此限：它们与其它端口同机，
+  // 回退不产生跨副本分裂；文件后端本身也提供 `records`。
+  if (backend.describe().requiresExternalInfrastructure && !hasPort(backend.ports, 'records')) {
+    throw new StorageUnavailableError(
+      backend.name,
+      'assertBackendPorts',
+      '声明依赖外部基础设施的后端必须提供 records 端口：否则幂等台账会静默落回本地磁盘，'
+      + '多副本之间不再共享同一份幂等事实（这类降级不会有任何报错）',
+    )
+  }
 }
 
 function hasPort(ports: StoragePorts, port: string): boolean {

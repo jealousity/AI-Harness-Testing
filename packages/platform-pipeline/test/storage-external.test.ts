@@ -189,7 +189,10 @@ test('[compose] 宿主用 overrides 明确表态时，端口冲突不再报错�
   const chosen = objects.ports.artifacts
   const backend = composeStorageBackends({
     parts: [
-      { role: 'records', backend: subset(records, 'records', ['checkpoints', 'tasks', 'gateTasks', 'usage', 'audit', 'artifacts']) },
+      // 夹具必须**自洽**：`subset` 声明的 `requiresExternalInfrastructure: true`，因此
+      // 这个"外部"部分必须提供 `records` 端口——否则 `assertBackendPorts` 会以
+      // "外部后端必须提供 records" 拒绝装配（那是另一条规则，与本用例的 overrides 无关）。
+      { role: 'records', backend: subset(records, 'records', ['checkpoints', 'tasks', 'gateTasks', 'usage', 'audit', 'artifacts', 'records']) },
       { role: 'objects', backend: subset(objects, 'objects', ['artifacts']) },
     ],
     overrides: { artifacts: chosen },
