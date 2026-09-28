@@ -183,7 +183,16 @@ button[aria-busy="true"]::after { content: " …"; }
 
 /* ── 流水线列表 ───────────────────────────────────────────────────────────── */
 
+.panel-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
+.panel-head > h2 { margin: 0; }
 .filters { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0 6px; }
+
+/* 流水线列表：窄屏横向滚动，不挤压列 */
+.tablewrap { overflow-x: auto; }
+table.pipelines { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.pipelines th, table.pipelines td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line-soft); white-space: nowrap; }
+table.pipelines th { color: var(--muted); font-weight: 500; font-size: 12px; }
+table.pipelines tbody tr:hover { background: #fafbfc; }
 .pipeline-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .pipeline-list li { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 

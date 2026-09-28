@@ -219,8 +219,9 @@ function renderPollingState() {
 
 // ── 渲染：向导与流水线列表 ───────────────────────────────────────────────────
 
-function renderEmptyState() {
-  $('empty-state').hidden = false
+/** 默认视图：流水线列表（点某一行进入详情）。 */
+function renderListView() {
+  $('pipeline-list-panel').hidden = false
   $('workspace').hidden = true
 }
 
@@ -287,34 +288,38 @@ function closeCreateDialog() {
 }
 
 function renderList() {
-  const list = $('pipeline-list')
-  list.replaceChildren()
+  const body = $('pipeline-list')
+  body.replaceChildren()
   const projectId = state.filters.projectId.trim()
   const status = state.filters.status
   const visible = state.list.filter(item =>
     (projectId === '' || item.projectId === projectId) && (status === '' || item.status === status))
 
   if (visible.length === 0) {
-    list.append(el('li', {
+    const cell = el('td', {
       className: 'muted',
-      text: state.list.length === 0 ? '没有可见的流水线。' : '当前筛选条件下没有匹配的流水线。',
-    }))
+      text: state.list.length === 0 ? '还没有流水线。点右上角「＋ 新建流水线」创建一条。' : '当前筛选条件下没有匹配的流水线。',
+    })
+    cell.setAttribute('colspan', '6')
+    body.append(el('tr', {}, [cell]))
     return
   }
+
   for (const item of visible) {
-    list.append(el('li', {}, [
-      el('button', {
-        text: `打开 ${item.pipelineId}`,
-        attrs: { type: 'button', 'aria-label': `打开流水线 ${item.pipelineId}` },
-        on: { click: () => openPipeline(item.pipelineId) },
-      }),
-      el('span', { className: 'mono', text: item.pipelineId }),
-      el('span', { className: 'small muted', text: item.projectId }),
-      chip(RUN_STATUS_LABELS[item.status] ?? item.status, item.status),
-      el('span', {
-        className: 'small muted',
-        text: item.nextStage === null ? '已到终态' : `下一阶段 ${item.nextStage}`,
-      }),
+    const open = el('button', {
+      className: 'primary',
+      text: '打开',
+      attrs: { type: 'button', 'aria-label': `打开流水线 ${item.pipelineId}` },
+      on: { click: () => openPipeline(item.pipelineId) },
+    })
+    body.append(el('tr', { attrs: { 'data-pipeline': item.pipelineId } }, [
+      el('td', { className: 'mono', text: item.pipelineId }),
+      el('td', { text: `${item.projectId}${item.tenantId === null ? '' : ` / ${item.tenantId}`}` }),
+      el('td', {}, [chip(RUN_STATUS_LABELS[item.status] ?? item.status, item.status)]),
+      // 列表接口只回 summary（没有 currentStage）——**不编造**，如实显示"—"。
+      el('td', { className: 'muted', text: '—' }),
+      el('td', { className: 'mono', text: item.nextStage ?? '终态' }),
+      el('td', {}, [open]),
     ]))
   }
 }
@@ -884,7 +889,7 @@ async function refresh() {
   state.busy = true
   try {
     if (state.pipelineId === null) {
-      renderEmptyState()
+      renderListView()
       state.list = (await api('GET', '/api/pipelines')).pipelines
       renderList()
       state.lastError = null
@@ -905,7 +910,7 @@ async function refresh() {
     state.events = events.events
     state.lastError = null
 
-    $('empty-state').hidden = true
+    $('pipeline-list-panel').hidden = true
     $('workspace').hidden = false
 
     renderSummary()
@@ -937,8 +942,10 @@ async function refresh() {
     state.lastError = error
     // 503 不显示成"没有流水线"：给出明确的基础设施提示 + 重试入口。
     if (state.pipelineId === null) {
-      $('pipeline-list').replaceChildren()
-      showOut('out-main', describeError(error), 'error')
+      const cell = el('td', { className: 'muted', text: describeError(error) })
+      cell.setAttribute('colspan', '6')
+      $('pipeline-list').replaceChildren(el('tr', {}, [cell]))
+      showOut('out-list', describeError(error), 'error')
     } else {
       $('conn').dataset.state = 'error'
       $('conn').textContent = '读取失败'
@@ -972,6 +979,7 @@ function openPipeline(pipelineId) {
 function closePipeline() {
   state.pipelineId = null
   state.view = null
+  // 回列表：清掉 hash（列表是默认视图，不占 URL）。
   history.replaceState(null, '', location.pathname)
   void refresh()
 }
@@ -1121,7 +1129,6 @@ $('create-form').addEventListener('submit', async event => {
 })
 
 $('btn-new-pipeline').addEventListener('click', () => { openCreateDialog() })
-$('btn-empty-new').addEventListener('click', () => { openCreateDialog() })
 $('btn-create-cancel').addEventListener('click', () => { closeCreateDialog() })
 // 通用配置变化时同步对话框里的摘要。
 for (const id of ['g-project', 'g-provider', 'g-ruleset', 'g-retries', 'g-gatewait', 'g-ttl']) {
