@@ -873,9 +873,19 @@ async function createPipeline(form) {
 async function triggerRun() {
   try {
     const result = await api('POST', `/api/pipelines/${encodeURIComponent(state.pipelineId)}/run`)
-    showOut('out-wizard', result.started
-      ? '已在后台触发运行。人工门等待超时后本次运行以 waiting-human 结束；裁决后再次触发即续跑。'
-      : `未启动新运行：${result.reason}`, result.started ? 'ok' : 'warn')
+    if (result.started) {
+      showOut('out-wizard',
+        '已在后台触发运行。人工门等待超时后本次运行以 waiting-human 结束；裁决后再次触发即续跑。', 'ok')
+    } else if (result.reason === 'already-running') {
+      showOut('out-wizard', '该流水线已有后台运行在进行，等它结束或停在人工门后再操作。', 'warn')
+    } else {
+      // **前置校验失败**：服务端在启动后台任务之前就拦下了它。
+      // 这是配置/环境问题——重复点击不会变好，必须说清楚，否则用户只会反复点。
+      showOut('out-wizard',
+        `未启动运行：${result.reason}\n\n`
+        + '这是配置或环境问题（例如 provider 凭据环境变量没设），重复点击不会变好；'
+        + '请先按上面的提示修好再重试。', 'error')
+    }
     await refresh()
   } catch (error) {
     showOut('out-wizard', describeError(error), 'error')

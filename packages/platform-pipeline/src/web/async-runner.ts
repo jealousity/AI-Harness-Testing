@@ -42,8 +42,17 @@ export type BackgroundRunOutcome =
 /** `trigger()` 的结果。 */
 export interface TriggerResult {
   readonly started: boolean
-  /** 未启动的原因：`already-running` = 本进程已在跑同一流水线。 */
-  readonly reason: 'already-running' | null
+  /**
+   * 未启动的原因。两种形态：
+   * - `'already-running'`：本进程已在跑同一流水线；
+   * - `'<错误码>: <消息>'`：**前置校验失败**（docs/14 W5）。例如
+   *   `provider-unavailable: no usable llm provider: primary: missing API key ...`。
+   *
+   * 为什么是自由文本而不是枚举：错误码本身来自 `PipelineRunErrorCode`（已有封闭集合），
+   * 消息里带的是"具体哪个 provider / 哪个环境变量"，那正是运维需要看到的。把它压缩成
+   * 枚举会丢掉可操作性；而把它写进日志（原本的行为）会让页面完全看不到。
+   */
+  readonly reason: string | null
   readonly handle: PipelineRunHandle | null
 }
 
@@ -179,6 +188,30 @@ export class AsyncPipelineRunner {
     // 读不到会抛 PipelineRunError（not-found / scope-mismatch / config-invalid），
     // 由调用方映射成 HTTP 状态；这里刻意不吞掉。
     await this.options.service.get(pipelineId, runAs)
+
+    /**
+     * **前置校验必须在启动后台任务之前**（docs/14 W5）。
+     *
+     * 这些失败（provider 缺 Key、审批覆盖缺失…）是在宿主装配时**同步**抛的，
+     * 但它们原本发生在后台任务内部：HTTP 早就回了 `202`，失败只进服务端日志，
+     * 页面显示"尚未开始：触发运行"——用户会反复点同一个按钮而得不到任何解释。
+     *
+     * 这里把它前移。失败时**不启动**后台任务，直接告诉调用者为什么。
+     * 刻意**不吞异常**：`preflight` 里 `locate` 抛的 not-found/scope-mismatch 应当
+     * 按原样冒泡给 HTTP（那是请求级错误，不是"运行起不来"）。
+     */
+    try {
+      await this.options.service.preflight(pipelineId, runAs)
+    } catch (error) {
+      const view = toPipelineRunError(error)
+      // 请求级错误（不存在 / 越权 / 配置非法）继续冒泡：调用方要拿到正确的状态码。
+      if (view.httpStatus === 404 || view.httpStatus === 403 || view.httpStatus === 400 || view.httpStatus === 401) {
+        throw error
+      }
+      // 其余（provider-unavailable / storage-unavailable…）是"运行起不来"：
+      // 以 started:false + 原因返回，而不是启动一个注定失败的后台任务。
+      return { started: false, reason: `${view.code}: ${view.message}`, handle: null }
+    }
 
     const handle = this.registry.start(pipelineId, async signal => {
       let outcome: BackgroundRunOutcome

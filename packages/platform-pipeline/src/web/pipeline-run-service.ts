@@ -211,6 +211,13 @@ export interface PipelineRunService {
   list(actor: ActorContext): Promise<readonly PipelineRunSummary[]>
   run(pipelineId: string, actor: ActorContext, options?: RunCallOptions): Promise<RunResult>
   /**
+   * 前置校验（配置 / provider / 审批覆盖 / 检查点可读）。
+   *
+   * 供后台运行入口在**启动之前**调用：这样"明显跑不起来"的失败会同步返回给调用者，
+   * 而不是只写进服务端日志。详见实现处的文档注释。
+   */
+  preflight(pipelineId: string, actor: ActorContext): Promise<void>
+  /**
    * 回读某阶段的产物文件（`GET /api/pipelines/:pipelineId/stages/:stageId/artifact`）。
    *
    * 返回 `null` 表示该阶段尚未产出（`StageState.artifact` 为空）或产物文件已不存在；
@@ -696,6 +703,40 @@ export class FilePipelineRunService implements PipelineRunService {
       // 同时写同一份检查点——比"多占一会儿锁"危险得多。长时间阻塞靠自动续租（心跳）
       // 保证不被误判 stale。
       await lock.release()
+    }
+  }
+
+  /**
+   * **前置校验**（docs/14 W5）：跑完 `run()` 里除"取锁 + 跑 driver"之外的全部准备步骤。
+   *
+   * 为什么单独开一个方法：这些失败（配置非法、**provider 缺 Key**、审批覆盖缺失…）
+   * 都是在 `createHost()` 里**同步**抛出来的，但 `run()` 是被后台任务调用的——
+   * 于是失败只进服务端日志，HTTP 那边早就返回了 `202`。实测：缺 `PLATFORM_LLM_API_KEY`
+   * 时页面显示"尚未开始：触发运行"，用户会反复点同一个按钮而得不到任何解释。
+   *
+   * 把前置校验前移到**启动后台运行之前**，失败就能以 `started: false` + 明确 reason
+   * 回到调用者。这比"把失败持久化"更好：失败发生得更早，而且**不新增任何状态**——
+   * 用"进程内记住上次失败"来补是被架构禁止的（那会成为第二份事实来源）。
+   *
+   * **不取运行锁**：锁要留给真正的 `run()`，否则前置校验会把锁持有到后台运行结束。
+   * 因此本方法**不保证**"校验通过后 run 一定能开始"（并发、锁竞争仍可能让 run 失败）；
+   * 它只保证"明显跑不起来的配置在启动后台任务之前就被拦下"。
+   */
+  async preflight(pipelineId: string, actor: ActorContext): Promise<void> {
+    assertActor(actor)
+    assertSafeIdentifier(pipelineId, 'pipelineId')
+    const { manifest, config, backend, checkpointRoot } = await this.locate(pipelineId, actor)
+    await this.requireCheckpoint(backend, pipelineId, checkpointRoot)
+    // 组装一次宿主：provider 解析、工具 ACL、审批覆盖都在这一步发生。
+    // 宿主会被丢弃（`run()` 会自己再建一个），代价是构造开销，不是模型调用。
+    try {
+      this.createHost(this.hostOptions(config, manifest, pipelineId, undefined))
+    } catch (error) {
+      // `createHost` 抛的是**普通 Error**（provider 解析失败、审批覆盖缺失等）。
+      // 服务层的约定是"前置失败一律抛 `PipelineRunError`"，调用方才能按错误码分支；
+      // 直接透传裸 Error 会让调用方拿不到 code，只能把一切归成 500。
+      // `run()` 里的 catch 也是这么翻译的，这里保持一致。
+      throw toPipelineRunError(error)
     }
   }
 
