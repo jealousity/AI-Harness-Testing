@@ -508,6 +508,31 @@ type RunResult =
 **新增环境变量**：`PLATFORM_TRUSTED_PROXY`（`'1'` 表示"身份由可信反向代理提供"，
 是开启请求头信任且非回环绑定时的**显式表态**）。未设置时该组合拒绝启动。
 
+## 8.2 W2 落地记录（索引 / 创建 / 台账一致性）
+
+| 项 | 落地方式 | 证据 |
+|---|---|---|
+| `list()` 与 `get`/`recover` 同源 | `list()` 改用 `scanPipelineIndexFrom(this.indexStore)`（此前调 `scanPipelineIndex(dataRoot)`，会另 new 一个默认文件存储） | `test/web-index-and-creation.test.ts` |
+| 索引扫描错误分类 | 只把**数据问题**（记录损坏 / 形状不符 / 键不一致）放进 `unreadable`；`StorageUnavailableError` **整体抛出**，由外壳映射 503 | 同文件（list 与 recover 各一条） |
+| 创建中间态 | manifest/索引新增 `creationState`；落盘顺序改为 **索引(creating) → 检查点 → 索引(ready)**；允许同指纹的 create 接管中间态 | 同文件（4 条） |
+| 中间态可见性 | `get`/`list`/`run` → `conflict`(409) + `hint`；`recover()` → `creation-incomplete` + `started: false` | 同文件 |
+| 外部后端缺 `records` | `assertBackendPorts` 对 `requiresExternalInfrastructure: true` 的后端**装配即失败**；服务层另有同规则纵深防御 | 同文件（3 条） |
+
+### 新增状态与字段
+
+- **落盘**：索引/manifest 新增可选 `creationState: 'creating' | 'ready'`。
+  **历史索引没有该字段 → 按 `'ready'` 解释，无需迁移。**
+- **`RecoveryAction`** 新增 `'creation-incomplete'`（与 `'unreadable'` 区分：
+  前者只需重新 create 接管，后者要去修那条记录）。
+- **409 新增一个触发场景**：索引存在但 `creationState === 'creating'`。
+
+### 已知语义（不是缺陷）
+
+- `list()` **跳过**中间态条目（沿用"不用半成品状态冒充成功"的既有策略）。
+  中间态通过 `get`(409 + hint) 与 `recover`(creation-incomplete) 暴露。
+- 同指纹并发 create 会各自接管中间态并写检查点（原子写，后者覆盖前者）。
+  指纹覆盖全部行为参数，因此这是"同一意图的重复提交"，可接受；但它**不是**分布式事务。
+
 ---
 
 ## 9. 本轮计划新增/变更的契约
@@ -526,10 +551,10 @@ type RunResult =
 | `PipelineRunView.blockingReason` | 新增（派生） | W3 | 未实现 |
 | `PipelineRunView.gateKind`（`'stage' \| 'escalation' \| null`） | 新增（派生） | W3 | 未实现 |
 | `PipelineRunView.stale` | 新增（派生） | W3 | 未实现 |
-| `list()` 改用注入的 `indexStore` | **缺陷修复（W-01）** | W2 | 未实现 |
-| `records` 缺失时显式区分 legacy fallback 与失败关闭 | 变更 | W2 | 未实现 |
-| 索引扫描区分数据损坏与基础设施不可用 | 变更 | W2 | 未实现 |
-| 创建过程可恢复状态（`creating` → `ready`） | 新增 | W2 | 未实现 |
+| `list()` 改用注入的 `indexStore` | **缺陷修复（W-01）** | W2 | ✅ 已实现（`f46cf37`）｜`test/web-index-and-creation.test.ts` |
+| `records` 缺失时显式区分 legacy fallback 与失败关闭 | 变更 | W2 | ✅ 已实现（`f46cf37`）｜`assertBackendPorts` 对"外部后端"失败关闭；同文件 |
+| 索引扫描区分数据损坏与基础设施不可用 | 变更 | W2 | ✅ 已实现（`f46cf37`）｜`scanPipelineIndexFrom` 只把数据问题放进 `unreadable` |
+| 创建过程可恢复状态（`creating` → `ready`） | 新增 | W2 | ✅ 已实现（`f46cf37`）｜`creationState` + `RecoveryAction: 'creation-incomplete'` |
 
 **派生字段的硬约束**：`nextAction` / `currentStage` / `blockingReason` / `gateKind`
 必须由**服务端**从检查点 + 产物 + 门任务 + 后端状态推导，**不得**由浏览器缓存推断，
