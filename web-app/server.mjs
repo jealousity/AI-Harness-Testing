@@ -321,7 +321,14 @@ const ROUTES = [
     assertOperatorRole(actor, '取消运行')
     // 再确认调用者有权看这条流水线（否则等于把取消变成探测接口）。
     await service.get(pipelineId, actor)
-    json(res, 202, { pipelineId, cancelled: runner.cancel(pipelineId, 'cancelled via web api') })
+    // 统一 cancel 响应语义（docs/14 W3 第 4 条）：两个 cancel 端点都回
+    // `{ target, cancelled }`，页面可以用一套分支渲染，而不必记两种形状。
+    // `target` 把"取消后台运行"和"撤回人工门任务"这两件不同的事显式区分开。
+    json(res, 202, {
+      target: 'run',
+      pipelineId,
+      cancelled: runner.cancel(pipelineId, 'cancelled via web api'),
+    })
   }],
 
   ['GET', /^\/api\/pipelines\/([^/]+)\/gates$/, async (req, res, pipelineId) => {
@@ -399,11 +406,14 @@ const ROUTES = [
 
   ['POST', /^\/api\/gates\/([^/]+)\/cancel$/, async (req, res, gateTaskId) => {
     const body = await readJsonBody(req)
-    json(res, 200, await service.cancelGate({
+    const task = await service.cancelGate({
       pipelineId: requiredString(body.pipelineId, 'pipelineId'),
       gateTaskId,
       ...optionalFields(body, ['note']),
-    }, actorOf(req)))
+    }, actorOf(req))
+    // 与「取消后台运行」同一套形状：`{ target, cancelled, ... }`。
+    // 取消门任务没有"没取消成"的中间态——走到这里就是已进终态。
+    json(res, 200, { target: 'gate', cancelled: true, task })
   }],
 
   ['POST', /^\/api\/admin\/recover$/, async (req, res) => {

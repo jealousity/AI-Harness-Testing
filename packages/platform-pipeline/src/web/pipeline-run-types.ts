@@ -15,7 +15,7 @@
  * @module platform-pipeline/web/pipeline-run-types
  */
 
-import type { HumanGateTaskStatus } from '../runtime/persistence.ts'
+import type { HumanGateTask, HumanGateTaskStatus } from '../runtime/persistence.ts'
 import { GateTaskBusyError } from '../runtime/persistence.ts'
 import { isStorageInfrastructureError, type StorageUnavailableError } from '../storage/ports.ts'
 import type { CheckpointStatus, InputLocks, ReentryRecord, StageId } from '../types.ts'
@@ -216,6 +216,143 @@ export interface PipelineEventView {
 }
 
 /**
+ * 服务端为 UI 派生的"下一步动作"（`docs/14` W3 第 1 条）。
+ *
+ * 为什么由**服务端**派生而不是让前端按状态自己推：状态与"该做什么"的映射散在前端，
+ * 就会出现"页面显示可以批准，服务端却拒绝"这类不一致。集中在一处派生、并由测试逐行
+ * 覆盖映射表，前端只负责渲染。
+ *
+ * 取值语义：
+ * | 取值 | 含义 |
+ * |---|---|
+ * | `run` | 触发运行（首次、打回重跑、重入已登记、消费已下的裁决） |
+ * | `view-artifact` | 终态已完成，去看产物 |
+ * | `claim-gate` | 认领人工门任务。**不由视图派生**：`decideGate` 会在未持 claim 时自动认领，
+ *   因此认领只是可选的"我要处理"声明（页面可提供按钮，但它不是"下一步"） |
+ * | `decide-gate` | 裁决人工门任务（**仅** `waiting-human` 时可能出现） |
+ * | `reenter` | 终态需要人工介入：登记重入才能继续 |
+ * | `retry-storage` | **不由视图派生**：保留给 HTTP 层在 503 时使用。视图能成功构建，
+ *   就说明存储当时是可用的，因此这个取值不会出现在 `PipelineRunView.nextAction` 里 |
+ * | `none` | 当前没有可执行的动作（例如后台运行正在进行中） |
+ */
+export type StageAction =
+  | 'run'
+  | 'view-artifact'
+  | 'claim-gate'
+  | 'decide-gate'
+  | 'reenter'
+  | 'retry-storage'
+  | 'none'
+
+/**
+ * 人工门任务的种类（`docs/14` W3 第 3 条）。
+ *
+ * - `stage`：**阶段门**。对应一份真实产物，批准即推进该阶段。
+ * - `escalation`：**升级任务**。由 `human.gateFailed` 产生（机器门禁失败 / 预算超限），
+ *   `artifactPath` 为空、`machineStatus` 为 `failed`，**永远不能被当作阶段批准**。
+ *
+ * 两者在数据上早已可区分（`artifactPath === ''`），但那是**隐式**的：UI 必须自己知道
+ * 这条约定。把它显式化，页面才能给出不同文案与不同操作集合。
+ */
+export type GateTaskKind = 'stage' | 'escalation'
+
+/**
+ * 人工门任务的**视图**：持久化记录 + 派生的种类标记。
+ *
+ * 刻意不在 `HumanGateTask` 上直接加字段——那会改变落盘形状，需要迁移。
+ * 派生字段只存在于返回给调用方的视图里。
+ */
+export interface GateTaskView extends HumanGateTask {
+  /** `true` = 升级任务（不对应产物，不可被批准为阶段门）。 */
+  readonly isEscalation: boolean
+}
+
+/** 由持久化记录派生门任务视图。 */
+export function toGateTaskView(task: HumanGateTask): GateTaskView {
+  return { ...task, isEscalation: task.artifactPath === '' }
+}
+
+/** {@link deriveNextAction} 的输入：全部来自已构建的视图事实，不含任何新状态。 */
+export interface NextActionFacts {
+  readonly status: PipelineRunStatus
+  /** 当前阶段（第一个非 `done` 的阶段）。 */
+  readonly currentStage: StageId | null
+  /** 当前阶段的检查点状态。 */
+  readonly currentStageStatus: CheckpointStatus | null
+  /** 未决门的种类；没有未决门时为 `null`。 */
+  readonly gateKind: GateTaskKind | null
+  /**
+   * 未决门的状态。
+   *
+   * **必须带上它**：`decideGate` 要求调用者**持有 claim**（否则 `gate-not-decidable`），
+   * 因此"先认领再裁决"是两步。只看 kind 会给出一个点了就被拒的动作。
+   */
+  readonly gateStatus: HumanGateTaskStatus | null
+}
+
+export interface NextActionDecision {
+  readonly action: StageAction
+  readonly reason: string | null
+}
+
+/**
+ * 派生"下一步该做什么"（纯函数）。
+ *
+ * 三条硬规则：
+ * 1. **终态永不出现 `decide-gate` / `claim-gate`**：`gate-failed` / `review-failed` /
+ *    `rejected` / `cancelled` / `failed` 一律给 `reenter`——页面因此不可能渲染出一个
+ *    "批准"按钮而服务端拒绝它（docs/14 W3 第 7 条）。
+ * 2. **`running` 给 `none`**：后台运行进行中，此刻没有任何人工动作是"正确"的；
+ *    催人去操作只会制造并发冲突。
+ * 3. **未决门给 `claim-gate` 还是 `decide-gate` 取决于它是否已被认领**——
+ *    这不是 UI 偏好，而是 `decideGate` 的前置条件。
+ *
+ * `retry-storage` 刻意**不在此函数的取值范围内**：视图能成功构建就说明存储可用。
+ */
+export function deriveNextAction(facts: NextActionFacts): NextActionDecision {
+  switch (facts.status) {
+    case 'running':
+      return { action: 'none', reason: '后台运行进行中：等它结束或停在人工门后再操作' }
+    case 'completed':
+      // 终态且无待办：去看产物。这不是"催办"，只是把入口指出来。
+      return { action: 'view-artifact', reason: null }
+    case 'waiting-human': {
+      if (facts.gateKind === null) {
+        return { action: 'run', reason: '裁决已登记但尚未被消费：触发运行以消费它并推进到下一阶段' }
+      }
+      const subject = facts.gateKind === 'escalation'
+        ? '机器门禁失败已升级为待处理任务'
+        : `阶段「${facts.currentStage ?? '未知'}」停在人工门`
+      // 注意：**不**把 `claim-gate` 作为派生动作。`decideGate` 在调用者未持 claim 时会
+      // 自动认领（`decideOnce`），因此认领不是前置条件，只是可选的"我要处理"声明。
+      // 把它当成"下一步"会逼用户点一个非必需的按钮。
+      return facts.gateStatus === 'claimed'
+        ? {
+            action: 'decide-gate',
+            reason: `${subject}：已被认领（同租约内裁决会冲突，可等租约过期）`,
+          }
+        : { action: 'decide-gate', reason: `${subject}：等待裁决（认领由服务端自动完成）` }
+    }
+    case 'gate-failed':
+      return { action: 'reenter', reason: '机器门禁失败是终态：修正原因后重入该阶段（不重试）' }
+    case 'review-failed':
+      return { action: 'reenter', reason: '交叉检查重试已耗尽（终态）：修正后重入该阶段' }
+    case 'rejected':
+      return { action: 'reenter', reason: '流水线已被拒绝（终态）：需要重入才能继续' }
+    case 'cancelled':
+      return { action: 'reenter', reason: '运行已取消（终态）：需要重入才能继续' }
+    case 'failed':
+      return { action: 'reenter', reason: '运行期失败（终态）：需要重入才能继续' }
+    case 'needs-fix':
+      return { action: 'run', reason: '阶段被人工打回：触发运行会重跑该阶段' }
+    case 'queued':
+      return facts.currentStageStatus === 'needs-reentry'
+        ? { action: 'run', reason: '重入已登记：触发运行会级联重跑该阶段及其下游' }
+        : { action: 'run', reason: '尚未开始：触发运行' }
+  }
+}
+
+/**
  * 流水线运行视图（`GET /api/pipelines/:pipelineId`，docs/10 §5.3）。
  *
  * 事实来源是检查点 + 产物 + 人工门任务；进程内运行句柄（`pipeline-run-registry.ts`）
@@ -235,6 +372,23 @@ export interface PipelineRunView {
   readonly openGateTaskId: string | null
   readonly reentries: readonly ReentryRecord[]
   readonly failure: PipelineRunFailure | null
+
+  // ── 以下为 W3 新增的**派生**字段（不是落盘事实，全部由服务端从上面的事实算出）──
+
+  /**
+   * 当前所在阶段 = **STAGE_ORDER 里第一个不是 `done` 的阶段**；全部完成时为 `null`。
+   *
+   * 与 `nextStage` 的区别：`nextStage` 是"游标指向哪"（实现细节），本字段是"用户此刻
+   * 该看哪个阶段"（界面语义）。当前实现下两者恒等（有测试钉住），但语义不同：
+   * 前者来自 `checkpoint.cursor`，后者来自阶段状态。
+   */
+  readonly currentStage: StageId | null
+  /** 服务端派生的下一步动作（映射表见 {@link StageAction}）。 */
+  readonly nextAction: StageAction
+  /** 为什么是这一步（面向运维的一句话）；没有可说的时为 `null`。 */
+  readonly blockingReason: string | null
+  /** 当前未决门的种类；没有未决门时为 `null`。 */
+  readonly gateKind: GateTaskKind | null
 }
 
 /**

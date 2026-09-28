@@ -89,7 +89,9 @@ import {
   PipelineRunError,
   assertGateRole,
   assertOperatorRole,
+  deriveNextAction,
   errorMessageOf,
+  toGateTaskView,
   toPipelineRunError,
   type ActorContext,
   type CreatePipelineRunInput,
@@ -97,6 +99,8 @@ import {
   type GateClaimInput,
   type GateDecisionInput,
   type GateTaskFilter,
+  type GateTaskKind,
+  type GateTaskView,
   type PipelineEventKind,
   type PipelineEventView,
   type PipelineRunFailure,
@@ -229,10 +233,10 @@ export interface PipelineRunService {
    */
   getUsage(pipelineId: string, actor: ActorContext): Promise<UsageSummary>
   reenter(input: ReenterInput, actor: ActorContext): Promise<Checkpoint>
-  listGateTasks(filter: GateTaskFilter, actor: ActorContext): Promise<readonly HumanGateTask[]>
-  claimGate(input: GateClaimInput, actor: ActorContext): Promise<HumanGateTask>
-  decideGate(input: GateDecisionInput, actor: ActorContext): Promise<HumanGateTask>
-  cancelGate(input: GateCancelInput, actor: ActorContext): Promise<HumanGateTask>
+  listGateTasks(filter: GateTaskFilter, actor: ActorContext): Promise<readonly GateTaskView[]>
+  claimGate(input: GateClaimInput, actor: ActorContext): Promise<GateTaskView>
+  decideGate(input: GateDecisionInput, actor: ActorContext): Promise<GateTaskView>
+  cancelGate(input: GateCancelInput, actor: ActorContext): Promise<GateTaskView>
 }
 
 /**
@@ -741,28 +745,31 @@ export class FilePipelineRunService implements PipelineRunService {
     }
   }
 
-  async listGateTasks(filter: GateTaskFilter, actor: ActorContext): Promise<readonly HumanGateTask[]> {
+  async listGateTasks(filter: GateTaskFilter, actor: ActorContext): Promise<readonly GateTaskView[]> {
     assertActor(actor)
     assertSafeIdentifier(filter.pipelineId, 'pipelineId')
     const { store } = await this.gateStoreOf(filter.pipelineId, filter.projectId, actor)
-    return store.list({
+    const tasks = await store.list({
       pipelineId: filter.pipelineId,
       ...(filter.status === undefined ? {} : { status: filter.status }),
     })
+    // 派生 `isEscalation`（docs/14 W3 第 3 条）：把"`artifactPath === ''` 即升级任务"
+    // 这条**隐式**约定显式化，页面才能对两种任务给出不同文案与操作集合。
+    return tasks.map(toGateTaskView)
   }
 
-  async claimGate(input: GateClaimInput, actor: ActorContext): Promise<HumanGateTask> {
+  async claimGate(input: GateClaimInput, actor: ActorContext): Promise<GateTaskView> {
     assertActor(actor)
     assertGateRole(actor)
     const { store, task } = await this.requireGateTask(input, actor)
     try {
-      return await store.claim(task.gateTaskId, actor.actorId, input.ttlMs ?? DEFAULT_CLAIM_TTL_MS)
+      return toGateTaskView(await store.claim(task.gateTaskId, actor.actorId, input.ttlMs ?? DEFAULT_CLAIM_TTL_MS))
     } catch (error) {
       throw toPipelineRunError(error, 'gate-not-claimable')
     }
   }
 
-  async decideGate(input: GateDecisionInput, actor: ActorContext): Promise<HumanGateTask> {
+  async decideGate(input: GateDecisionInput, actor: ActorContext): Promise<GateTaskView> {
     assertActor(actor)
     assertGateRole(actor)
     if (!GATE_DECISIONS.includes(input.action)) {
@@ -782,10 +789,10 @@ export class FilePipelineRunService implements PipelineRunService {
     // 缺省不带 decisionId = 不启用幂等：行为与 M2 之前逐字一致（终态 → gate-not-decidable，
     // 已消费 → gate-consumed）。带上它以后，同一个 (gateTaskId, decisionId) 的重复投递
     // 会重放首次裁决结果（§6.4「同一 gate decision 重试不会重复消费」）。
-    if (input.decisionId === undefined) return this.decideOnce(store, task, input, actor)
+    if (input.decisionId === undefined) return toGateTaskView(await this.decideOnce(store, task, input, actor))
 
     const namespace = IDEMPOTENCY_NAMESPACES.gateDecision
-    return this.runIdempotent(
+    const decided = await this.runIdempotent(
       config,
       projectRoot,
       namespace,
@@ -793,6 +800,7 @@ export class FilePipelineRunService implements PipelineRunService {
       idempotencyFingerprint(namespace, [input.pipelineId, task.gateTaskId, input.action, input.note ?? '', actor.actorId]),
       () => this.decideOnce(store, task, input, actor),
     )
+    return toGateTaskView(decided)
   }
 
   /**
@@ -842,14 +850,14 @@ export class FilePipelineRunService implements PipelineRunService {
     }
   }
 
-  async cancelGate(input: GateCancelInput, actor: ActorContext): Promise<HumanGateTask> {
+  async cancelGate(input: GateCancelInput, actor: ActorContext): Promise<GateTaskView> {
     assertActor(actor)
     // 取消门任务会把它推进 `cancelled` 终态（不可再裁决）——同为运维动作（docs/11 P1-02）。
     assertOperatorRole(actor, '取消人工门任务')
     const { store, task } = await this.requireGateTask(input, actor)
     if (store.cancel === undefined) throw new PipelineRunError('run-failed', '当前门存储不支持 cancel')
     try {
-      return await store.cancel(task.gateTaskId, actor.actorId, input.note ?? '')
+      return toGateTaskView(await store.cancel(task.gateTaskId, actor.actorId, input.note ?? ''))
     } catch (error) {
       throw toPipelineRunError(error, 'gate-not-decidable')
     }
@@ -1315,6 +1323,26 @@ export class FilePipelineRunService implements PipelineRunService {
       return buildStageView(stageId, state, stageTaskOf(tasks, stageId), await effectiveDigest(artifacts, state))
     }))
 
+    // ── W3 派生字段（docs/14 W3）：全部由上面的事实算出，不引入任何新状态 ──────────
+    //
+    // `currentStage` 用**阶段状态**（第一个非 done）而不是游标推导：游标是编排实现细节，
+    // 而界面要回答的是"用户此刻该看哪个阶段"。
+    const currentStage = STAGE_ORDER.find(id => checkpoint.stageStates[id]!.status !== 'done') ?? null
+    const currentStageStatus = currentStage === null ? null : checkpoint.stageStates[currentStage]!.status
+    // 未决门 = 第一条 pending/claimed 的任务。注意它**可能是升级任务**（`artifactPath === ''`），
+    // 因此必须带出种类，页面才能给出不同文案与操作集合。
+    const openTask = tasks.find(task => task.status === 'pending' || task.status === 'claimed') ?? null
+    const gateKind: GateTaskKind | null = openTask === null
+      ? null
+      : (openTask.artifactPath === '' ? 'escalation' : 'stage')
+    const decision = deriveNextAction({
+      status,
+      currentStage,
+      currentStageStatus,
+      gateKind,
+      gateStatus: openTask?.status ?? null,
+    })
+
     return {
       pipelineId: checkpoint.pipelineId,
       tenantId: config.scope?.tenantId ?? null,
@@ -1325,9 +1353,13 @@ export class FilePipelineRunService implements PipelineRunService {
       templateVersion: checkpoint.templateVersion,
       rulesetVersion: checkpoint.rulesetVersion,
       stages,
-      openGateTaskId: tasks.find(task => task.status === 'pending' || task.status === 'claimed')?.gateTaskId ?? null,
+      openGateTaskId: openTask?.gateTaskId ?? null,
       reentries: checkpoint.reentries,
       failure: deriveRunFailure(status, checkpoint, tasks),
+      currentStage,
+      nextAction: decision.action,
+      blockingReason: decision.reason,
+      gateKind,
     }
   }
 
