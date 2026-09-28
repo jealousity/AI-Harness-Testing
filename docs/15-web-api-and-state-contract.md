@@ -251,7 +251,7 @@ interface PipelineRunSummary {
 的差别会泄露存在性）。响应 `202`：
 
 ```json
-{ "pipelineId": "...", "cancelled": true }
+{ "target": "run", "pipelineId": "...", "cancelled": true }
 ```
 
 ### 5.6 `GET /api/pipelines/:pipelineId`
@@ -270,8 +270,33 @@ interface PipelineRunView {
   openGateTaskId: string | null
   reentries: readonly ReentryRecord[]
   failure: PipelineRunFailure | null
+
+  // W3 新增的**派生**字段（不是落盘事实）
+  currentStage: StageId | null
+  nextAction: StageAction
+  blockingReason: string | null
+  gateKind: GateTaskKind | null
 }
 ```
+
+`StageAction = 'run' | 'view-artifact' | 'claim-gate' | 'decide-gate' | 'reenter' | 'retry-storage' | 'none'`
+`GateTaskKind = 'stage' | 'escalation'`
+
+**派生规则**（`deriveNextAction`，纯函数，逐行有用例）：
+
+| 状态 | 未决门 | `nextAction` |
+|---|---|---|
+| `running` | — | `none`（后台运行进行中，此刻没有"正确的人工动作"） |
+| `queued` | — | `run` |
+| `needs-fix` | — | `run` |
+| `waiting-human` | 有（stage 或 escalation） | `decide-gate` |
+| `waiting-human` | 无 | `run`（去消费已登记的裁决） |
+| `gate-failed` / `review-failed` / `rejected` / `cancelled` / `failed` | — | `reenter` |
+| `completed` | — | `view-artifact`（`blockingReason` 为 `null`） |
+
+**三条硬规则**：① 终态永不产出 `decide-gate` / `claim-gate`；② `running` 给 `none`；
+③ `claim-gate` 与 `retry-storage` **不由视图派生**（前者因 `decideGate` 自动认领，
+后者由 HTTP 层在 503 时使用）。
 
 响应体额外合并运行时字段：`running: boolean`（来自进程内 registry）。
 
@@ -321,8 +346,12 @@ interface PipelineRunFailure {
 查询参数：`status`（可选，`HumanGateTaskStatus`）。
 
 ```json
-{ "gates": [ HumanGateTask ] }
+{ "gates": [ GateTaskView ] }
 ```
+
+`GateTaskView = HumanGateTask & { isEscalation: boolean }` —— 派生字段，**不改落盘形状**。
+`isEscalation: true` 表示升级任务（`artifactPath === ''`、`machineStatus === 'failed'`），
+**永远不能被当作阶段批准**。`claimGate` / `decideGate` / `cancelGate` 的单条返回同样带它。
 
 ### 5.8 `GET /api/pipelines/:pipelineId/events`
 
@@ -388,7 +417,15 @@ interface StageArtifactView {
 
 ### 5.14 `POST /api/gates/:gateTaskId/cancel`
 
-请求体：`{ pipelineId, note? }` → `200` + `HumanGateTask`。
+请求体：`{ pipelineId, note? }` → `200`：
+
+```json
+{ "target": "gate", "cancelled": true, "task": GateTaskView }
+```
+
+> **W3 变更（破坏性）**：此前直接返回任务本体。两个 cancel 端点现在共用
+> `{ target, cancelled, ... }` 形状，页面可以用一套分支渲染"取消后台运行"与
+> "撤回人工门任务"这两件不同的事。
 
 ### 5.15 `POST /api/admin/recover`
 
@@ -505,6 +542,35 @@ type RunResult =
 | 启动期完整配置校验 | `assertStartupConfigUsable`：阶段 ACL、审批覆盖、规则引用、provider 引用 | `test/web-server-config.test.ts` |
 | 启动日志不泄露 | `startupLogLines` 只含监听地址、逻辑 configRef、危险模式警告 | 同文件 |
 
+## 8.3 W3 落地记录（六阶段流转与派生字段）
+
+| 项 | 落地方式 | 证据 |
+|---|---|---|
+| `nextAction` 映射表 | `deriveNextAction` 纯函数，覆盖 10 个状态 × 3 种门情形 | `test/web-stage-flow.test.ts` |
+| `currentStage` | `STAGE_ORDER` 里第一个非 `done` 的阶段；与 `nextStage` 恒等（有用例钉住） | 同文件（逐阶段推进 6 次） |
+| `gateKind` | 由未决门的 `artifactPath === ''` 派生 `'stage'` / `'escalation'` | 同文件 |
+| `isEscalation` | `toGateTaskView` 派生，四个门任务方法统一返回 | 同文件（含真实预算超限路径） |
+| cancel 语义统一 | 两个端点共用 `{ target, cancelled, ... }` | `web-app/server.mjs` |
+
+### 与规划书建议形状的**有意偏离**（按 docs/14 §5.1 报告冲突）
+
+1. **未新增 `stale` 字段**。规划书 §3 W3 的建议视图里有它，但服务端**没有**可诚实表达
+   它的依据：客户端的"数据可能过期"取决于浏览器自己的轮询状态（暂停/失败），服务端无从
+   得知；服务端唯一能说的"有后台运行在跑"已由既有 `running` 表达。新增一个同义字段
+   就是伪造事实，违反 docs/10 §1 原则 2「不伪装」。
+2. **`claim-gate` 不作为派生动作**。`decideGate` 在调用者未持 claim 时**自动认领**
+   （`decideOnce`），认领因此不是前置条件。把它当作"下一步"会逼用户点一个非必需按钮。
+   它仍保留在 `StageAction` 中，供页面做可选的"我要处理"按钮。
+3. **`retry-storage` 不由视图派生**。视图能成功构建就说明存储当时可用；该取值保留给
+   HTTP 层在 503 时使用，让页面只需要一套动作词汇表。
+
+### 已知边界（不是缺陷）
+
+- `blockingReason` **不含认领人身份**：视图是 actor 无关的，塞入 `claimedBy` 会让同一条
+  流水线对不同调用者返回不同视图。
+
+---
+
 **新增环境变量**：`PLATFORM_TRUSTED_PROXY`（`'1'` 表示"身份由可信反向代理提供"，
 是开启请求头信任且非回环绑定时的**显式表态**）。未设置时该组合拒绝启动。
 
@@ -546,11 +612,13 @@ type RunResult =
 | 数值环境变量严格校验，非法即启动失败 | 变更 | W1 | ✅ 已实现（`ee0814b`）｜`test/web-server-config.test.ts`（22 项） |
 | 非 loopback + trust headers 无可信代理策略时拒绝启动 | 新增 | W1 | ✅ 已实现（`ee0814b`）｜同文件 + 验收10e；新增 `PLATFORM_TRUSTED_PROXY=1` 显式表态 |
 | 启动时完成完整配置/ACL/审批覆盖校验 | 变更 | W1 | ✅ 已实现（`ee0814b`）｜`assertStartupConfigUsable`；`web-app/server.mjs` 启动即调用 |
-| `PipelineRunView.currentStage` | 新增（派生） | W3 | 未实现 |
-| `PipelineRunView.nextAction` | 新增（派生） | W3 | 未实现 |
-| `PipelineRunView.blockingReason` | 新增（派生） | W3 | 未实现 |
-| `PipelineRunView.gateKind`（`'stage' \| 'escalation' \| null`） | 新增（派生） | W3 | 未实现 |
-| `PipelineRunView.stale` | 新增（派生） | W3 | 未实现 |
+| `PipelineRunView.currentStage` | 新增（派生） | W3 | ✅ 已实现（`1f15943`）｜`test/web-stage-flow.test.ts` |
+| `PipelineRunView.nextAction` | 新增（派生） | W3 | ✅ 已实现（`1f15943`）｜同文件 |
+| `PipelineRunView.blockingReason` | 新增（派生） | W3 | ✅ 已实现（`1f15943`）｜同文件 |
+| `PipelineRunView.gateKind`（`'stage' \| 'escalation' \| null`） | 新增（派生） | W3 | ✅ 已实现（`1f15943`）｜同文件 |
+| `PipelineRunView.stale` | 新增（派生） | W3 | ❌ **有意不实现**，理由见 §8.3（服务端无诚实依据，等价信息已由 `running` 表达） |
+| 门任务 `isEscalation` | 新增（派生） | W3 | ✅ 已实现（`1f15943`）｜同文件 |
+| 两个 cancel 端点响应形状统一 | **变更（破坏性）** | W3 | ✅ 已实现（`1f15943`）｜`web-app/server.mjs` |
 | `list()` 改用注入的 `indexStore` | **缺陷修复（W-01）** | W2 | ✅ 已实现（`f46cf37`）｜`test/web-index-and-creation.test.ts` |
 | `records` 缺失时显式区分 legacy fallback 与失败关闭 | 变更 | W2 | ✅ 已实现（`f46cf37`）｜`assertBackendPorts` 对"外部后端"失败关闭；同文件 |
 | 索引扫描区分数据损坏与基础设施不可用 | 变更 | W2 | ✅ 已实现（`f46cf37`）｜`scanPipelineIndexFrom` 只把数据问题放进 `unreadable` |
