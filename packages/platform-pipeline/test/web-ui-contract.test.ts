@@ -143,3 +143,27 @@ test('UI：按钮有明确禁用态（不只靠鼠标指针）', async () => {
   const css = await readPublic('styles.css')
   assert.match(css, /button:disabled/, '禁用态必须有视觉表达')
 })
+
+test('UI：刷新后能恢复同一条流水线（pipelineId 只进 URL，不作状态缓存）', async () => {
+  const js = await readPublic('app.js')
+  // 启动时从 hash 还原；hashchange 时跟随。
+  assert.match(js, /location\.hash/, '必须把 pipelineId 写进 URL')
+  assert.match(js, /hashchange/, '需要监听 hashchange（浏览器前进/后退、手改 URL）')
+  assert.match(js, /#pipeline=|pipeline=\(\[\^&\]\+\)/, 'URL 里要能解析出 pipelineId')
+  // 反向：不得把运行状态存进 localStorage/sessionStorage（那会成为第二份事实来源）。
+  assert.equal(/localStorage|sessionStorage/.test(js), false,
+    'app.js 不得使用 localStorage/sessionStorage 缓存运行状态')
+})
+
+test('UI：主要操作都有 loading / error / success 三种结果表达', async () => {
+  const js = await readPublic('app.js')
+  const css = stripCssComments(await readPublic('styles.css'))
+  // 结果区按 kind 区分样式，且三种 kind 都被用到。
+  for (const kind of ['ok', 'warn', 'error']) {
+    assert.match(js, new RegExp(`'${kind}'`), `app.js 必须用到 ${kind} 结果类型`)
+    assert.match(css, new RegExp(`\\.out\\[data-kind="${kind}"\\]`), `styles.css 必须为 ${kind} 定义样式`)
+  }
+  // loading：请求期间禁用按钮（`state.busy`）。
+  assert.match(js, /state\.busy/, '请求期间必须有忙碌态')
+  assert.match(js, /disabled\s*=/, '忙碌态必须体现为按钮禁用')
+})
