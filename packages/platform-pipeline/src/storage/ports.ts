@@ -241,6 +241,8 @@ export function checkAndStripSchemaVersion(ref: string, kind: StorageRecordKind,
  */
 export type AuditEventKind =
   | 'pipeline-created'
+  | 'pipeline-updated'
+  | 'pipeline-removed'
   | 'run-started'
   | 'run-settled'
   | 'stage-advanced'

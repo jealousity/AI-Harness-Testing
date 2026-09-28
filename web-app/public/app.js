@@ -95,6 +95,8 @@ const state = {
   /** 列表与筛选（纯界面状态）。 */
   list: [],
   filters: { projectId: '', status: '' },
+  /** 左侧菜单当前选中项（未打开流水线时右侧显示什么）。 */
+  nav: 'list',
   polling: true,
   busy: false,
   /** 最近一次刷新失败的原因；`null` 表示本次刷新成功。 */
@@ -219,10 +221,20 @@ function renderPollingState() {
 
 // ── 渲染：向导与流水线列表 ───────────────────────────────────────────────────
 
-/** 默认视图：流水线列表（点某一行进入详情）。 */
-function renderListView() {
-  $('pipeline-list-panel').hidden = false
-  $('workspace').hidden = true
+/**
+ * 视图切换（左侧菜单 → 右侧内容）。
+ *
+ * 三个视图**互斥**：通用配置 / 流水线列表 / 流水线详情。菜单项的选中态用
+ * `aria-current="page"` 表达——不只靠颜色。
+ */
+function setView(view) {
+  $('general-panel').hidden = view !== 'general'
+  $('pipeline-list-panel').hidden = view !== 'list'
+  $('workspace').hidden = view !== 'detail'
+  const onList = view === 'list'
+  const onGeneral = view === 'general'
+  $('btn-nav-list').setAttribute('aria-current', onList ? 'page' : 'false')
+  $('btn-nav-general').setAttribute('aria-current', onGeneral ? 'page' : 'false')
 }
 
 // ── 通用配置（左侧一级菜单）与新建对话框 ────────────────────────────────────
@@ -288,7 +300,7 @@ function closeCreateDialog() {
 }
 
 function renderList() {
-  const body = $('pipeline-list')
+  const body = $('pipeline-table')
   body.replaceChildren()
   const projectId = state.filters.projectId.trim()
   const status = state.filters.status
@@ -300,26 +312,23 @@ function renderList() {
       className: 'muted',
       text: state.list.length === 0 ? '还没有流水线。点右上角「＋ 新建流水线」创建一条。' : '当前筛选条件下没有匹配的流水线。',
     })
-    cell.setAttribute('colspan', '6')
+    cell.setAttribute('colspan', '5')
     body.append(el('tr', {}, [cell]))
     return
   }
 
   for (const item of visible) {
-    const open = el('button', {
-      className: 'primary',
-      text: '打开',
-      attrs: { type: 'button', 'aria-label': `打开流水线 ${item.pipelineId}` },
-      on: { click: () => openPipeline(item.pipelineId) },
-    })
     body.append(el('tr', { attrs: { 'data-pipeline': item.pipelineId } }, [
       el('td', { className: 'mono', text: item.pipelineId }),
       el('td', { text: `${item.projectId}${item.tenantId === null ? '' : ` / ${item.tenantId}`}` }),
       el('td', {}, [chip(RUN_STATUS_LABELS[item.status] ?? item.status, item.status)]),
-      // 列表接口只回 summary（没有 currentStage）——**不编造**，如实显示"—"。
-      el('td', { className: 'muted', text: '—' }),
       el('td', { className: 'mono', text: item.nextStage ?? '终态' }),
-      el('td', {}, [open]),
+      el('td', {}, [el('button', {
+        className: 'primary',
+        text: '打开',
+        attrs: { type: 'button', 'aria-label': `打开流水线 ${item.pipelineId}` },
+        on: { click: () => openPipeline(item.pipelineId) },
+      })]),
     ]))
   }
 }
@@ -808,6 +817,82 @@ function syncReenterDigest() {
   $('f-reenter-digest').value = stage?.digest ?? ''
 }
 
+// ── 编辑 / 移除流水线 ────────────────────────────────────────────────────────
+
+/** 打开编辑对话框，按 `view.params` **预填**（没有预填就只能让用户盲填）。 */
+function openEditDialog() {
+  const params = state.view?.params ?? {}
+  $('e-requirement').value = params.requirementInput ?? ''
+  $('e-provider').value = params.providerName ?? ''
+  $('e-target').value = params.targetBaseUrl ?? ''
+  $('e-ruleset').value = params.rulesetVersion ?? ''
+  $('e-retries').value = params.maxGateRetries ?? ''
+  $('e-gatewait').value = params.gateWaitTimeoutMs ?? ''
+  $('e-ttl').value = params.gateTaskTtlMs ?? ''
+  $('e-diag').value = (params.diagCredentials ?? []).join(', ')
+  $('edit-context').textContent = `流水线 ${state.pipelineId}`
+    + (params.updatedAt === undefined ? '（从未编辑过）' : `（上次编辑 ${timeText(params.updatedAt)}）`)
+  clearOut('out-edit')
+  const dialog = $('edit-dialog')
+  if (typeof dialog.showModal === 'function') dialog.showModal()
+  else dialog.setAttribute('open', '')
+}
+
+function closeEditDialog() {
+  const dialog = $('edit-dialog')
+  if (typeof dialog.close === 'function') dialog.close()
+  else dialog.removeAttribute('open')
+}
+
+async function submitEdit() {
+  const pipelineId = state.pipelineId
+  // 字符串：**原样提交**（清空即清掉该字段）。数字：留空 = 不修改——因为契约里
+  // `undefined` 表示"不修改"，没有"清掉数字"的语义，UI 不假装有。
+  const body = {
+    requirementInput: $('e-requirement').value.trim(),
+    providerName: $('e-provider').value.trim(),
+    targetBaseUrl: $('e-target').value.trim(),
+    rulesetVersion: $('e-ruleset').value.trim(),
+    diagCredentials: $('e-diag').value.split(',').map(item => item.trim()).filter(item => item !== ''),
+  }
+  for (const [field, id] of [['maxGateRetries', 'e-retries'], ['gateWaitTimeoutMs', 'e-gatewait'], ['gateTaskTtlMs', 'e-ttl']]) {
+    const raw = $(id).value.trim()
+    if (raw === '') continue
+    const value = Number(raw)
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new ApiError('invalid-request', `${field} 必须是非负整数`, 400, {})
+    }
+    body[field] = value
+  }
+
+  const result = await api('PATCH', `/api/pipelines/${encodeURIComponent(pipelineId)}`, body)
+  closeEditDialog()
+  const changed = result.changedFields.length === 0 ? '（没有字段变化）' : `已保存：${result.changedFields.join('、')}`
+  showOut('out-main', result.warning === null ? changed : `${changed}\n\n${result.warning}`,
+    result.warning === null ? 'ok' : 'warn')
+  await refresh()
+}
+
+/**
+ * 移除流水线。
+ *
+ * **语义必须说清**：当前实现只从索引摘掉，数据（产物/检查点/审计）仍留在数据根。
+ * 用户点"移除"时最怕的是"我以为是删掉，其实数据还在"或者反过来——所以确认框里
+ * 直接写明会发生什么，返回值也如实显示。
+ */
+async function removePipeline() {
+  const pipelineId = state.pipelineId
+  const ok = window.confirm(
+    `确定移除流水线 ${pipelineId}？\n\n`
+    + '只会从列表里摘掉索引：产物 / 检查点 / 门任务 / 审计**仍保留在数据根**，'
+    + '可用同一流水线 ID 重新创建找回。真删需要运维在数据根上清理。',
+  )
+  if (!ok) return
+  const result = await api('DELETE', `/api/pipelines/${encodeURIComponent(pipelineId)}`)
+  showOut('out-main', `已移除 ${result.pipelineId}。${result.dataRetained ? `\n\n${result.dataRetainedReason}` : ''}`, 'warn')
+  closePipeline()
+}
+
 // ── 渲染：数据根体检（docs/14 W5 第 9 条）─────────────────────────────────────
 
 function renderDiagnostics(report) {
@@ -889,7 +974,7 @@ async function refresh() {
   state.busy = true
   try {
     if (state.pipelineId === null) {
-      renderListView()
+      setView(state.nav)
       state.list = (await api('GET', '/api/pipelines')).pipelines
       renderList()
       state.lastError = null
@@ -910,8 +995,7 @@ async function refresh() {
     state.events = events.events
     state.lastError = null
 
-    $('pipeline-list-panel').hidden = true
-    $('workspace').hidden = false
+    setView('detail')
 
     renderSummary()
     renderStepper()
@@ -942,10 +1026,7 @@ async function refresh() {
     state.lastError = error
     // 503 不显示成"没有流水线"：给出明确的基础设施提示 + 重试入口。
     if (state.pipelineId === null) {
-      const cell = el('td', { className: 'muted', text: describeError(error) })
-      cell.setAttribute('colspan', '6')
-      $('pipeline-list').replaceChildren(el('tr', {}, [cell]))
-      showOut('out-list', describeError(error), 'error')
+      showOut('out-main', describeError(error), 'error')
     } else {
       $('conn').dataset.state = 'error'
       $('conn').textContent = '读取失败'
@@ -979,7 +1060,7 @@ function openPipeline(pipelineId) {
 function closePipeline() {
   state.pipelineId = null
   state.view = null
-  // 回列表：清掉 hash（列表是默认视图，不占 URL）。
+  // 回左侧菜单当前选中的视图（列表或通用配置）；清掉 hash（视图不占 URL）。
   history.replaceState(null, '', location.pathname)
   void refresh()
 }
@@ -1129,10 +1210,17 @@ $('create-form').addEventListener('submit', async event => {
 })
 
 $('btn-new-pipeline').addEventListener('click', () => { openCreateDialog() })
-// 始终可见的流水线列表入口：从详情页一键回到列表。
-$('btn-show-list').addEventListener('click', () => {
+// 左侧一级菜单项：点它在**右侧**显示对应内容。
+$('btn-nav-list').addEventListener('click', () => {
+  state.nav = 'list'
   if (state.pipelineId === null) void refresh()
   else closePipeline()
+})
+$('btn-nav-general').addEventListener('click', () => {
+  state.nav = 'general'
+  // 通用配置与流水线无关：若正开着详情，先关掉（避免"菜单选中项"与"右侧内容"不一致）。
+  if (state.pipelineId !== null) closePipeline()
+  else { setView('general'); void refresh() }
 })
 $('btn-create-cancel').addEventListener('click', () => { closeCreateDialog() })
 // 通用配置变化时同步对话框里的摘要。
@@ -1162,6 +1250,16 @@ $('btn-primary').addEventListener('click', () => { void runPrimaryAction() })
 $('btn-cancel-run').addEventListener('click', () => { void cancelRun() })
 $('btn-recover').addEventListener('click', () => { void recover() })
 $('btn-close').addEventListener('click', () => { closePipeline() })
+$('btn-edit').addEventListener('click', () => { openEditDialog() })
+$('btn-remove').addEventListener('click', async () => {
+  try { await removePipeline() } catch (error) { showOut('out-main', describeError(error), 'error') }
+})
+$('btn-edit-cancel').addEventListener('click', () => { closeEditDialog() })
+$('edit-form').addEventListener('submit', async event => {
+  // `method="dialog"` 会自动关闭对话框；拦下来，否则保存失败时错误提示会随对话框消失。
+  event.preventDefault()
+  try { await submitEdit() } catch (error) { showOut('out-edit', describeError(error), 'error') }
+})
 $('btn-reenter').addEventListener('click', () => { void reenter() })
 $('btn-diagnostics').addEventListener('click', () => { void runDiagnostics() })
 $('btn-refresh').addEventListener('click', () => { void refresh() })

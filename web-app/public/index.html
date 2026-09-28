@@ -20,8 +20,6 @@
       <span class="conn" id="conn" role="status" aria-live="polite">连接中…</span>
       <button type="button" id="btn-poll">暂停自动刷新</button>
       <button type="button" id="btn-refresh">立即刷新</button>
-      <!-- 流水线列表入口：**始终可见**，避免停在详情页后找不到列表 -->
-      <button type="button" id="btn-show-list">流水线列表</button>
       <!-- 新建流水线：右上角主操作 -->
       <button type="button" class="primary" id="btn-new-pipeline">＋ 新建流水线</button>
     </div>
@@ -30,32 +28,11 @@
   <div class="shell">
     <!-- ── 左侧一级菜单：通用配置 + 流水线 ──────────────────────────────────── -->
     <aside class="sidebar" aria-label="一级菜单">
-      <!-- 通用配置：**可折叠**（点标题展开/收起）。这里只放对所有流水线都通用的项；
-           每条流水线自己的字段（含标识）在新建对话框里。 -->
-      <details class="side-block" id="general-config" open>
-        <summary>通用配置</summary>
-        <p class="hint">对本会话内新建的流水线生效；不写入任何运行状态。</p>
-
-        <label for="g-project">项目 ID<span class="req">必填</span>
-          <input id="g-project" autocomplete="off">
-        </label>
-        <label for="g-provider">Provider（可选）
-          <input id="g-provider" autocomplete="off" placeholder="缺省用配置的 defaultProvider">
-        </label>
-        <label for="g-ruleset">规则集版本（可选）
-          <input id="g-ruleset" autocomplete="off" placeholder="缺省用平台默认">
-        </label>
-        <label for="g-retries">人工门重试上限（可选）
-          <input id="g-retries" type="number" min="0" step="1" autocomplete="off">
-        </label>
-        <label for="g-gatewait">人工门等待上限 / 毫秒（可选）
-          <input id="g-gatewait" type="number" min="0" step="1" autocomplete="off" placeholder="0 = 只轮询一次就让出控制权">
-        </label>
-        <label for="g-ttl">门任务 TTL / 毫秒（可选）
-          <input id="g-ttl" type="number" min="0" step="1" autocomplete="off">
-        </label>
-      </details>
-
+      <!-- 一级菜单：只有菜单项，内容一律在**右侧**展示 -->
+      <nav class="side-block side-nav" aria-label="功能菜单">
+        <button type="button" class="nav-item" id="btn-nav-general">通用配置</button>
+        <button type="button" class="nav-item" id="btn-nav-list" aria-current="page">流水线列表</button>
+      </nav>
     </aside>
 
     <!-- ── 主内容区 ─────────────────────────────────────────────────────────── -->
@@ -69,11 +46,37 @@
       <!-- 主区操作结果（运行 / 裁决 / 恢复 / 取消）；与创建对话框的结果分开。 -->
       <p class="out" id="out-main" role="alert" hidden></p>
 
-      <!-- 流水线列表（默认视图）。点某一行的「打开」进入详情。 -->
+      <!-- 右侧「通用配置」视图：点左侧菜单进来 -->
+      <section class="panel" id="general-panel" hidden aria-labelledby="general-title">
+        <h2 id="general-title">通用配置</h2>
+        <p class="hint">对本会话内新建的流水线生效；不写入任何运行状态（不存 localStorage）。</p>
+        <div class="grid">
+          <label for="g-project">项目 ID<span class="req">必填</span>
+            <input id="g-project" autocomplete="off">
+          </label>
+          <label for="g-provider">Provider（可选）
+            <input id="g-provider" autocomplete="off" placeholder="缺省用配置的 defaultProvider">
+          </label>
+          <label for="g-ruleset">规则集版本（可选）
+            <input id="g-ruleset" autocomplete="off" placeholder="缺省用平台默认">
+          </label>
+          <label for="g-retries">人工门重试上限（可选）
+            <input id="g-retries" type="number" min="0" step="1" autocomplete="off">
+          </label>
+          <label for="g-gatewait">人工门等待上限 / 毫秒（可选）
+            <input id="g-gatewait" type="number" min="0" step="1" autocomplete="off" placeholder="0 = 只轮询一次就让出控制权">
+          </label>
+          <label for="g-ttl">门任务 TTL / 毫秒（可选）
+            <input id="g-ttl" type="number" min="0" step="1" autocomplete="off">
+          </label>
+        </div>
+      </section>
+
+      <!-- 右侧列表视图：点左侧菜单「流水线列表」进来；点某行的「打开」进详情 -->
       <section class="panel" id="pipeline-list-panel" aria-labelledby="list-title">
         <div class="panel-head">
           <h2 id="list-title">流水线列表</h2>
-          <button type="button" id="btn-list">刷新列表</button>
+          <button type="button" id="btn-list">刷新</button>
         </div>
         <div class="filters" id="list-filters">
           <label for="f-filter-project">按项目筛选
@@ -98,14 +101,11 @@
         <div class="tablewrap">
           <table class="pipelines">
             <thead>
-              <tr>
-                <th>流水线</th><th>项目 / 租户</th><th>状态</th><th>当前阶段</th><th>下一阶段</th><th></th>
-              </tr>
+              <tr><th>流水线</th><th>项目 / 租户</th><th>状态</th><th>下一阶段</th><th></th></tr>
             </thead>
-            <tbody id="pipeline-list"><tr><td colspan="6" class="muted">尚未加载</td></tr></tbody>
+            <tbody id="pipeline-table"><tr><td colspan="5" class="muted">尚未加载</td></tr></tbody>
           </table>
         </div>
-        <p class="out" id="out-list" role="alert" hidden></p>
       </section>
 
       <!-- 主工作区 -->
@@ -127,6 +127,8 @@
             <button type="button" class="primary" id="btn-primary">—</button>
             <button type="button" id="btn-cancel-run">取消后台运行</button>
             <button type="button" id="btn-recover">恢复扫描</button>
+            <button type="button" id="btn-edit">编辑参数</button>
+            <button type="button" class="danger" id="btn-remove">移除</button>
             <button type="button" id="btn-close">← 返回列表</button>
           </div>
         </section>
@@ -231,6 +233,49 @@
       <div class="actions">
         <button type="submit" class="primary" id="btn-create">创建流水线</button>
         <button type="button" id="btn-create-cancel">取消</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- ── 编辑运行参数（已按当前值预填；清空字符串 = 清掉该字段）──────────────── -->
+  <dialog id="edit-dialog" aria-labelledby="edit-title">
+    <form id="edit-form" method="dialog">
+      <h2 id="edit-title">编辑运行参数</h2>
+      <p class="hint">
+        只改**运行参数**；项目 / 租户 / 配置引用不可改（它们决定这条流水线的身份）。
+        字符串清空即清掉该字段；数字留空表示不修改。
+      </p>
+      <p class="mono small" id="edit-context">—</p>
+      <div class="grid">
+        <label for="e-requirement">需求输入文件
+          <input id="e-requirement" autocomplete="off">
+        </label>
+        <label for="e-provider">Provider
+          <input id="e-provider" autocomplete="off">
+        </label>
+        <label for="e-target">被测服务基址
+          <input id="e-target" autocomplete="off">
+        </label>
+        <label for="e-ruleset">规则集版本
+          <input id="e-ruleset" autocomplete="off">
+        </label>
+        <label for="e-retries">人工门重试上限
+          <input id="e-retries" type="number" min="0" step="1" autocomplete="off">
+        </label>
+        <label for="e-gatewait">人工门等待上限 / 毫秒
+          <input id="e-gatewait" type="number" min="0" step="1" autocomplete="off">
+        </label>
+        <label for="e-ttl">门任务 TTL / 毫秒
+          <input id="e-ttl" type="number" min="0" step="1" autocomplete="off">
+        </label>
+        <label for="e-diag">诊断探针白名单（逗号分隔）
+          <input id="e-diag" autocomplete="off">
+        </label>
+      </div>
+      <p class="out" id="out-edit" role="alert" hidden></p>
+      <div class="actions">
+        <button type="submit" class="primary" id="btn-edit-save">保存</button>
+        <button type="button" id="btn-edit-cancel">取消</button>
       </div>
     </form>
   </dialog>

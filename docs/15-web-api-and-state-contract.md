@@ -691,6 +691,30 @@ type RunResult =
 
 ---
 
+## 8.6 编辑 / 移除流水线（W5 后续）
+
+| 接口 | 语义 | 权限 |
+|---|---|---|
+| `PATCH /api/pipelines/:pipelineId` | 只改**运行参数**（需求输入 / provider / 被测基址 / 规则集 / 重试上限 / 门等待 / TTL / 诊断探针）。**不改**作用域字段与状态 | `operator` |
+| `DELETE /api/pipelines/:pipelineId` | **只摘索引**（`dataRetained: true`），数据仍留在数据根 | `admin` |
+
+**编辑的三条边界**（都有用例钉住）：① 不改 `projectId`/`tenantId`/`configRef`——它们决定索引键；
+② **不改状态**：已有产物时只返回 `warning`，不自动重入；③ 有运行在进行中时 `conflict`（判据用**运行锁**，
+跨进程有效；不用进程内 registry）。
+
+**移除为什么不是真删**：产物/检查点/任务/门任务四个端口都没有 `remove` 能力。
+真删要么给这四个端口加 `remove` 并同步三个后端与契约测试，要么让 service 按文件路径递归删
+（跨过后端抽象、绕过路径安全校验）。保留数据换来**可恢复**与**审计链不断**。
+
+**新增落盘/契约**：
+- `PipelineRunView.params?`（**仅 `get()` 填**）——页面据此预填编辑表单；
+- manifest 新增 `updatedAt?`（与 `createdAt` 分开）；
+- `AuditEventKind` 新增 `pipeline-updated` / `pipeline-removed`
+  ——**必须同时加进运行时白名单 `AUDIT_EVENT_KINDS`**，否则写侧照写、读侧静默丢弃
+  （本文件上面那段注释警告的正是这件事，实测踩到过一次）。
+
+---
+
 ## 9. 本轮计划新增/变更的契约
 
 > 以下为 `docs/14` W1~W3 的计划内容，**冻结稿确认它们尚未存在**。实现时必须

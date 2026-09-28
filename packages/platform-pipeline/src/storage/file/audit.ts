@@ -164,6 +164,10 @@ export const AUDIT_EVENT_KINDS: readonly AuditEventKind[] = [
   'pipeline-created', 'run-started', 'run-settled', 'stage-advanced', 'gate-opened',
   'gate-decided', 'gate-failed', 'reentry', 'cancelled', 'artifact-written',
   'executor-invoked', 'knowledge-written', 'case-archived', 'lock-event', 'storage-migrated',
+  // 编辑与移除（docs/14 W5 后续）。**必须同时加在这里**：只加类型不加数组时，
+  // 写侧照写、读侧静默丢弃——事件在盘上却永远查不出来（本文件上面那段注释警告的正是这件事，
+  // 实测踩到过一次：`update`/`remove` 的审计事件一条都读不出来）。
+  'pipeline-updated', 'pipeline-removed',
 ]
 
 function errorMessageOf(error: unknown): string {

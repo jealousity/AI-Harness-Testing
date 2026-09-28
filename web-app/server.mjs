@@ -367,6 +367,23 @@ const ROUTES = [
     json(res, 200, await service.diagnose(pipelineId, actorOf(req)))
   }],
 
+  ['PATCH', /^\/api\/pipelines\/([^/]+)$/, async (req, res, pipelineId) => {
+    // 编辑**运行参数**（docs/14 W5 后续）。作用域字段（projectId/tenantId/configRef）
+    // 刻意不可编辑——它们决定索引键，改了就不是同一条流水线。
+    const body = await readJsonBody(req)
+    json(res, 200, await service.update({
+      pipelineId,
+      ...optionalFields(body, ['requirementInput', 'providerName', 'targetBaseUrl', 'rulesetVersion']),
+      ...optionalNumbers(body, ['maxGateRetries', 'gateWaitTimeoutMs', 'gateTaskTtlMs']),
+      ...(Array.isArray(body.diagCredentials) ? { diagCredentials: body.diagCredentials } : {}),
+    }, actorOf(req)))
+  }],
+
+  ['DELETE', /^\/api\/pipelines\/([^/]+)$/, async (req, res, pipelineId) => {
+    // 破坏性动作（要求 admin，service 层再校验一次）。
+    json(res, 200, await service.remove(pipelineId, actorOf(req)))
+  }],
+
   ['POST', /^\/api\/pipelines\/([^/]+)\/reenter$/, async (req, res, pipelineId) => {
     const body = await readJsonBody(req)
     const checkpoint = await service.reenter({

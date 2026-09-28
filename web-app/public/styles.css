@@ -101,6 +101,18 @@ main {
   border-radius: var(--radius); padding: 12px 14px;
 }
 .side-block > h2 { margin: 0 0 8px; font-size: 14px; }
+.side-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+/* 一级菜单项：整块可点，选中态明确（不只靠颜色——带 aria-current）。 */
+.side-nav { padding: 6px; }
+.nav-item {
+  width: 100%; text-align: left; padding: 8px 10px;
+  border: 1px solid transparent; border-radius: 6px; background: transparent;
+  font-size: 14px;
+}
+.nav-item:hover { background: var(--bg); border-color: var(--line); }
+.nav-item[aria-current="page"] { background: #eef4ff; border-color: #cfe0ff; color: var(--info); font-weight: 600; }
+.side-head > h2 { margin: 0; font-size: 14px; }
+.side-head > button { padding: 3px 10px; font-size: 12px; }
 /* 通用配置是可折叠的 details：标题即折叠开关。 */
 .side-block > summary {
   cursor: pointer; font-weight: 600; font-size: 14px;

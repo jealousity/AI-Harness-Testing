@@ -144,6 +144,26 @@ export interface StageView {
   readonly failure: StageFailureView | null
 }
 
+/**
+ * 流水线的**运行参数**（清单里可编辑的那部分）。
+ *
+ * 只在 `get()` 的返回值上出现（列表与运行结果不需要它，因此视图里是可选字段）。
+ * 页面用它**预填编辑表单**——没有它就只能让用户盲填，而"留空 = 不修改"会让
+ * 用户无法确认当前值到底是什么。
+ */
+export interface PipelineRunParams {
+  readonly requirementInput?: string
+  readonly providerName?: string
+  readonly targetBaseUrl?: string
+  readonly rulesetVersion?: string
+  readonly maxGateRetries?: number
+  readonly gateWaitTimeoutMs?: number
+  readonly gateTaskTtlMs?: number
+  readonly diagCredentials?: readonly string[]
+  /** 最近一次编辑时间；从未编辑过则缺省。 */
+  readonly updatedAt?: number
+}
+
 /** 流水线级失败摘要。`detail` 取自持久化事实（门禁违规 / 审核 findings / 异常消息）。 */
 export interface PipelineRunFailure {
   readonly kind: 'gate-failed' | 'review-failed' | 'rejected' | 'cancelled' | 'error'
@@ -353,6 +373,55 @@ export function deriveNextAction(facts: NextActionFacts): NextActionDecision {
 }
 
 /**
+ * 编辑流水线请求（`PATCH /api/pipelines/:pipelineId`）。
+ *
+ * **只应用出现的字段**：没传的保持原值。要清空一个可选字符串/数组，传空串或空数组
+ * （不用 `null`——那会与"没传"难以区分，而 JSON 里两者都能表达，容易误清）。
+ *
+ * **不包含** `projectId` / `tenantId` / `configRef`：它们决定作用域与索引键，
+ * 改了就不是同一条流水线了（要换项目就新建一条）。
+ */
+export interface UpdatePipelineRunInput {
+  readonly pipelineId: string
+  readonly requirementInput?: string
+  readonly providerName?: string
+  readonly targetBaseUrl?: string
+  readonly rulesetVersion?: string
+  readonly maxGateRetries?: number
+  readonly gateWaitTimeoutMs?: number
+  readonly gateTaskTtlMs?: number
+  readonly diagCredentials?: readonly string[]
+}
+
+/** 编辑结果。 */
+export interface PipelineUpdateView {
+  readonly pipelineId: string
+  readonly updatedAt: number
+  /** 变更过的字段名（没变更时为空数组）。 */
+  readonly changedFields: readonly string[]
+  /**
+   * 面向运维的提醒。当这条流水线**已经产出过阶段产物**时给出——
+   * 那些产物是在**旧参数**下产生的，参数改了它们不会自动重做。
+   */
+  readonly warning: string | null
+}
+
+/**
+ * 移除流水线结果（`DELETE /api/pipelines/:pipelineId`）。
+ *
+ * **当前实现只摘掉索引，数据仍留在数据根**（`dataRetained: true`）。
+ * 理由写在 `dataRetainedReason` 里——真删需要给产物/检查点/任务/门任务四个端口
+ * 增加 `remove` 能力并同步三个后端与契约测试，那是独立的一项工作。
+ * 保留数据意味着可恢复、可取证；清理由运维在数据根上做。
+ */
+export interface PipelineRemovalView {
+  readonly pipelineId: string
+  readonly removed: boolean
+  readonly dataRetained: boolean
+  readonly dataRetainedReason: string
+}
+
+/**
  * 数据根体检结果（`GET /api/pipelines/:pipelineId/diagnostics`，docs/14 W5 第 9 条）。
  *
  * 为什么需要它：单机部署里出问题时，运维只能看服务端日志或手工翻文件。
@@ -437,6 +506,11 @@ export interface PipelineRunView {
   readonly blockingReason: string | null
   /** 当前未决门的种类；没有未决门时为 `null`。 */
   readonly gateKind: GateTaskKind | null
+  /**
+   * 运行参数（仅 `get()` 填；列表与运行结果不带它）。
+   * 页面据此预填编辑表单。
+   */
+  readonly params?: PipelineRunParams
 }
 
 /**

@@ -88,6 +88,7 @@ import { HumanGateWaitAbortedError } from '../runtime/persistent-human-gate.ts'
 import { inspectPipelineLock } from '../checkpoint-lock.ts'
 import {
   PipelineRunError,
+  assertAdminRole,
   assertGateRole,
   assertOperatorRole,
   deriveNextAction,
@@ -103,6 +104,10 @@ import {
   type GateTaskKind,
   type GateTaskView,
   type PipelineDiagnostics,
+  type PipelineRemovalView,
+  type PipelineRunParams,
+  type PipelineUpdateView,
+  type UpdatePipelineRunInput,
   type PipelineEventKind,
   type PipelineEventView,
   type PipelineRunFailure,
@@ -226,6 +231,10 @@ export interface PipelineRunService {
    * 要求 `operator`：它是只读的，但暴露的是部署层面的排障信息。
    */
   diagnose(pipelineId: string, actor: ActorContext): Promise<PipelineDiagnostics>
+  /** 编辑运行参数（不改作用域、不改状态、有运行在跑时拒绝）。 */
+  update(input: UpdatePipelineRunInput, actor: ActorContext): Promise<PipelineUpdateView>
+  /** 移除流水线（当前只摘索引，数据保留；要求 admin）。 */
+  remove(pipelineId: string, actor: ActorContext): Promise<PipelineRemovalView>
   /**
    * 回读某阶段的产物文件（`GET /api/pipelines/:pipelineId/stages/:stageId/artifact`）。
    *
@@ -296,6 +305,13 @@ export interface PipelineRunManifest {
   readonly rulesetVersion?: string
   /** 创建时间（毫秒）；历史索引没有这个字段。 */
   readonly createdAt?: number
+  /**
+   * 最近一次**编辑**时间（毫秒）；从未编辑过则缺省。
+   *
+   * 与 `createdAt` 分开：`create` 的幂等指纹覆盖运行参数，而 `update` 是显式改参数，
+   * 两者语义不同——合成一个字段会让"这条流水线什么时候建的"变得不可回答。
+   */
+  readonly updatedAt?: number
   /** receive 阶段的输入文件路径（降级链末级）。 */
   readonly requirementInput?: string
   /** 指定 provider 名；缺省按配置的 `llm.defaultProvider` 回退。 */
@@ -406,6 +422,7 @@ function isIndexEntry(value: unknown): value is PipelineRunManifest {
     && optionalNonEmptyString(candidate, 'providerName')
     && optionalNonEmptyString(candidate, 'targetBaseUrl')
     && optionalFiniteNumber(candidate, 'createdAt')
+    && optionalFiniteNumber(candidate, 'updatedAt')
     && optionalFiniteNumber(candidate, 'maxGateRetries')
     && optionalFiniteNumber(candidate, 'gateWaitTimeoutMs')
     && optionalFiniteNumber(candidate, 'gateTaskTtlMs')
@@ -444,6 +461,32 @@ function optionalNonEmptyStringArray(record: Record<string, unknown>, key: strin
 const GATE_DECISIONS = ['approved', 'changes-needed', 'rejected'] as const
 const CLAIMABLE_STATUSES = ['pending', 'claimed'] as const
 const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+/**
+ * 允许通过 `update()` 编辑的清单字段。
+ *
+ * 刻意**不含** `pipelineId` / `projectId` / `tenantId` / `configRef`：
+ * 它们决定索引键与作用域，改了就不是同一条流水线（要换项目就新建一条）。
+ */
+/** 从清单投影出**可编辑的运行参数**（只取 `EDITABLE_MANIFEST_FIELDS`，不泄露作用域字段）。 */
+function runParamsOf(manifest: PipelineRunManifest): PipelineRunParams {
+  return {
+    ...(manifest.requirementInput === undefined ? {} : { requirementInput: manifest.requirementInput }),
+    ...(manifest.providerName === undefined ? {} : { providerName: manifest.providerName }),
+    ...(manifest.targetBaseUrl === undefined ? {} : { targetBaseUrl: manifest.targetBaseUrl }),
+    ...(manifest.rulesetVersion === undefined ? {} : { rulesetVersion: manifest.rulesetVersion }),
+    ...(manifest.maxGateRetries === undefined ? {} : { maxGateRetries: manifest.maxGateRetries }),
+    ...(manifest.gateWaitTimeoutMs === undefined ? {} : { gateWaitTimeoutMs: manifest.gateWaitTimeoutMs }),
+    ...(manifest.gateTaskTtlMs === undefined ? {} : { gateTaskTtlMs: manifest.gateTaskTtlMs }),
+    ...(manifest.diagCredentials === undefined ? {} : { diagCredentials: manifest.diagCredentials }),
+    ...(manifest.updatedAt === undefined ? {} : { updatedAt: manifest.updatedAt }),
+  }
+}
+
+const EDITABLE_MANIFEST_FIELDS = [
+  'requirementInput', 'providerName', 'targetBaseUrl', 'rulesetVersion',
+  'maxGateRetries', 'gateWaitTimeoutMs', 'gateTaskTtlMs', 'diagCredentials',
+] as const
+
 const DEFAULT_RULESET_VERSION = 'platform-generic-r1'
 const DEFAULT_CLAIM_TTL_MS = 300_000
 
@@ -580,8 +623,10 @@ export class FilePipelineRunService implements PipelineRunService {
   async get(pipelineId: string, actor: ActorContext): Promise<PipelineRunView> {
     assertActor(actor)
     assertSafeIdentifier(pipelineId, 'pipelineId')
-    const { config, checkpoint } = await this.loadRun(pipelineId, actor)
-    return this.buildView(config, checkpoint)
+    const { manifest, config, checkpoint } = await this.loadRun(pipelineId, actor)
+    // `params` 只在 `get()` 上挂：列表与运行结果不需要它，而穿透 7 处 `buildView`
+    // 调用点去加一个必填字段，风险远大于收益。
+    return { ...(await this.buildView(config, checkpoint)), params: runParamsOf(manifest) }
   }
 
   async list(actor: ActorContext): Promise<readonly PipelineRunSummary[]> {
@@ -799,6 +844,146 @@ export class FilePipelineRunService implements PipelineRunService {
       // 直接透传裸 Error 会让调用方拿不到 code，只能把一切归成 500。
       // `run()` 里的 catch 也是这么翻译的，这里保持一致。
       throw toPipelineRunError(error)
+    }
+  }
+
+  /**
+   * 编辑流水线的**运行参数**（`PATCH /api/pipelines/:pipelineId`）。
+   *
+   * 边界（刻意收窄）：
+   * - **不改** `projectId` / `tenantId` / `configRef`：它们决定作用域与索引键，
+   *   改了就不是同一条流水线（要换项目就新建）；
+   * - **不改状态**：编辑是"改参数"，不是"改流水线状态"。已经有产物时只给一句提醒，
+   *   让运维自己决定要不要 reenter——顺手把状态改了会很意外；
+   * - **有运行在进行中时拒绝**：参数会在下一次 run 生效，而正在跑的那次用的是旧参数，
+   *   中途改会让"这次运行到底按哪套参数"变得不可解释。
+   *
+   * 与 `create` 的幂等指纹的关系：`create` 用指纹把"同 ID 换参数"挡成 409，那是为了防止
+   * **静默复用**（同一次创建请求被重试时悄悄用上别人的参数）。编辑是**显式**动作，
+   * 有审计留痕，两者不冲突。
+   */
+  async update(input: UpdatePipelineRunInput, actor: ActorContext): Promise<PipelineUpdateView> {
+    assertActor(actor)
+    assertOperatorRole(actor, '编辑流水线')
+    assertSafeIdentifier(input.pipelineId, 'pipelineId')
+    if (input.targetBaseUrl !== undefined && input.targetBaseUrl.trim() !== '') {
+      this.assertTargetBaseUrl(input.targetBaseUrl)
+    }
+    if (input.diagCredentials !== undefined) assertDiagCredentials(input.diagCredentials)
+    assertNonNegativeInteger(input.maxGateRetries, 'maxGateRetries')
+    assertNonNegativeInteger(input.gateWaitTimeoutMs, 'gateWaitTimeoutMs')
+    assertNonNegativeInteger(input.gateTaskTtlMs, 'gateTaskTtlMs')
+
+    const { manifest, config, backend, checkpointRoot, checkpointBase } = await this.locate(input.pipelineId, actor)
+    await this.assertNoRunInFlight(checkpointBase, input.pipelineId, '编辑')
+
+    const next: PipelineRunManifest = {
+      ...manifest,
+      ...(input.requirementInput === undefined ? {} : { requirementInput: input.requirementInput }),
+      ...(input.providerName === undefined ? {} : { providerName: input.providerName }),
+      ...(input.targetBaseUrl === undefined ? {} : { targetBaseUrl: input.targetBaseUrl }),
+      ...(input.rulesetVersion === undefined ? {} : { rulesetVersion: input.rulesetVersion }),
+      ...(input.maxGateRetries === undefined ? {} : { maxGateRetries: input.maxGateRetries }),
+      ...(input.gateWaitTimeoutMs === undefined ? {} : { gateWaitTimeoutMs: input.gateWaitTimeoutMs }),
+      ...(input.gateTaskTtlMs === undefined ? {} : { gateTaskTtlMs: input.gateTaskTtlMs }),
+      ...(input.diagCredentials === undefined ? {} : { diagCredentials: input.diagCredentials }),
+      updatedAt: Date.now(),
+    }
+    const changedFields = EDITABLE_MANIFEST_FIELDS
+      .filter(field => JSON.stringify(manifest[field]) !== JSON.stringify(next[field]))
+
+    await this.writeIndex(next)
+    await this.appendAudit(backend, manifest, config, actor, 'pipeline-updated',
+      `编辑流水线运行参数：${changedFields.length === 0 ? '（无字段变化）' : changedFields.join('、')}`)
+
+    const checkpoint = await this.requireCheckpoint(backend, input.pipelineId, checkpointRoot)
+    const produced = STAGE_ORDER.some(id => checkpoint.stageStates[id]!.status !== 'idle')
+    return {
+      pipelineId: input.pipelineId,
+      updatedAt: next.updatedAt ?? Date.now(),
+      changedFields,
+      warning: produced
+        ? '该流水线已有阶段产物，它们是在**旧参数**下产生的；本次编辑不会自动重做它们。'
+          + '要按新参数重做，请在「高级」里登记重入（reenter）对应阶段。'
+        : null,
+    }
+  }
+
+  /**
+   * **移除**流水线（`DELETE /api/pipelines/:pipelineId`）。
+   *
+   * **当前实现只摘掉索引，数据仍留在数据根**——`dataRetained: true`，理由如实写在返回值里。
+   *
+   * 为什么不真删：产物/检查点/任务/门任务四个端口都没有 `remove` 能力，
+   * 真删要么给这四个端口加 `remove` 并同步 file/memory/compose 三个后端与契约测试
+   * （独立的一项工作），要么让 service 直接按文件路径递归删（**跨过后端抽象**，
+   * 换后端就失效，且绕过路径安全校验）。两者都不该塞进这个改动里。
+   *
+   * 保留数据的两个好处：**可恢复**（重新用同一 pipelineId 创建即可找回现场）、
+   * **可取证**（审计链不断）。清理是运维在数据根上的动作。
+   *
+   * 注意：移除后**重新创建同一 pipelineId 会写新的检查点**，覆盖旧的那份
+   * （索引没了，`create` 的"已存在"检查不会触发）。要保留旧现场就先备份数据根。
+   */
+  async remove(pipelineId: string, actor: ActorContext): Promise<PipelineRemovalView> {
+    assertActor(actor)
+    // 破坏性动作：要求 admin（与 recover 同级）。
+    assertAdminRole(actor, '移除流水线')
+    assertSafeIdentifier(pipelineId, 'pipelineId')
+
+    const { manifest, config, backend, checkpointBase } = await this.locate(pipelineId, actor)
+    await this.assertNoRunInFlight(checkpointBase, pipelineId, '移除')
+
+    await this.indexStore.remove(PIPELINE_INDEX_COLLECTION, pipelineId)
+    await this.appendAudit(backend, manifest, config, actor, 'pipeline-removed',
+      '从索引移除流水线（数据保留在数据根，可用同一 pipelineId 重新创建找回）')
+
+    return {
+      pipelineId,
+      removed: true,
+      dataRetained: true,
+      dataRetainedReason:
+        '当前只摘除索引：产物/检查点/门任务/用量/审计仍留在数据根。'
+        + '真删需要给四个存储端口增加 remove 能力（含三个后端与契约测试），属独立工作。',
+    }
+  }
+
+  /**
+   * 有运行在进行中时拒绝写操作。
+   *
+   * 判据用**运行锁**而不是进程内 registry：锁是跨进程的持久化事实，
+   * 而 registry 只覆盖本进程——用后者会漏掉"另一个进程正在跑"。
+   */
+  private async assertNoRunInFlight(checkpointBase: string, pipelineId: string, action: string): Promise<void> {
+    const lock = await inspectPipelineLock(checkpointBase, pipelineId)
+    if (!lock.present) return
+    throw new PipelineRunError('conflict', `该流水线有运行在进行中，不能${action}`, {
+      pipelineId,
+      lockOwner: lock.owner?.ownerId ?? null,
+      hint: '等运行结束；若确认是残留锁，用数据根体检（diagnostics）确认后再处理。',
+    })
+  }
+
+  /** 追加一条审计事件。**尽力而为**：审计是观测，写不进去不该回滚业务动作。 */
+  private async appendAudit(
+    backend: StorageBackend,
+    manifest: PipelineRunManifest,
+    config: PipelineConfig,
+    actor: ActorContext,
+    kind: 'pipeline-updated' | 'pipeline-removed',
+    detail: string,
+  ): Promise<void> {
+    try {
+      await backend.ports.audit.append({
+        kind,
+        actor: actor.actorId,
+        detail,
+        projectId: config.projectId,
+        pipelineId: manifest.pipelineId,
+        ...(config.scope?.tenantId === undefined ? {} : { tenantId: config.scope.tenantId }),
+      })
+    } catch {
+      // 审计写失败不能把业务动作判成失败——那会让"动作成功了但报错"更糟。
     }
   }
 
@@ -1146,9 +1331,10 @@ export class FilePipelineRunService implements PipelineRunService {
   private async loadRun(pipelineId: string, actor: ActorContext): Promise<{
     readonly config: PipelineConfig
     readonly checkpoint: Checkpoint
+    readonly manifest: PipelineRunManifest
   }> {
-    const { config, backend, checkpointRoot } = await this.locate(pipelineId, actor)
-    return { config, checkpoint: await this.requireCheckpoint(backend, pipelineId, checkpointRoot) }
+    const { manifest, config, backend, checkpointRoot } = await this.locate(pipelineId, actor)
+    return { manifest, config, checkpoint: await this.requireCheckpoint(backend, pipelineId, checkpointRoot) }
   }
 
   /**
