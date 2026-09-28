@@ -182,13 +182,16 @@ type PipelineEventKind =
   "ok": true,
   "app": "harness-web-app",
   "configRef": "default",
-  "trustActorHeaders": false,
-  "running": ["<pipelineId>", "..."]
+  "trustActorHeaders": false
 }
 ```
 
-> **W-05（待修）**：`running` 泄露正在运行的 pipeline ID，与本服务其它路径"把跨作用域
-> 伪装成 not-found"的防枚举设计自相矛盾。W1 将移除该字段。
+> **已由 W1 收紧（W-05）**：原响应含 `running: [pipelineId...]`，那是一个**未鉴权**的
+> 枚举旁路——本服务其它路径都刻意把"存在但无权限"伪装成 `not-found`，而 `/health`
+> 直接把正在运行的 ID 列出来。现已移除。
+> 单条流水线的运行状态仍可从 `GET /api/pipelines/:pipelineId` 的 `running` 字段读取
+> （已鉴权、已作用域校验），能力没有丢失。
+> 回归：`test/web-http.test.ts` 验收10a 断言健康响应**字段集合恰好**为这四个键。
 
 ### 5.2 `GET /api/pipelines`
 
@@ -491,17 +494,33 @@ type RunResult =
 
 ---
 
-## 9. 本轮计划新增/变更的契约（**当前均未实现**）
+## 8.1 W1 落地记录（启动与安全硬化）
+
+| 项 | 落地方式 | 证据 |
+|---|---|---|
+| 严格数值解析 | 新增 `src/web/server-config.ts` 的 `parseWebServerConfig`；只接受十进制非负整数，`NaN`/小数/科学计数法/十六进制/负数/越界**启动即失败** | `test/web-server-config.test.ts` |
+| 请求体上限 | `PLATFORM_MAX_BODY` 经严格解析后注入 `readJsonBody`；`content-length` 与分块累积两条路径都拒绝 | 验收10c + 手工冒烟 |
+| `/health` 脱敏 | 只回 `ok`/`app`/`configRef`/`trustActorHeaders` | 验收10a |
+| 危险部署组合 | `assertTrustActorHeadersDeployment`：信任请求头 + 非回环 + 未声明 `PLATFORM_TRUSTED_PROXY=1` → 拒绝启动 | 验收10e + 手工冒烟（exit=1） |
+| 启动期完整配置校验 | `assertStartupConfigUsable`：阶段 ACL、审批覆盖、规则引用、provider 引用 | `test/web-server-config.test.ts` |
+| 启动日志不泄露 | `startupLogLines` 只含监听地址、逻辑 configRef、危险模式警告 | 同文件 |
+
+**新增环境变量**：`PLATFORM_TRUSTED_PROXY`（`'1'` 表示"身份由可信反向代理提供"，
+是开启请求头信任且非回环绑定时的**显式表态**）。未设置时该组合拒绝启动。
+
+---
+
+## 9. 本轮计划新增/变更的契约
 
 > 以下为 `docs/14` W1~W3 的计划内容，**冻结稿确认它们尚未存在**。实现时必须
 > 先写契约测试，并在本文件对应章节把状态从"计划"改为"已实现 + 提交号"。
 
 | 计划项 | 类型 | 归属阶段 | 状态 |
 |---|---|---|---|
-| `GET /health` 移除 `running` 字段 | **变更（收紧）** | W1 | 未实现 |
-| 数值环境变量严格校验，非法即启动失败 | 变更 | W1 | 未实现 |
-| 非 loopback + trust headers 无可信代理策略时拒绝启动 | 新增 | W1 | 未实现 |
-| 启动时完成完整配置/ACL/审批覆盖校验 | 变更 | W1 | 未实现 |
+| `GET /health` 移除 `running` 字段 | **变更（收紧）** | W1 | ✅ 已实现（`ee0814b`）｜`test/web-http.test.ts` 验收10a |
+| 数值环境变量严格校验，非法即启动失败 | 变更 | W1 | ✅ 已实现（`ee0814b`）｜`test/web-server-config.test.ts`（22 项） |
+| 非 loopback + trust headers 无可信代理策略时拒绝启动 | 新增 | W1 | ✅ 已实现（`ee0814b`）｜同文件 + 验收10e；新增 `PLATFORM_TRUSTED_PROXY=1` 显式表态 |
+| 启动时完成完整配置/ACL/审批覆盖校验 | 变更 | W1 | ✅ 已实现（`ee0814b`）｜`assertStartupConfigUsable`；`web-app/server.mjs` 启动即调用 |
 | `PipelineRunView.currentStage` | 新增（派生） | W3 | 未实现 |
 | `PipelineRunView.nextAction` | 新增（派生） | W3 | 未实现 |
 | `PipelineRunView.blockingReason` | 新增（派生） | W3 | 未实现 |
