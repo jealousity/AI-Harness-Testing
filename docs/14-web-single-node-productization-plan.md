@@ -416,32 +416,48 @@ web-app/public/styles.css
 
 推荐不引入前端框架，继续使用原生 DOM；若 DeepSeek 认为需要依赖，必须先报告依赖、体积、离线运行和安全影响，未经确认不得引入。
 
-页面结构：
+页面结构（**按用户要求调整**：通用配置进左侧一级菜单，创建流水线改成按钮 + 对话框）：
 
 ```text
 AppShell
 ├── TopBar
 │   ├── Brand
 │   ├── ServiceHealth
-│   ├── PipelineSelector
-│   └── Refresh/ConnectionState
-├── PipelineSummary
-│   ├── tenant/project/pipeline
-│   ├── status/currentStage/nextAction
-│   └── primaryAction
-├── StageStepper
-├── MainWorkspace
-│   ├── CurrentTaskCard
-│   ├── ArtifactViewer
-│   ├── GateReviewPanel
-│   └── FailureRecoveryPanel
-├── UsageBudgetPanel
-├── EventTimeline
-└── AdvancedDetails
-    ├── manifest summary
-    ├── raw machine violations
-    └── backend/diagnostic information
+│   └── Refresh / ConnectionState（含暂停自动刷新）
+├── Sidebar（左侧一级菜单）
+│   ├── 通用配置（对本会话内新建的流水线生效）
+│   │   ├── 项目 ID（必填）
+│   │   ├── Provider / 规则集版本
+│   │   └── 运行选项：人工门重试上限 / 等待上限 / 门任务 TTL
+│   └── 流水线
+│       ├── [＋ 新建流水线]  ← 按钮，打开对话框
+│       ├── 筛选（项目 / 状态）
+│       └── 可见流水线列表
+└── MainWorkspace
+    ├── 主区状态位（运行 / 裁决 / 恢复 / 取消的结果）
+    ├── EmptyState（未打开流水线时；不是空表格）
+    ├── PipelineSummary（含由 nextAction 驱动的主操作按钮）
+    ├── StageStepper
+    ├── CurrentTaskCard
+    ├── GateReviewPanel
+    ├── ArtifactViewer
+    ├── UsageBudgetPanel
+    ├── EventTimeline
+    └── AdvancedDetails
+        ├── 重入表单
+        ├── 数据根体检
+        ├── raw machine violations
+        └── backend/diagnostic information
+
+CreatePipelineDialog（模态）
+├── 通用配置摘要（只读回显，来自左侧菜单）
+├── 流水线 ID（必填）
+├── 需求输入文件 / 被测服务基址 / 诊断探针（每条流水线特有）
+└── 创建 / 取消
 ```
+
+**通用配置只活在会话内存里**，不写 `localStorage`/`sessionStorage`：运行状态一律来自
+服务端，浏览器不做第二份事实来源（`test/web-ui-contract.test.ts` 有断言钉住）。
 
 交互要求：
 
