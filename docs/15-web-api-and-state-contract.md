@@ -636,10 +636,49 @@ type RunResult =
 检查点没写、事件流里没有、视图仍显示 `queued`，页面只说"尚未开始：触发运行"。
 用户会反复点"触发运行"而得不到任何解释。
 
-**为什么不在这里修**：让 `deriveRunStatus` 产出 `failed` 需要把运行期失败**持久化**
-（审计事件或检查点），那是 driver/host 的改动。用"进程内记一下上次失败"来补是
-**被架构禁止的**——进程内 registry 刻意不导出任何状态查询，否则会变成第二份事实来源。
-已列为 `docs/14` W5 的任务。
+**修法与结果（W5 已修）**：这类失败（provider 缺 Key、审批覆盖缺失…）是在**宿主装配**时
+**同步**抛出来的，却发生在后台任务内部。因此正确修法不是"把失败持久化"，而是
+**把前置校验前移到启动后台任务之前**：
+
+- 新增 `PipelineRunService.preflight(pipelineId, actor)`：跑完 `run()` 里除"取锁 + 跑 driver"
+  之外的全部准备步骤；
+- `AsyncRunner.trigger()` 在 `registry.start()` **之前**调用它；失败时返回
+  `{ started: false, reason: '<错误码>: <消息>' }`，**不启动**注定失败的后台任务；
+- 请求级错误（404/403/400/401）仍按原状态码冒泡，不被降级。
+
+这比持久化更好：失败发生得更早，而且**不新增任何状态**（用"进程内记住上次失败"来补
+是被架构禁止的）。证据：`test/web-preflight.test.ts`（用**真实宿主**复现缺 Key 路径）。
+
+**仍未覆盖的一半**：真正的**运行期**异常（driver 内部抛错）不写检查点，因此后台运行时
+对 UI 仍不可见——那需要权威的运行遥测（M3），**本轮未做**，已记在 §8.5。
+
+---
+
+## 8.5 W5 落地记录（单机运行、恢复与数据生命周期）
+
+| 规划书要求 | 落地方式 | 证据 |
+|---|---|---|
+| 本地启动说明 + 最小环境变量模板 | 新增 `docs/16-local-single-node-runbook.md` | 手册本身 |
+| 数据根按需创建、**数据根之外不写业务状态** | 由后端按需 `mkdir`；有测试把数据根放进父目录、跑完整生命周期后比对父目录 | `test/web-single-node.test.ts` |
+| 创建 → 门 → 关进程 → 重启 → recover → 继续 | `recover` 用与 service 同一个索引存储；重启后视图逐字相同 | 同文件（3 项） |
+| recover 不替真人裁决、不自动批准 | `await-human` + `started: false` + **零 spawn** | 同文件 |
+| 进程内句柄不作事实来源 | 重启后 `get`/`listGateTasks`/`listEvents` 全部从磁盘重建 | 同文件 |
+| **后台运行前置失败对 UI 可见** | `preflight` 前移（见 §8.4） | `test/web-preflight.test.ts`（5 项） |
+
+### 契约变化
+
+- **新增** `PipelineRunService.preflight(pipelineId, actor): Promise<void>`。
+- **`POST /api/pipelines/:id/run` 的 `started: false` 新增取值形态**
+  `'<错误码>: <消息>'`（例如 `provider-unavailable: ... missing API key environment variable: X`）。
+  原有 `'already-running'` 语义不变。
+
+### 已知边界（不是缺陷）
+
+- `preflight` **不取运行锁**（锁要留给真正的 `run()`），因此它只保证"明显跑不起来的配置
+  在启动后台任务之前被拦下"，**不保证**"校验通过后 run 一定能开始"。
+- **运行期**异常仍不持久化（见 §8.4 末尾），属 M3 遥测范围。
+- **数据根体检接口（规划书 W5 第 9 条）本轮未做**：`backend.diagnose()` 已存在，
+  但没有把它暴露成 HTTP 接口或 CLI 命令。缺它时排障只能看服务端日志与手工看文件。
 
 ---
 
@@ -662,7 +701,9 @@ type RunResult =
 | 门任务 `isEscalation` | 新增（派生） | W3 | ✅ 已实现（`1f15943`）｜同文件 |
 | 两个 cancel 端点响应形状统一 | **变更（破坏性）** | W3 | ✅ 已实现（`1f15943`）｜`web-app/server.mjs` |
 | Web UI 信息架构与交互重做 | 重写（前端） | W4 | ✅ 已实现（`9611476`）｜`test/web-ui-contract.test.ts`（12 项） |
-| 后台运行前置失败对 UI 可见 | 新增（需后端持久化） | W5 | ⬜ **未实现**，理由见 §8.4 |
+| 后台运行**前置**失败对 UI 可见 | 新增 | W5 | ✅ 已实现（`67c4f5c`）｜`preflight` 前移，见 §8.4 |
+| 后台运行**运行期**失败对 UI 可见 | 新增（需 M3 遥测持久化） | — | ⬜ **未实现**，理由见 §8.5 |
+| 数据根体检接口 / 命令 | 新增 | W5 | ⬜ **未实现**，理由见 §8.5 |
 | `list()` 改用注入的 `indexStore` | **缺陷修复（W-01）** | W2 | ✅ 已实现（`f46cf37`）｜`test/web-index-and-creation.test.ts` |
 | `records` 缺失时显式区分 legacy fallback 与失败关闭 | 变更 | W2 | ✅ 已实现（`f46cf37`）｜`assertBackendPorts` 对"外部后端"失败关闭；同文件 |
 | 索引扫描区分数据损坏与基础设施不可用 | 变更 | W2 | ✅ 已实现（`f46cf37`）｜`scanPipelineIndexFrom` 只把数据问题放进 `unreadable` |
