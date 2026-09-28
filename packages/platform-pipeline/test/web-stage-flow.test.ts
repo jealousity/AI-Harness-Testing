@@ -295,3 +295,63 @@ test('W3：rejected 终态下 nextAction 是 reenter，且服务端确实拒绝�
   assert.ok(['gate-not-decidable', 'gate-consumed', 'gate-not-claimable'].includes(String(code)),
     `终态裁决必须被拒，实际 ${String(code)}`)
 })
+
+// ── 4. 运行期异常必须落盘并对 UI 可见（docs/14 W5 遗留项）──────────────────────
+
+test('W3：阶段抛非预期异常时，失败被落盘、状态为 failed、动作为 reenter', async () => {
+  // 这个缺口是 W4 冒烟时实测到的：driver 内部抛出的异常此前只随 RunResult 返回给
+  // 后台任务，于是后台运行时在 UI 上**完全不可见**——检查点没写、事件流没有、
+  // 页面只说"尚未开始"，用户只会反复点"触发运行"。
+  const service = serviceOf(new ScriptedHost({ crashStages: ['receive'] }))
+  await service.create(CREATE, REVIEWER)
+
+  const result = await service.run('pipe-1', REVIEWER)
+  assert.equal(result.outcome, 'failed', '非预期异常必须归成 failed 结果')
+
+  const view = await service.get('pipe-1', REVIEWER)
+  assert.equal(view.status, 'failed', '状态必须是 failed（不能因为阶段停在 running 就显示"运行中"）')
+  assert.equal(view.nextAction, 'reenter', '页面因此给的是"去登记重入"，而不是让人反复点运行')
+  assert.equal(view.currentStage, 'receive')
+
+  const failure = view.stages.find(stage => stage.stageId === 'receive')!.failure
+  assert.ok(failure !== null, '当前阶段必须带上失败摘要')
+  assert.equal(failure.kind, 'run-error', '必须与门禁/审核失败区分开')
+  assert.match(String(failure.detail), /scripted crash at receive/, '失败详情要能定位问题')
+  assert.match(String(failure.detail), /\[/, '详情里要带错误码')
+})
+
+test('W3：运行期失败在**重启后仍然可见**（说明它真的落盘了，不是内存里的）', async () => {
+  // 用 `receive`：它是第一个阶段，run 会立刻撞上它。
+  // （用 `analyze` 会先在 receive 的人工门停下，根本跑不到那一阶段。）
+  const first = serviceOf(new ScriptedHost({ crashStages: ['receive'] }))
+  await first.create(CREATE, REVIEWER)
+  await first.run('pipe-1', REVIEWER)
+  assert.equal((await first.get('pipe-1', REVIEWER)).status, 'failed')
+
+  // 新 service + 新宿主：进程内什么都没留下。
+  const restarted = serviceOf(new ScriptedHost())
+  const view = await restarted.get('pipe-1', REVIEWER)
+  assert.equal(view.status, 'failed', '重启后仍必须是 failed——失败是持久化事实')
+  assert.equal(view.nextAction, 'reenter')
+  assert.equal(
+    view.stages.find(stage => stage.stageId === 'receive')!.failure?.kind,
+    'run-error',
+    '失败摘要也必须从磁盘重建',
+  )
+})
+
+test('W3：重入并成功重跑之后，状态不再停在 failed（历史失败不会永久钉住状态）', async () => {
+  const service = serviceOf(new ScriptedHost({ crashStages: ['receive'] }))
+  await service.create(CREATE, REVIEWER)
+  await service.run('pipe-1', REVIEWER)
+  assert.equal((await service.get('pipe-1', REVIEWER)).status, 'failed')
+
+  // 换一个不再抛错的宿主（模拟"问题已修复"），登记重入后重跑。
+  const fixed = serviceOf(new ScriptedHost())
+  await fixed.reenter({ ...SCOPE, stageId: 'receive', reason: '修好导致崩溃的原因' }, REVIEWER)
+  await fixed.run('pipe-1', REVIEWER)
+
+  const view = await fixed.get('pipe-1', REVIEWER)
+  assert.equal(view.status, 'waiting-human', '重跑成功并停在人工门，不能再显示 failed')
+  assert.equal(view.nextAction, 'decide-gate')
+})

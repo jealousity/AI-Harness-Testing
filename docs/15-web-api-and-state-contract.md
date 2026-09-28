@@ -676,7 +676,13 @@ type RunResult =
 
 - `preflight` **不取运行锁**（锁要留给真正的 `run()`），因此它只保证"明显跑不起来的配置
   在启动后台任务之前被拦下"，**不保证**"校验通过后 run 一定能开始"。
-- **运行期**异常仍不持久化（见 §8.4 末尾），属 M3 遥测范围。
+- **运行期异常已落盘**（W5 遗留项，已补）：`service.run` 捕获到 driver 抛出的非预期异常时，
+  把它记到**当前阶段**的 `failures`（`kind: 'run-error'`，错误码写进 detail），
+  `deriveRunStatus` 据此产出 `failed`，`nextAction` 为 `reenter`。
+  这样后台运行时崩溃在 UI 上**可见**，且**重启后仍然可见**（是持久化事实）。
+  证据：`test/web-stage-flow.test.ts` 的三条。
+  已知边界：**存储本身故障时写不进任何东西**（此时 `recordRunFailure` 静默放弃，
+  但绝不吞掉原异常）；那类故障由 `storage-unavailable`(503) 表达。
 - **数据根体检已实现**（`GET /api/pipelines/:id/diagnostics`）：把 `backend.diagnose()`
   的六类诊断码、索引不可读项、用量坏行、创建中间态与运行锁现状汇总成一份只读报告。
   覆盖规划书要求的七类。证据：`test/web-diagnostics.test.ts`（8 项）。
@@ -705,7 +711,7 @@ type RunResult =
 | 两个 cancel 端点响应形状统一 | **变更（破坏性）** | W3 | ✅ 已实现（`1f15943`）｜`web-app/server.mjs` |
 | Web UI 信息架构与交互重做 | 重写（前端） | W4 | ✅ 已实现（`9611476`）｜`test/web-ui-contract.test.ts`（12 项） |
 | 后台运行**前置**失败对 UI 可见 | 新增 | W5 | ✅ 已实现（`67c4f5c`）｜`preflight` 前移，见 §8.4 |
-| 后台运行**运行期**失败对 UI 可见 | 新增（需 M3 遥测持久化） | — | ⬜ **未实现**，理由见 §8.5 |
+| 后台运行**运行期**失败对 UI 可见 | 新增 | W5 补 | ✅ 已实现（本次提交）｜`run-error` 落盘 + `deriveRunStatus` 产出 `failed`；`test/web-stage-flow.test.ts`（3 项） |
 | 数据根体检接口 | 新增 | W5 | ✅ 已实现（本次提交）｜`GET /api/pipelines/:id/diagnostics` + `test/web-diagnostics.test.ts`（8 项） |
 | 数据根体检 **CLI 命令** | 新增 | — | ⬜ 未实现：接口已够用，CLI 命令未加 |
 | `list()` 改用注入的 `indexStore` | **缺陷修复（W-01）** | W2 | ✅ 已实现（`f46cf37`）｜`test/web-index-and-creation.test.ts` |

@@ -110,6 +110,11 @@ export interface ScriptedHostOptions {
    * 阶段失败 + 检查点可恢复 + 不进入人工批准）。
    */
   readonly budgetExceededStages?: readonly StageId[]
+  /**
+   * 让这些阶段的 spawn **抛非预期异常**（普通 `Error`，不是预算超限、不是产物不可读、
+   * 不是存储故障）。用于验证"运行期异常会被落盘并对 UI 可见"——这正是 W5 的遗留项。
+   */
+  readonly crashStages?: readonly StageId[]
   /** 超限维度；缺省 `max-steps`。 */
   readonly budgetExceededKind?: UsageLimitKind
   /**
@@ -138,6 +143,7 @@ export class RecordingSpawner implements StageSpawner {
   private readonly usage: UsageSink | undefined
   private readonly usagePerStage: { readonly llm: number; readonly tool: number }
   private readonly budgetExceededStages: ReadonlySet<StageId>
+  private readonly crashStages: ReadonlySet<StageId>
   private readonly budgetExceededKind: UsageLimitKind
   private call: number
 
@@ -147,6 +153,7 @@ export class RecordingSpawner implements StageSpawner {
     this.usage = usage
     this.usagePerStage = { llm: options.usagePerStage?.llm ?? 1, tool: options.usagePerStage?.tool ?? 1 }
     this.budgetExceededStages = new Set(options.budgetExceededStages ?? [])
+    this.crashStages = new Set(options.crashStages ?? [])
     this.budgetExceededKind = options.budgetExceededKind ?? 'max-steps'
     this.inner = new ScriptedStageRunner(artifacts, ({ request }) => {
       this.call += 1
@@ -161,6 +168,10 @@ export class RecordingSpawner implements StageSpawner {
   async runStage(request: SpawnRequest, cfg: PipelineConfig): Promise<SpawnedRun> {
     this.stages.push(request.stageId)
     if (this.beforeStage !== undefined) await this.beforeStage(request)
+    if (this.crashStages.has(request.stageId)) {
+      // 普通 Error：驱动不会把它归成预算超限或产物不可读，因此会一路抛到 service。
+      throw new Error(`scripted crash at ${request.stageId}`)
+    }
     if (this.budgetExceededStages.has(request.stageId)) {
       const budget = cfg.stages[request.stageId].budget
       const limit = this.budgetExceededKind === 'timeout' ? budget.timeoutMs : budget.maxSteps

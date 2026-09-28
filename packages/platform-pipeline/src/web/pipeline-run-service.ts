@@ -698,8 +698,19 @@ export class FilePipelineRunService implements PipelineRunService {
           }
           return { outcome: 'cancelled', view }
         }
-        // 运行期异常不写检查点，因此无法从持久化事实重建 —— 只能随本次 RunResult 返回。
-        return { outcome: 'failed', error: toPipelineRunError(error).toView(), view }
+        // 运行期异常**落盘**（docs/14 W5 遗留项）。
+        //
+        // 此前它只随 RunResult 返回给后台任务，于是后台运行时在 UI 上**完全不可见**：
+        // 检查点没写、事件流里没有、页面只说"尚未开始"，用户只会反复点"触发运行"。
+        // 这与"前置校验失败"不同——那个已经在启动后台任务之前同步返回了（见 `preflight`）。
+        //
+        // 顺序要紧：**先落盘、再建视图**，否则这一次返回的视图里看不到刚记下的失败。
+        const failure = toPipelineRunError(error)
+        await this.recordRunFailure(backend, pipelineId, checkpointRoot, failure)
+        const failedView = await this.buildView(
+          config, await this.requireCheckpoint(backend, pipelineId, checkpointRoot),
+        )
+        return { outcome: 'failed', error: failure.toView(), view: failedView }
       }
     } finally {
       // §6.3 M2-2「人工门等待期间可以释放运行锁，但必须保留 awaiting-gate checkpoint 和
@@ -712,6 +723,48 @@ export class FilePipelineRunService implements PipelineRunService {
       // 同时写同一份检查点——比"多占一会儿锁"危险得多。长时间阻塞靠自动续租（心跳）
       // 保证不被误判 stale。
       await lock.release()
+    }
+  }
+
+  /**
+   * 把运行期异常落盘到**当前阶段**的 `failures` 上（docs/14 W5 遗留项）。
+   *
+   * 为什么放在 service 而不是 driver：`docs/10 §4.2 M0-2` 明确把"映射机器门禁失败、
+   * 审核失败、拒绝**和异常**"列为 service 的职责；而且 service 是唯一同时拿到
+   * backend / 检查点根 / 错误分类的地方。
+   *
+   * **尽力而为**：写不进去就不写（存储坏了本来就写不进任何东西），
+   * 但**绝不吞掉原异常**——调用方仍然拿到 `outcome: 'failed'` 与原始错误视图。
+   */
+  private async recordRunFailure(
+    backend: StorageBackend,
+    pipelineId: string,
+    checkpointRoot: string,
+    error: PipelineRunError,
+  ): Promise<void> {
+    try {
+      const checkpoint = await this.requireCheckpoint(backend, pipelineId, checkpointRoot)
+      const stageId = STAGE_ORDER[checkpoint.cursor]
+      if (stageId === undefined) return // 游标已过末阶段：没有可归属的阶段
+      const state = checkpoint.stageStates[stageId]!
+      const updated: Checkpoint = {
+        ...checkpoint,
+        stageStates: {
+          ...checkpoint.stageStates,
+          [stageId]: {
+            ...state,
+            failures: [
+              ...state.failures,
+              // `kind` 用 `run-error` 与门禁/审核失败区分；错误码写进 detail 而不是 rule
+              // ——`rule` 是**门禁规则 id**（如 R4-08），塞错误码会让人误以为它是一条规则。
+              { kind: 'run-error', detail: `[${error.code}] ${error.message}`, at: Date.now() },
+            ],
+          },
+        },
+      }
+      await backend.ports.checkpoints.save(checkpointRoot, updated)
+    } catch {
+      // 落盘失败不能盖掉原异常：调用方要拿到的仍然是"这次运行为什么失败"。
     }
   }
 
@@ -1511,6 +1564,23 @@ export function deriveRunStatus(checkpoint: Checkpoint, tasks: readonly HumanGat
   // 因此恢复扫描不会把它当"续跑"重启，重跑必须显式 reenter。
   if (states.some(state => state.status === 'review-failed')) return 'review-failed'
   if (states.some(state => state.status === 'needs-fix')) return 'needs-fix'
+  /**
+   * 运行期异常（docs/14 W5 遗留项）：`service.run` 在 driver 抛异常时把它记到**当前阶段**
+   * 的 `failures` 上。必须在 `running` 之前判——异常发生时阶段状态往往还停在 `running`，
+   * 否则这条已经落盘的失败会被"看起来在跑"盖住。
+   *
+   * 判据刻意限定在**当前阶段**且**最后一条**失败，并排除 `done` / `needs-reentry`：
+   * 否则一次历史异常会永久把状态钉在 `failed`，重入并重跑成功之后仍然显示失败。
+   */
+  const current = STAGE_ORDER[checkpoint.cursor]
+  const currentState = current === undefined ? undefined : checkpoint.stageStates[current]
+  if (currentState !== undefined
+      && currentState.status !== 'done'
+      && currentState.status !== 'needs-reentry'
+      && currentState.failures[currentState.failures.length - 1]?.kind === 'run-error') {
+    return 'failed'
+  }
+
   if (states.some(state => state.status === 'needs-reentry')) return 'running'
   if (states.some(state => state.status === 'running' || state.status === 'produced')) return 'running'
   if (checkpoint.cursor === 0 && states.every(state => state.status === 'idle')) return 'queued'

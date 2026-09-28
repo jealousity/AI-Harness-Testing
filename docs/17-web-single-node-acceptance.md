@@ -91,14 +91,22 @@ agent-browser screenshot
 agent-browser close
 ```
 
-### 2.2 后台运行**运行期**异常对 UI 不可见 —— 未做
+### 2.2 后台运行**运行期**异常 —— 已补做 ✅
 
-**前置**失败（provider 缺 Key、审批覆盖缺失）已在 W5 修好（`preflight` 前移，同步返回
-`started: false` + 原因）。但 **driver 内部**抛出的异常不写检查点，因此后台运行时
-对 UI 仍不可见——它只进服务端日志与 `RunResult.outcome === 'failed'`。
+**前置**失败（provider 缺 Key、审批覆盖缺失）在 W5 修好（`preflight` 前移，同步返回
+`started: false` + 原因）。**运行期**异常（driver 内部抛出）也已在 W5 补做：
 
-**为什么没做**：需要权威的运行遥测（M3）把运行期失败持久化。用"进程内记住上次失败"
-绕过是被架构禁止的（那会成为第二份事实来源）。
+- `service.run` 捕获到非预期异常时，把它落盘到**当前阶段**的 `failures`
+  （`kind: 'run-error'`，错误码写进 detail）；
+- `deriveRunStatus` 据此产出 `failed`，`nextAction` 为 `reenter`；
+- 因此后台运行时崩溃在 UI 上**可见**，而且**重启后仍然可见**（是持久化事实）。
+
+**关键判据**：`deriveRunStatus` 的 `run-error` 检查限定在**当前阶段**、取**最后一条**失败、
+并排除 `done` / `needs-reentry` —— 否则一次历史异常会永久把状态钉在 `failed`，
+重入重跑成功之后仍显示失败（有专门用例覆盖这条）。
+
+**已知边界**：**存储本身故障时写不进任何东西**（`recordRunFailure` 静默放弃，
+但绝不吞掉原异常）。那类故障由 `storage-unavailable`(503) 表达，不是"运行失败"。
 
 ### 2.3 数据根体检 —— 已补做（接口 ✅、CLI 命令 ⬜）
 
