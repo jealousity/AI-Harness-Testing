@@ -55,9 +55,25 @@
 `web-ui-contract.test.ts` 是**静态结构断言**（读文件、跑正则），**不执行 JS**，
 因此它拦不住"JS 运行时抛错导致白屏"这类问题。
 
-**为什么没做**：本机没有安装浏览器自动化工具（`agent-browser` 不在 PATH）；
-安装它需要 `npm install -g` + 下载 Chromium（约 500MB），而**本环境的全局安装被规则禁止**，
-且网络在本轮持续不稳定（多次推送重试 10 次以上才成功）。
+**为什么没做（已实际尝试过，附实测证据）**：
+
+1. **`agent-browser` CLI 已装成功**（装到隔离的 managed workspace，未用 `-g`）：
+   `agent-browser --version` → `agent-browser 0.27.0`。
+2. **Chromium 下载失败**。两次尝试 `agent-browser install`，都是网络层被掐断：
+
+   ```text
+   Installing Chrome...
+   ✗ Failed to fetch version info: error sending request for url
+     (https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json):
+     client error (SendRequest): connection error: peer closed connection
+     without sending TLS close_notify
+   ```
+
+   本机缓存的 Chromium 目录（`~/Library/Caches/ms-playwright/`）为空。
+   这与本轮反复出现的网络症状一致：`git push` 多次要重试 6~10 次、
+   `npm`/GitHub 通道间歇性 502 或 TLS 中断。
+
+**结论**：这是**环境限制**，不是代码问题。换一台网络可达的机器执行下面的命令即可补齐。
 
 **影响范围**：验收项 14、24、25 只能停在 🟡。**发布判定不受影响**（见 `docs/13` §3），
 但**不得**据此声称"UI 交互已验收"。
