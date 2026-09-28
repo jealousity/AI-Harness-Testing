@@ -7,94 +7,222 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
+  <a class="skip-link" href="#main">跳到主内容</a>
+
+  <!-- ── TopBar：品牌 / 连接状态 / 自动刷新开关 ─────────────────────────────── -->
   <header class="topbar">
     <div class="brand">
-      <h1>通用测试辅助平台</h1>
-      <p class="sub">六阶段流水线控制台 · receive → analyze → design → execute → report → archive</p>
+      <span class="brand-name">通用测试辅助平台</span>
+      <span class="brand-sub">六阶段流水线控制台 · receive → analyze → design → execute → report → archive</span>
     </div>
-    <div class="health" id="health">连接中…</div>
+    <div class="topbar-right">
+      <!-- 连接状态用 aria-live 播报，且**不只靠颜色**表达（文案里带状态词）。 -->
+      <span class="conn" id="conn" role="status" aria-live="polite">连接中…</span>
+      <button type="button" id="btn-poll">暂停自动刷新</button>
+      <button type="button" id="btn-refresh">立即刷新</button>
+    </div>
   </header>
 
-  <!--
-    凭据说明（docs/10 §5.1、§5.3）：本页面**没有** API Key 输入框。
-    provider 凭据由服务端按配置里的 apiKeyEnv 从进程环境变量注入，
-    浏览器既不上传也无法读取。configRef 同样由服务端固定，不可在此填写。
-  -->
-  <p class="notice" id="credential-notice">
-    模型凭据由服务端环境变量注入（配置里的 <code>apiKeyEnv</code>）；本页面不接收、也不展示任何 API Key。
-  </p>
+  <main id="main">
+    <!-- 凭据说明（docs/10 §5.1、§5.3）：本页面没有 API Key 输入框。 -->
+    <p class="notice" id="notice" role="note">
+      模型凭据由服务端按配置里的 <code>apiKeyEnv</code> 从环境变量注入；本页面不接收、也不展示任何 API Key。
+      <code>configRef</code> 同样由服务端固定。
+    </p>
 
-  <main>
-    <section class="card">
-      <h2>1 · 创建 / 打开流水线</h2>
-      <div class="grid">
-        <label>项目 ID<input id="projectId" value="demo" autocomplete="off"></label>
-        <label>流水线 ID<input id="pipelineId" value="pipe-1" autocomplete="off"></label>
-        <label>需求输入文件（可选）<input id="requirementInput" placeholder="/abs/path/requirements.pdf" autocomplete="off"></label>
-        <label>Provider（可选）<input id="providerName" placeholder="primary" autocomplete="off"></label>
-        <label>被测服务基址（可选）<input id="targetBaseUrl" placeholder="https://staging.example.com" autocomplete="off"></label>
+    <!-- ── 首屏向导：没有打开流水线时显示，而不是空表格 ────────────────────── -->
+    <section class="panel" id="wizard" aria-labelledby="wizard-title">
+      <h2 id="wizard-title">创建 / 打开流水线</h2>
+
+      <form id="create-form">
+        <fieldset>
+          <legend>1 · 基本信息</legend>
+          <div class="grid">
+            <label for="f-project">项目 ID<span class="req">必填</span>
+              <input id="f-project" name="projectId" autocomplete="off" required>
+            </label>
+            <label for="f-pipeline">流水线 ID<span class="req">必填</span>
+              <input id="f-pipeline" name="pipelineId" autocomplete="off" required>
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>2 · 需求输入（可选）</legend>
+          <div class="grid">
+            <label for="f-requirement">需求文件路径
+              <input id="f-requirement" name="requirementInput" autocomplete="off" placeholder="/abs/path/requirements.pdf">
+            </label>
+            <label for="f-ruleset">规则集版本
+              <input id="f-ruleset" name="rulesetVersion" autocomplete="off" placeholder="缺省用平台默认">
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>3 · 被测服务（可选）</legend>
+          <div class="grid">
+            <label for="f-target">被测服务基址
+              <input id="f-target" name="targetBaseUrl" autocomplete="off" placeholder="https://staging.example.com">
+            </label>
+            <label for="f-provider">Provider
+              <input id="f-provider" name="providerName" autocomplete="off" placeholder="缺省用配置的 defaultProvider">
+            </label>
+          </div>
+          <p class="hint">基址会先过服务端的 SSRF 判据；内网与本机地址默认被拒绝。</p>
+        </fieldset>
+
+        <fieldset>
+          <legend>4 · 运行选项（可选）</legend>
+          <div class="grid">
+            <label for="f-retries">人工门重试上限
+              <input id="f-retries" name="maxGateRetries" type="number" min="0" step="1" autocomplete="off">
+            </label>
+            <label for="f-gatewait">人工门等待上限（毫秒）
+              <input id="f-gatewait" name="gateWaitTimeoutMs" type="number" min="0" step="1" autocomplete="off" placeholder="0 = 只轮询一次就让出控制权">
+            </label>
+            <label for="f-ttl">门任务 TTL（毫秒）
+              <input id="f-ttl" name="gateTaskTtlMs" type="number" min="0" step="1" autocomplete="off">
+            </label>
+            <label for="f-diag">诊断探针白名单（逗号分隔的环境变量名）
+              <input id="f-diag" name="diagCredentials" autocomplete="off" placeholder="ACME_API_TOKEN">
+            </label>
+          </div>
+        </fieldset>
+
+        <div class="actions">
+          <button type="submit" class="primary" id="btn-create">创建流水线</button>
+          <button type="button" id="btn-list">列出可见流水线</button>
+        </div>
+      </form>
+
+      <p class="out" id="out-wizard" role="alert" hidden></p>
+
+      <div class="filters" id="list-filters" hidden>
+        <label for="f-filter-project">按项目筛选
+          <input id="f-filter-project" autocomplete="off">
+        </label>
+        <label for="f-filter-status">按状态筛选
+          <select id="f-filter-status">
+            <option value="">全部</option>
+            <option value="queued">排队中</option>
+            <option value="running">运行中</option>
+            <option value="waiting-human">等待人工裁决</option>
+            <option value="needs-fix">打回重跑中</option>
+            <option value="gate-failed">机器门禁失败</option>
+            <option value="review-failed">交叉检查未通过</option>
+            <option value="rejected">已被拒绝</option>
+            <option value="completed">已完成</option>
+            <option value="cancelled">已取消</option>
+          </select>
+        </label>
       </div>
-      <div class="actions">
-        <button id="btn-create" class="primary">创建流水线（202）</button>
-        <button id="btn-refresh">刷新</button>
-        <button id="btn-list">列出可见流水线</button>
-      </div>
-      <pre class="out" id="out-create" hidden></pre>
-      <ul class="pipelines" id="pipeline-list"></ul>
+      <ul class="pipeline-list" id="pipeline-list" aria-label="可见流水线"></ul>
     </section>
 
-    <section class="card">
-      <h2>2 · 运行控制</h2>
-      <div class="statusline">
-        <span class="badge" id="run-status">—</span>
-        <span class="muted" id="run-meta">尚未加载</span>
-      </div>
-      <div class="actions">
-        <button id="btn-run" class="primary">触发运行（后台，202）</button>
-        <button id="btn-cancel-run">取消后台运行</button>
-        <button id="btn-recover">恢复扫描（进程重启后）</button>
-        <label class="inline"><input type="checkbox" id="auto-poll" checked> 自动轮询（2s）</label>
-      </div>
-      <pre class="out" id="out-run" hidden></pre>
-    </section>
+    <!-- ── 主工作区 ─────────────────────────────────────────────────────────── -->
+    <div id="workspace" hidden>
+      <!-- PipelineSummary -->
+      <section class="panel summary" aria-labelledby="summary-title">
+        <h2 id="summary-title" class="sr-only">流水线概要</h2>
+        <div class="summary-grid">
+          <div>
+            <span class="k">流水线</span>
+            <span class="v mono" id="s-pipeline">—</span>
+          </div>
+          <div>
+            <span class="k">项目 / 租户</span>
+            <span class="v" id="s-project">—</span>
+          </div>
+          <div>
+            <span class="k">状态</span>
+            <span class="v"><span class="chip" id="s-status">—</span></span>
+          </div>
+          <div>
+            <span class="k">当前阶段</span>
+            <span class="v" id="s-stage">—</span>
+          </div>
+          <div>
+            <span class="k">下一阶段</span>
+            <span class="v mono" id="s-next">—</span>
+          </div>
+          <div>
+            <span class="k">后台运行</span>
+            <span class="v" id="s-running">—</span>
+          </div>
+        </div>
+        <p class="reason" id="s-reason" role="status" aria-live="polite"></p>
+        <div class="actions">
+          <!-- 主操作按钮由服务端的 nextAction 驱动；终态永不出现"批准"。 -->
+          <button type="button" class="primary" id="btn-primary">—</button>
+          <button type="button" id="btn-cancel-run">取消后台运行</button>
+          <button type="button" id="btn-recover">恢复扫描</button>
+          <button type="button" id="btn-close">关闭这条流水线</button>
+        </div>
+      </section>
 
-    <section class="card">
-      <h2>3 · 阶段状态</h2>
-      <p class="hint">全部字段来自持久化事实（检查点 + 产物 + 人工门任务），不是浏览器本地推断。</p>
-      <div class="tablewrap">
-        <table class="stages">
-          <thead>
-            <tr><th>阶段</th><th>状态</th><th>机器门禁</th><th>审核结论</th><th>digest</th><th>时间</th><th></th></tr>
-          </thead>
-          <tbody id="stage-rows"><tr><td colspan="7" class="muted">尚未加载</td></tr></tbody>
-        </table>
-      </div>
-      <div id="stage-detail"></div>
-    </section>
+      <!-- StageStepper -->
+      <nav class="panel stepper-panel" aria-labelledby="stepper-title">
+        <h2 id="stepper-title">六阶段进度</h2>
+        <ol class="stepper" id="stepper"></ol>
+      </nav>
 
-    <section class="card">
-      <h2>4 · 人工门任务</h2>
-      <p class="hint">裁决必须显式选择结论，不存在「缺省即批准」；裁决只写任务，不会在本请求内跑完整条流水线。</p>
-      <div id="gate-list" class="gates"><p class="muted">尚未加载</p></div>
-    </section>
+      <!-- MainWorkspace：当前任务 / 人工门 / 产物 / 失败恢复 -->
+      <section class="panel task" aria-labelledby="task-title">
+        <h2 id="task-title">当前任务</h2>
+        <div id="task-body" role="status" aria-live="polite"></div>
+      </section>
 
-    <section class="card">
-      <h2>5 · 阶段重入</h2>
-      <p class="hint">重入会作废该阶段及其下游产物并级联重跑。digest 用于防止页面打开过久后覆盖他人的新版本。</p>
-      <div class="grid">
-        <label>阶段<select id="reenter-stage"></select></label>
-        <label>原因<input id="reenter-reason" placeholder="需求变更" autocomplete="off"></label>
-        <label>当前 digest（自动填充）<input id="reenter-digest" readonly></label>
-      </div>
-      <div class="actions"><button id="btn-reenter">登记重入</button></div>
-      <pre class="out" id="out-reenter" hidden></pre>
-    </section>
+      <section class="panel" aria-labelledby="gates-title">
+        <h2 id="gates-title">人工门任务</h2>
+        <p class="hint">
+          裁决必须显式选择结论（不存在「缺省即批准」）；裁决只写任务，由下一次「触发运行」消费。
+          <strong>升级任务</strong>（机器门禁失败 / 预算超限产生）不对应产物，永远不会被当作阶段批准。
+        </p>
+        <p class="out" id="gate-notice" role="status" aria-live="polite" hidden></p>
+        <div id="gate-workspace"></div>
+      </section>
 
-    <section class="card">
-      <h2>6 · 事件时间线</h2>
-      <p class="hint">只投影有持久化时间戳的事实（开门 / 认领 / 裁决 / 取消 / 消费 / 失败 / 重入）。</p>
-      <ul class="events" id="event-list"><li class="muted">尚未加载</li></ul>
-    </section>
+      <section class="panel" aria-labelledby="artifact-title">
+        <h2 id="artifact-title">阶段产物</h2>
+        <div id="artifact-viewer"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="usage-title">
+        <h2 id="usage-title">用量与预算</h2>
+        <div id="usage-panel"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="events-title">
+        <h2 id="events-title">事件时间线</h2>
+        <p class="hint">只投影有持久化时间戳的事实；顺序与时间在重启后一致。</p>
+        <ul class="events" id="events-list"></ul>
+      </section>
+
+      <!-- AdvancedDetails -->
+      <details class="panel advanced">
+        <summary>高级：重入 / 原始诊断</summary>
+        <div class="grid">
+          <label for="f-reenter-stage">重入阶段
+            <select id="f-reenter-stage"></select>
+          </label>
+          <label for="f-reenter-reason">原因
+            <input id="f-reenter-reason" autocomplete="off" placeholder="需求变更">
+          </label>
+          <label for="f-reenter-digest">当前 digest（自动填充）
+            <input id="f-reenter-digest" readonly>
+          </label>
+        </div>
+        <div class="actions">
+          <button type="button" id="btn-reenter">登记重入</button>
+        </div>
+        <p class="out" id="out-reenter" role="alert" hidden></p>
+        <h3>机器违规与审核明细</h3>
+        <div id="advanced-violations"></div>
+        <h3>原始视图</h3>
+        <pre class="raw" id="raw-view"></pre>
+      </details>
+    </div>
   </main>
 
   <script src="/app.js" type="module"></script>

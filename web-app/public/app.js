@@ -1,17 +1,18 @@
 /**
- * 流水线控制台前端（docs/10 §5.1「前端显示真实阶段状态、人工门任务、机器违规和审核 findings」）。
+ * 流水线控制台前端（docs/14 §3 W4）。
  *
- * 三条纪律：
- * 1. **只渲染服务端返回的字段**，不在浏览器里推断阶段状态、不缓存"上次看到的状态"；
- * 2. **不持有任何凭据**：没有 API Key 输入框，也不把 provider 信息写进请求；
- * 3. 每次渲染都整块重画（数据量小），避免增量更新与轮询结果不一致。
+ * 四条纪律：
+ * 1. **只渲染服务端字段**：阶段状态、下一步动作、门任务种类全部来自服务端派生字段
+ *    （`nextAction` / `gateKind` / `isEscalation`），浏览器**不自己推断**业务状态。
+ * 2. **安全渲染**：所有服务端内容一律经 `textContent` 写入，**任何地方都不用 `innerHTML`
+ *    拼数据**（产物内容、findings、violations 都可能含 `<script>` 之类）。
+ * 3. **不打断用户**：轮询只更新事实，不覆盖正在查看的产物、也不覆盖正在输入的门任务说明。
+ * 4. **不伪造**：拿不到的数据显示"—"或明确的错误，不编占位值；503 不显示成"没有流水线"。
  *
- * 数据来源（全部是持久化事实的投影）：
- * - `GET /api/pipelines/:id` → 阶段状态、机器违规、审核 findings、失败摘要；
- * - `GET /api/pipelines/:id/gates` → 人工门任务；
- * - `GET /api/pipelines/:id/events` → 事件时间线；
- * - `GET /api/pipelines/:id/stages/:stageId/artifact` → 产物内容。
+ * 不引入任何前端框架/外部资源：本地单机要能离线运行。
  */
+
+// ── 标签映射（仅用于显示，不参与任何判断）────────────────────────────────────
 
 const STAGE_LABELS = {
   receive: '需求接收',
@@ -22,7 +23,7 @@ const STAGE_LABELS = {
   archive: '产物归档',
 }
 
-const STATUS_LABELS = {
+const RUN_STATUS_LABELS = {
   queued: '排队中',
   running: '运行中',
   'waiting-human': '等待人工裁决',
@@ -67,22 +68,80 @@ const EVENT_LABELS = {
   reenter: '重入',
 }
 
+/** 服务端 `nextAction` → 主操作按钮文案。**不在这里做业务判断**，只做文案映射。 */
+const ACTION_LABELS = {
+  run: '触发运行',
+  'view-artifact': '查看当前阶段产物',
+  'claim-gate': '认领门任务',
+  'decide-gate': '去裁决',
+  reenter: '去登记重入',
+  'retry-storage': '重试（存储暂不可用）',
+  none: '暂无可用操作',
+}
+
+// ── 状态（只存**导航上下文**与本次会话的界面状态，不存业务状态）─────────────
+
+const state = {
+  /** 当前打开的流水线；唯一持久化到 URL 的东西。 */
+  pipelineId: null,
+  view: null,
+  gates: [],
+  usage: null,
+  events: [],
+  /** 产物查看器展开的阶段；跨刷新保留（不打断用户）。 */
+  openArtifact: null,
+  artifact: null,
+  artifactError: null,
+  /** 列表与筛选（纯界面状态）。 */
+  list: [],
+  filters: { projectId: '', status: '' },
+  polling: true,
+  busy: false,
+  /** 最近一次刷新失败的原因；`null` 表示本次刷新成功。 */
+  lastError: null,
+}
+
+// ── 安全 DOM 构造（**唯一**创建节点的方式；没有 innerHTML）────────────────────
+
+function el(tag, options = {}, children = []) {
+  const node = document.createElement(tag)
+  if (options.className !== undefined) node.className = options.className
+  // `text` 一律走 textContent —— 这是"服务端内容不进 HTML 解析器"的唯一保证。
+  if (options.text !== undefined && options.text !== null) node.textContent = String(options.text)
+  if (options.attrs !== undefined) {
+    for (const [key, value] of Object.entries(options.attrs)) {
+      if (value === null || value === undefined || value === false) continue
+      node.setAttribute(key, value === true ? '' : String(value))
+    }
+  }
+  if (options.on !== undefined) {
+    for (const [type, handler] of Object.entries(options.on)) node.addEventListener(type, handler)
+  }
+  for (const child of children) if (child !== null && child !== undefined) node.append(child)
+  return node
+}
+
 const $ = id => document.getElementById(id)
 
-/** 当前页面正在看的流水线；为空表示还没打开任何流水线。 */
-let current = null
-let pollTimer = null
-/** 当前展开的产物（用于渲染高亮与保留展开状态）。 */
-let openArtifact = null
+function chip(label, status) {
+  return el('span', { className: 'chip', text: label, attrs: { 'data-status': status } })
+}
 
-// ── 与服务端交互 ─────────────────────────────────────────────────────────────
+function timeText(ms) {
+  return typeof ms === 'number' && Number.isFinite(ms) ? new Date(ms).toLocaleString() : '—'
+}
 
-/**
- * 统一的请求封装。
- *
- * 服务端错误体是 `{ error: { code, message, details, httpStatus } }`，
- * 这里把 code 也带进 Error，便于调用方按错误码分支（如 conflict 提示刷新）。
- */
+// ── 请求封装 ─────────────────────────────────────────────────────────────────
+
+class ApiError extends Error {
+  constructor(code, message, httpStatus, details) {
+    super(message)
+    this.code = code
+    this.httpStatus = httpStatus
+    this.details = details
+  }
+}
+
 async function api(method, path, body) {
   const response = await fetch(path, {
     method,
@@ -100,257 +159,327 @@ async function api(method, path, body) {
   }
   if (!response.ok) {
     const detail = payload?.error ?? { code: String(response.status), message: '请求失败' }
-    const error = new Error(detail.message ?? '请求失败')
-    error.code = detail.code
-    error.details = detail.details
-    error.httpStatus = response.status
-    throw error
+    throw new ApiError(detail.code ?? String(response.status), detail.message ?? '请求失败', response.status, detail.details)
   }
   return payload
 }
 
-function report(container, message, kind = 'info') {
-  const node = $(container)
+/** 把错误渲染成"人话 + 下一步"，并区分 503（存储故障）与其它。 */
+function describeError(error) {
+  if (error instanceof ApiError && error.httpStatus === 503) {
+    return `存储暂不可用（${error.code}）：${error.message}。这是基础设施故障，不是"没有数据"——请稍后重试。`
+  }
+  const code = error?.code ? `[${error.code}] ` : ''
+  return `${code}${error?.message ?? String(error)}`
+}
+
+function showOut(id, message, kind = 'info') {
+  const node = $(id)
   node.hidden = false
   node.dataset.kind = kind
-  node.textContent = typeof message === 'string' ? message : JSON.stringify(message, null, 2)
+  node.textContent = message
 }
 
-function showError(container, error) {
-  report(container, `${error.code ? `[${error.code}] ` : ''}${error.message}`, 'error')
+function clearOut(id) {
+  const node = $(id)
+  node.hidden = true
+  node.textContent = ''
+  delete node.dataset.kind
 }
 
-// ── 渲染：健康状态 ───────────────────────────────────────────────────────────
+// ── 渲染：连接状态与轮询开关 ─────────────────────────────────────────────────
 
 async function refreshHealth() {
   try {
     const health = await api('GET', '/health')
-    // `/health` 只回固定健康信息（不再回显运行中的 pipeline ID，避免未鉴权枚举旁路）。
-    // 单条流水线是否在跑，看 `GET /api/pipelines/:id` 的 `running` 字段。
-    $('health').textContent = `服务正常 · configRef=${health.configRef}`
-    $('health').dataset.state = 'ok'
+    $('conn').dataset.state = 'ok'
+    $('conn').textContent = `服务正常 · configRef=${health.configRef}`
     if (health.trustActorHeaders) {
-      $('credential-notice').textContent =
-        '注意：本实例已开启 PLATFORM_TRUST_ACTOR_HEADERS，调用者身份取自请求头，必须由反向代理完成真实鉴权。'
-      $('credential-notice').dataset.state = 'warn'
+      $('notice').textContent =
+        '注意：本实例已开启 PLATFORM_TRUST_ACTOR_HEADERS，调用者身份取自请求头，必须由反向代理完成真实鉴权并剥除同名头。'
+      $('notice').dataset.state = 'warn'
     }
   } catch (error) {
-    $('health').textContent = `服务不可用：${error.message}`
-    $('health').dataset.state = 'error'
+    $('conn').dataset.state = 'error'
+    $('conn').textContent = `服务不可用：${error.message}`
   }
 }
 
-// ── 渲染：阶段表 ─────────────────────────────────────────────────────────────
-
-function stageTimeText(stage) {
-  if (stage.startedAt === null) return '—'
-  const start = new Date(stage.startedAt).toLocaleString()
-  return stage.finishedAt === null ? `${start} → 进行中` : `${start} → ${new Date(stage.finishedAt).toLocaleString()}`
-}
-
-function renderStages(view) {
-  const tbody = $('stage-rows')
-  tbody.replaceChildren()
-
-  for (const stage of view.stages) {
-    const row = document.createElement('tr')
-    row.dataset.status = stage.status
-
-    const name = document.createElement('td')
-    name.innerHTML = `<strong>${STAGE_LABELS[stage.stageId] ?? stage.stageId}</strong><br><small class="muted">${stage.stageId}</small>`
-
-    const status = document.createElement('td')
-    status.innerHTML = `<span class="chip" data-status="${stage.status}">${STAGE_STATUS_LABELS[stage.status] ?? stage.status}</span>`
-    if (stage.failure !== null) {
-      const failure = document.createElement('div')
-      failure.className = 'fail'
-      failure.textContent = `${stage.failure.kind}${stage.failure.rule ? ` · ${stage.failure.rule}` : ''}${stage.failure.detail ? `：${stage.failure.detail}` : ''}`
-      status.append(failure)
-    }
-
-    const machine = document.createElement('td')
-    machine.innerHTML = `<span class="chip" data-status="${stage.machineStatus}">${stage.machineStatus === 'passed' ? '通过' : '未通过'}</span>`
-    if (stage.machineViolations.length > 0) {
-      const list = document.createElement('ul')
-      list.className = 'violations'
-      for (const violation of stage.machineViolations) {
-        const item = document.createElement('li')
-        item.dataset.level = violation.level
-        item.textContent = `[${violation.level}] ${violation.rule}：${violation.detail}`
-        list.append(item)
-      }
-      machine.append(list)
-    }
-
-    const review = document.createElement('td')
-    if (stage.reviewVerdict === null) {
-      review.innerHTML = '<span class="muted">—</span>'
-    } else {
-      review.innerHTML = `<span class="chip" data-status="review">${stage.reviewVerdict}</span>`
-      if (stage.reviewFindings.length > 0) {
-        const list = document.createElement('ul')
-        list.className = 'findings'
-        for (const finding of stage.reviewFindings) {
-          const item = document.createElement('li')
-          item.textContent = finding
-          list.append(item)
-        }
-        review.append(list)
-      }
-    }
-
-    const digest = document.createElement('td')
-    digest.className = 'mono'
-    digest.textContent = stage.digest === '' ? '—' : stage.digest.slice(0, 16)
-
-    const time = document.createElement('td')
-    time.className = 'mono small'
-    time.textContent = stageTimeText(stage)
-
-    const actions = document.createElement('td')
-    const openButton = document.createElement('button')
-    openButton.textContent = openArtifact === stage.stageId ? '收起产物' : '查看产物'
-    openButton.addEventListener('click', () => toggleArtifact(stage.stageId))
-    actions.append(openButton)
-    if (stage.humanGateTaskId !== null) {
-      const gateButton = document.createElement('button')
-      gateButton.textContent = '定位门任务'
-      gateButton.addEventListener('click', () => {
-        const target = document.querySelector(`[data-gate="${stage.humanGateTaskId}"]`)
-        if (target !== null) target.scrollIntoView({ block: 'center', behavior: 'smooth' })
-      })
-      actions.append(gateButton)
-    }
-
-    row.append(name, status, machine, review, digest, time, actions)
-    tbody.append(row)
+/** 轮询开关 + "已暂停，数据可能过期"提示（要求 18）。 */
+function renderPollingState() {
+  const button = $('btn-poll')
+  button.textContent = state.polling ? '暂停自动刷新' : '恢复自动刷新'
+  button.setAttribute('aria-pressed', String(!state.polling))
+  const base = state.polling ? '自动刷新中' : '已暂停，数据可能过期'
+  if (state.lastError !== null) {
+    $('conn').dataset.state = 'error'
+    $('conn').textContent = `${base} · 最近一次刷新失败`
   }
-
-  // 重入表单的 digest 自动填充：用当前阶段的真实 digest，避免用户手抄错。
-  const select = $('reenter-stage')
-  if (select.options.length === 0) {
-    for (const stage of view.stages) {
-      const option = document.createElement('option')
-      option.value = stage.stageId
-      option.textContent = `${STAGE_LABELS[stage.stageId] ?? stage.stageId}（${stage.stageId}）`
-      select.append(option)
-    }
-    select.addEventListener('change', () => syncReenterDigest())
-  }
-  syncReenterDigest()
 }
 
-function syncReenterDigest() {
-  const stageId = $('reenter-stage').value
-  const stage = current?.stages.find(item => item.stageId === stageId)
-  $('reenter-digest').value = stage?.digest ?? ''
+// ── 渲染：向导与流水线列表 ───────────────────────────────────────────────────
+
+function renderWizard() {
+  $('wizard').hidden = false
+  $('workspace').hidden = true
 }
 
-async function toggleArtifact(stageId) {
-  if (openArtifact === stageId) {
-    openArtifact = null
-    $('stage-detail').replaceChildren()
-    renderStages(current)
+function renderList() {
+  const list = $('pipeline-list')
+  list.replaceChildren()
+  const projectId = state.filters.projectId.trim()
+  const status = state.filters.status
+  const visible = state.list.filter(item =>
+    (projectId === '' || item.projectId === projectId) && (status === '' || item.status === status))
+
+  if (visible.length === 0) {
+    list.append(el('li', {
+      className: 'muted',
+      text: state.list.length === 0 ? '没有可见的流水线。' : '当前筛选条件下没有匹配的流水线。',
+    }))
     return
   }
-  openArtifact = stageId
-  const container = $('stage-detail')
-  container.replaceChildren()
-  const loading = document.createElement('p')
-  loading.className = 'muted'
-  loading.textContent = `正在读取 ${stageId} 的产物…`
-  container.append(loading)
-  try {
-    const artifact = await api('GET', `/api/pipelines/${encodeURIComponent(current.pipelineId)}/stages/${encodeURIComponent(stageId)}/artifact`)
-    const head = document.createElement('p')
-    head.className = 'mono small'
-    head.textContent = `${artifact.artifactPath} · v${artifact.version} · digest ${artifact.digest.slice(0, 16)}`
-    const body = document.createElement('pre')
-    body.className = 'artifact'
-    body.textContent = JSON.stringify(artifact.content, null, 2)
-    container.replaceChildren(head, body)
-  } catch (error) {
-    const failed = document.createElement('p')
-    failed.className = 'muted'
-    // 404 = 该阶段尚未产出（服务端不编造空产物），如实展示。
-    failed.textContent = `${error.code === 'not-found' ? '该阶段尚无产物' : `读取产物失败：${error.message}`}`
-    container.replaceChildren(failed)
+  for (const item of visible) {
+    list.append(el('li', {}, [
+      el('button', {
+        text: `打开 ${item.pipelineId}`,
+        attrs: { type: 'button', 'aria-label': `打开流水线 ${item.pipelineId}` },
+        on: { click: () => openPipeline(item.pipelineId) },
+      }),
+      el('span', { className: 'mono', text: item.pipelineId }),
+      el('span', { className: 'small muted', text: item.projectId }),
+      chip(RUN_STATUS_LABELS[item.status] ?? item.status, item.status),
+      el('span', {
+        className: 'small muted',
+        text: item.nextStage === null ? '已到终态' : `下一阶段 ${item.nextStage}`,
+      }),
+    ]))
   }
-  renderStages(current)
+}
+
+// ── 渲染：概要 ───────────────────────────────────────────────────────────────
+
+function renderSummary() {
+  const view = state.view
+  if (view === null) return
+  $('s-pipeline').textContent = view.pipelineId
+  $('s-project').textContent = `${view.projectId}${view.tenantId === null ? '' : ` / ${view.tenantId}`}`
+  $('s-status').textContent = RUN_STATUS_LABELS[view.status] ?? view.status
+  $('s-status').dataset.status = view.status
+  $('s-stage').textContent = view.currentStage === null
+    ? '（六阶段已全部完成）'
+    : `${STAGE_LABELS[view.currentStage] ?? view.currentStage}（${view.currentStage}）`
+  $('s-next').textContent = view.nextStage ?? '—'
+  $('s-running').textContent = view.running ? '进行中' : '无'
+
+  const reason = $('s-reason')
+  reason.textContent = view.blockingReason === null ? '' : view.blockingReason
+  reason.hidden = view.blockingReason === null
+
+  // 主操作按钮完全由服务端 nextAction 驱动；终态不会出现"批准"。
+  const primary = $('btn-primary')
+  primary.textContent = ACTION_LABELS[view.nextAction] ?? view.nextAction
+  primary.dataset.action = view.nextAction
+  primary.disabled = state.busy || view.nextAction === 'none'
+}
+
+function runPrimaryAction() {
+  const action = $('btn-primary').dataset.action
+  switch (action) {
+    case 'run':
+      return triggerRun()
+    case 'view-artifact':
+      return state.view?.currentStage === null || state.view?.currentStage === undefined
+        ? Promise.resolve()
+        : toggleArtifact(state.view.currentStage, true)
+    case 'decide-gate':
+    case 'claim-gate':
+      $('gates-title')?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+      $('gate-workspace').querySelector('button')?.focus()
+      return Promise.resolve()
+    case 'reenter':
+      document.querySelector('details.advanced')?.setAttribute('open', '')
+      $('f-reenter-reason')?.focus()
+      return Promise.resolve()
+    case 'retry-storage':
+      return refresh()
+    default:
+      return Promise.resolve()
+  }
+}
+
+// ── 渲染：六阶段 Stepper ─────────────────────────────────────────────────────
+
+function renderStepper() {
+  const stepper = $('stepper')
+  stepper.replaceChildren()
+  const view = state.view
+  if (view === null) return
+
+  for (const stage of view.stages) {
+    const isCurrent = view.currentStage === stage.stageId
+    const item = el('li', {
+      attrs: {
+        'data-status': stage.status,
+        'data-current': isCurrent ? 'true' : 'false',
+        // 颜色不是唯一信息：aria-current 让读屏也知道"当前阶段"。
+        ...(isCurrent ? { 'aria-current': 'step' } : {}),
+      },
+    })
+    item.append(
+      el('div', { className: 'step-name', text: STAGE_LABELS[stage.stageId] ?? stage.stageId }),
+      el('div', { className: 'step-id', text: stage.stageId }),
+      el('div', {}, [chip(STAGE_STATUS_LABELS[stage.status] ?? stage.status, stage.status)]),
+      el('div', {
+        className: 'step-meta',
+        text: `机器门禁 ${stage.machineStatus === 'passed' ? '通过' : '未通过'}`
+          + ` · digest ${stage.digest === '' ? '—' : stage.digest.slice(0, 12)}`,
+      }),
+      el('div', { className: 'step-meta', text: `${timeText(stage.startedAt)} → ${timeText(stage.finishedAt)}` }),
+    )
+    if (stage.failure !== null) {
+      item.append(el('div', {
+        className: 'step-meta',
+        text: `失败 ${stage.failure.kind}${stage.failure.rule === null ? '' : ` · ${stage.failure.rule}`}`,
+      }))
+    }
+    item.append(el('button', {
+      text: state.openArtifact === stage.stageId ? '收起产物' : '查看产物',
+      attrs: { type: 'button', 'aria-label': `查看 ${STAGE_LABELS[stage.stageId] ?? stage.stageId} 的产物` },
+      on: { click: () => toggleArtifact(stage.stageId) },
+    }))
+    if (stage.humanGateTaskId !== null) {
+      const gateTaskId = stage.humanGateTaskId
+      item.append(el('button', {
+        text: '定位门任务',
+        attrs: { type: 'button' },
+        on: {
+          click: () => {
+            const target = document.querySelector(`[data-gate="${CSS.escape(gateTaskId)}"]`)
+            if (target !== null) {
+              target.scrollIntoView({ block: 'center', behavior: 'smooth' })
+              target.focus?.()
+            }
+          },
+        },
+      }))
+    }
+    stepper.append(item)
+  }
+}
+
+// ── 渲染：当前任务卡 ─────────────────────────────────────────────────────────
+
+function renderTask() {
+  const body = $('task-body')
+  body.replaceChildren()
+  const view = state.view
+  if (view === null) return
+
+  body.append(el('p', { className: 'task-headline', text: ACTION_LABELS[view.nextAction] ?? view.nextAction }))
+  if (view.blockingReason !== null) body.append(el('p', { className: 'reason', text: view.blockingReason }))
+
+  if (view.failure !== null) {
+    body.append(el('p', {
+      className: 'reason',
+      text: `流水线失败：${view.failure.kind}`
+        + (view.failure.stageId === null ? '' : `（阶段 ${view.failure.stageId}）`)
+        + ` — ${view.failure.detail}`,
+    }))
+  }
+  if (view.nextAction === 'none') {
+    body.append(el('p', { className: 'muted', text: '后台运行进行中：等它结束或停在人工门后再操作。' }))
+  }
 }
 
 // ── 渲染：人工门 ─────────────────────────────────────────────────────────────
 
-function renderGates(gates) {
-  const container = $('gate-list')
-  container.replaceChildren()
-  if (gates.length === 0) {
-    const empty = document.createElement('p')
-    empty.className = 'muted'
-    empty.textContent = '当前没有人工门任务。'
-    container.append(empty)
+/**
+ * 用户是否正在门任务面板里输入？
+ *
+ * 要求 7：轮询不能覆盖用户正在查看/输入的内容。只要有输入框被聚焦或已填入内容，
+ * 就**冻结**该面板的自动重绘，并提示"有新变化"。
+ */
+function gatesFrozen() {
+  const root = $('gate-workspace')
+  const active = document.activeElement
+  if (active !== null && root.contains(active)) return true
+  return [...root.querySelectorAll('textarea, input')].some(node => node.value.trim() !== '')
+}
+
+function renderGates() {
+  const root = $('gate-workspace')
+  root.replaceChildren()
+  if (state.gates.length === 0) {
+    root.append(el('p', { className: 'muted', text: '当前没有人工门任务。' }))
     return
   }
 
-  for (const task of gates) {
-    const box = document.createElement('div')
-    box.className = 'gate'
-    box.dataset.gate = task.gateTaskId
-    box.dataset.status = task.status
+  for (const task of state.gates) {
+    const escalation = task.isEscalation === true
+    const box = el('div', {
+      className: 'gate',
+      attrs: {
+        'data-gate': task.gateTaskId,
+        'data-status': task.status,
+        'data-escalation': escalation ? 'true' : 'false',
+        tabindex: '-1',
+      },
+    })
 
-    const head = document.createElement('div')
-    head.className = 'gate-head'
-    head.innerHTML = `<strong>${STAGE_LABELS[task.stageId] ?? task.stageId}</strong>
-      <span class="chip" data-status="${task.status}">${GATE_STATUS_LABELS[task.status] ?? task.status}</span>
-      <span class="mono small">${task.gateTaskId}</span>`
-    box.append(head)
+    box.append(el('div', { className: 'gate-head' }, [
+      el('strong', { text: STAGE_LABELS[task.stageId] ?? task.stageId }),
+      // 种类必须写出来，不能只靠底色区分。
+      el('span', {
+        className: 'chip',
+        text: escalation ? '升级任务（非阶段门）' : '阶段门',
+        attrs: { 'data-status': escalation ? 'gate-failed' : 'pending' },
+      }),
+      chip(GATE_STATUS_LABELS[task.status] ?? task.status, task.status),
+      el('span', { className: 'mono small', text: task.gateTaskId }),
+    ]))
 
-    const meta = document.createElement('p')
-    meta.className = 'mono small'
-    meta.textContent = `产物 ${task.artifactPath} · 机器门禁 ${task.machineStatus}`
-      + (task.claimedBy ? ` · 认领人 ${task.claimedBy}` : '')
-      + (task.decision ? ` · 裁决 ${task.decision.action} by ${task.decision.by}：${task.decision.note}` : '')
-      + (task.cancellation ? ` · 已取消 by ${task.cancellation.by}：${task.cancellation.note}` : '')
-      + (task.consumedAt ? ' · 裁决已被消费' : '')
-    box.append(meta)
+    box.append(el('p', {
+      className: 'gate-meta',
+      text: escalation
+        ? '该任务由机器门禁失败或预算超限产生，不对应产物，永远不会被当作阶段批准。处置方式：修正原因后登记重入。'
+        : `产物 ${task.artifactPath} · 机器门禁 ${task.machineStatus}`,
+    }))
+    if (task.claimedBy !== undefined) {
+      box.append(el('p', {
+        className: 'gate-meta',
+        text: `认领人 ${task.claimedBy}${task.lease === undefined ? '' : `（租约至 ${timeText(task.lease.expiresAt)}）`}`,
+      }))
+    }
+    if (task.decision !== undefined) {
+      box.append(el('p', { className: 'gate-meta', text: `裁决 ${task.decision.action} by ${task.decision.by}：${task.decision.note}` }))
+    }
+    if (task.cancellation !== undefined) {
+      box.append(el('p', { className: 'gate-meta', text: `已取消 by ${task.cancellation.by}：${task.cancellation.note}` }))
+    }
 
     if (task.machineViolations.length > 0) {
-      const list = document.createElement('ul')
-      list.className = 'violations'
-      for (const violation of task.machineViolations) {
-        const item = document.createElement('li')
-        item.dataset.level = violation.level
-        item.textContent = `[${violation.level}] ${violation.rule}：${violation.detail}`
-        list.append(item)
-      }
-      box.append(list)
+      box.append(el('ul', { className: 'violations' }, task.machineViolations.map(v =>
+        el('li', { text: `[${v.level}] ${v.rule}：${v.detail}`, attrs: { 'data-level': v.level } }))))
     }
     if (task.review !== undefined) {
-      const review = document.createElement('div')
-      review.className = 'review'
-      review.innerHTML = `<span class="chip" data-status="review">${task.review.verdict}</span>`
-      const list = document.createElement('ul')
-      list.className = 'findings'
-      for (const finding of task.review.findings) {
-        const item = document.createElement('li')
-        item.textContent = finding
-        list.append(item)
-      }
-      review.append(list)
-      box.append(review)
+      box.append(el('div', {}, [
+        chip(task.review.verdict, 'review'),
+        el('ul', { className: 'findings' }, task.review.findings.map(f => el('li', { text: f }))),
+      ]))
     }
 
-    // 已终态的任务只读展示：再次裁决会被服务端以 gate-not-decidable 拒绝，
-    // 因此前端也不提供按钮，避免制造"点了就能改"的错觉。
+    // 只有"可裁决"的状态才给按钮：终态任务点不了，避免"点了就能改"的错觉。
     const decidable = task.status === 'pending' || task.status === 'claimed'
     if (decidable) {
-      const note = document.createElement('input')
-      note.placeholder = '裁决说明（打回/拒绝时必填）'
-      const row = document.createElement('div')
-      row.className = 'actions'
-      // 幂等（docs/10 §6.3 M2-3）：同一个 (任务, 动作, 说明) 沿用同一个 decisionId，
-      // 因此双击或网络重试会被服务端**重放首次裁决结果**，而不是二次驱动门。
-      // 说明文字一改就换一个 id——那是另一个裁决意图，不该被当成重试。
+      const note = el('textarea', {
+        attrs: {
+          'aria-label': `对 ${task.gateTaskId} 的裁决说明（打回 / 拒绝 / 取消时必填）`,
+          placeholder: '裁决说明（打回 / 拒绝 / 取消时必填）',
+        },
+      })
+      const row = el('div', { className: 'actions' })
+      // 幂等：同一 (任务, 动作, 说明) 沿用同一个 decisionId，双击/重试只会重放首次结果。
       const decisionIds = new Map()
       const decisionIdFor = action => {
         const intent = `${task.gateTaskId}\u0000${action}\u0000${note.value}`
@@ -362,234 +491,536 @@ function renderGates(gates) {
         return id
       }
       for (const [action, label] of [['approved', '批准'], ['changes-needed', '打回重跑'], ['rejected', '拒绝']]) {
-        const button = document.createElement('button')
-        button.textContent = label
-        if (action === 'approved') button.className = 'primary'
-        button.addEventListener('click', () => decideGate(task, action, note.value, box, decisionIdFor(action)))
-        row.append(button)
+        row.append(el('button', {
+          // 升级任务上的"批准"不是阶段批准，因此不标成 primary，避免误导。
+          className: action === 'approved' ? (escalation ? 'danger' : 'primary') : '',
+          text: label,
+          attrs: { type: 'button' },
+          on: { click: () => decideGate(task, action, note.value, decisionIdFor(action)) },
+        }))
       }
-      const cancelButton = document.createElement('button')
-      cancelButton.textContent = '取消任务'
-      cancelButton.addEventListener('click', () => cancelGate(task, note.value, box))
-      row.append(cancelButton)
+      row.append(el('button', {
+        text: '取消任务',
+        attrs: { type: 'button' },
+        on: { click: () => cancelGate(task, note.value) },
+      }))
       box.append(note, row)
     }
 
-    container.append(box)
+    root.append(box)
   }
 }
 
-/** 裁决幂等标识。非安全上下文（局域网 http）没有 `crypto.randomUUID`，退回随机串。 */
 function newDecisionId() {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
   return `dec-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
 
-async function decideGate(task, action, note, box, decisionId) {
-  try {
-    await api('POST', `/api/gates/${encodeURIComponent(task.gateTaskId)}/decide`, {
-      pipelineId: current.pipelineId,
-      action,
-      note,
-      // 乐观并发：带上页面看到的 updatedAt，避免覆盖他人在同一页面上完成的裁决。
-      expectedUpdatedAt: task.updatedAt,
-      // 幂等：重复投递（双击/重试）返回首次裁决结果，不二次驱动门。
-      decisionId,
-    })
-    report('out-run', `已裁决 ${task.stageId} → ${action}；再次触发运行即消费该裁决。`)
-    await refresh()
-  } catch (error) {
-    showError('out-run', error)
-    if (error.code === 'conflict') await refresh()
+// ── 渲染：产物（可折叠）──────────────────────────────────────────────────────
+
+/**
+ * 递归渲染任意 JSON（要求 13）。
+ *
+ * 折叠策略：数组/对象/长字符串用 `<details>`，短值直接文本。
+ * **所有文本走 textContent**（要求 14）——产物是 agent 写的，可能含 HTML。
+ */
+function renderValue(value, key, depth = 0) {
+  const label = key === null || key === undefined ? '' : `${key}: `
+
+  if (value === null || value === undefined) {
+    return el('div', { className: 'mono small muted', text: `${label}—` })
   }
+  if (typeof value !== 'object') {
+    const text = typeof value === 'string' ? value : JSON.stringify(value)
+    if (typeof value === 'string' && text.length > 160) {
+      return el('details', { className: 'node' }, [
+        el('summary', { text: `${label}文本（${text.length} 字符）` }),
+        el('pre', { className: 'artifact', text }),
+      ])
+    }
+    return el('div', { className: 'mono small', text: `${label}${text}` })
+  }
+
+  const isArray = Array.isArray(value)
+  const entries = isArray ? value.map((item, index) => [String(index), item]) : Object.entries(value)
+  const summary = `${label}${isArray ? `数组（${entries.length} 项）` : `对象（${entries.length} 字段）`}`
+
+  // 浅层小对象直接展开，避免层层点击。
+  const shallow = depth === 0 && entries.length <= 6
+    && entries.every(([, item]) => item === null || typeof item !== 'object')
+  const body = entries.map(([childKey, child]) => renderValue(child, isArray ? null : childKey, depth + 1))
+  if (shallow) return el('div', {}, [el('div', { className: 'small muted', text: summary }), ...body])
+
+  return el('details', { className: 'node', attrs: depth === 0 ? { open: true } : {} }, [
+    el('summary', { text: summary }),
+    ...body,
+  ])
 }
 
-async function cancelGate(task, note, box) {
-  try {
-    await api('POST', `/api/gates/${encodeURIComponent(task.gateTaskId)}/cancel`, {
-      pipelineId: current.pipelineId,
-      note,
-    })
-    report('out-run', `已取消门任务 ${task.gateTaskId}。`)
-    await refresh()
-  } catch (error) {
-    showError('out-run', error)
-  }
-}
-
-// ── 渲染：事件 ───────────────────────────────────────────────────────────────
-
-function renderEvents(events) {
-  const list = $('event-list')
-  list.replaceChildren()
-  if (events.length === 0) {
-    const empty = document.createElement('li')
-    empty.className = 'muted'
-    empty.textContent = '尚无事件。'
-    list.append(empty)
+function renderArtifact() {
+  const root = $('artifact-viewer')
+  root.replaceChildren()
+  if (state.openArtifact === null) {
+    root.append(el('p', { className: 'muted', text: '在上方阶段卡片或「当前任务」里点击「查看产物」。' }))
     return
   }
-  for (const event of events) {
-    const item = document.createElement('li')
-    item.innerHTML = `<span class="mono small">${new Date(event.at).toLocaleString()}</span>
-      <span class="chip" data-status="event">${EVENT_LABELS[event.kind] ?? event.kind}</span>
-      <span>${event.stageId === null ? '' : `${STAGE_LABELS[event.stageId] ?? event.stageId} · `}${escapeHtml(event.detail)}</span>
-      ${event.actorId === null ? '' : `<span class="muted small">by ${escapeHtml(event.actorId)}</span>`}`
-    list.append(item)
+  if (state.artifactError !== null) {
+    root.append(el('p', { className: 'muted', text: state.artifactError }))
+    return
   }
+  const artifact = state.artifact
+  if (artifact === null) {
+    root.append(el('p', { className: 'muted', text: '正在读取产物…' }))
+    return
+  }
+  root.append(el('p', {
+    className: 'mono small',
+    text: `${artifact.artifactPath} · v${artifact.version} · digest ${artifact.digest.slice(0, 16)}`,
+  }))
+  root.append(renderValue(artifact.content, null))
 }
 
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, char => (
-    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]
-  ))
-}
-
-// ── 刷新与轮询 ───────────────────────────────────────────────────────────────
-
-async function refresh() {
-  const pipelineId = $('pipelineId').value.trim()
-  if (pipelineId === '') return
+async function toggleArtifact(stageId, keepOpen = false) {
+  if (state.openArtifact === stageId && !keepOpen) {
+    state.openArtifact = null
+    state.artifact = null
+    state.artifactError = null
+    renderArtifact()
+    renderStepper()
+    return
+  }
+  state.openArtifact = stageId
+  state.artifact = null
+  state.artifactError = null
+  renderArtifact()
+  renderStepper()
   try {
-    const view = await api('GET', `/api/pipelines/${encodeURIComponent(pipelineId)}`)
-    current = view
-    $('run-status').textContent = STATUS_LABELS[view.status] ?? view.status
-    $('run-status').dataset.status = view.status
-    $('run-meta').textContent = `cursor ${view.cursor} · 下一阶段 ${view.nextStage ?? '—'}`
-      + ` · 后台运行中 ${view.running ? '是' : '否'}`
-      + ` · 模板 ${view.templateVersion} · 规则集 ${view.rulesetVersion}`
-      + (view.openGateTaskId === null ? '' : ` · 待裁决 ${view.openGateTaskId}`)
-    renderStages(view)
-
-    const [gates, events] = await Promise.all([
-      api('GET', `/api/pipelines/${encodeURIComponent(pipelineId)}/gates`),
-      api('GET', `/api/pipelines/${encodeURIComponent(pipelineId)}/events`),
-    ])
-    renderGates(gates.gates)
-    renderEvents(events.events)
+    state.artifact = await api('GET',
+      `/api/pipelines/${encodeURIComponent(state.pipelineId)}/stages/${encodeURIComponent(stageId)}/artifact`)
   } catch (error) {
-    showError('out-run', error)
-    $('run-status').textContent = '读取失败'
-    $('run-status').dataset.status = 'failed'
-    $('run-meta').textContent = error.message
+    // 404 = 该阶段尚未产出（服务端不编造空产物），如实展示。
+    state.artifactError = error instanceof ApiError && error.httpStatus === 404
+      ? '该阶段尚无产物（服务端不返回空对象）。'
+      : describeError(error)
+  }
+  renderArtifact()
+}
+
+// ── 渲染：用量 / 事件 / 高级 ─────────────────────────────────────────────────
+
+function renderUsage() {
+  const root = $('usage-panel')
+  root.replaceChildren()
+  const usage = state.usage
+  if (usage === null) {
+    root.append(el('p', { className: 'muted', text: '尚未加载。' }))
+    return
+  }
+  if (usage.skippedLines > 0) {
+    root.append(el('p', {
+      className: 'reason',
+      text: `注意：用量日志有 ${usage.skippedLines} 行无法解析，计量不完整——不能把下面的数字读成"用量为 0"。`,
+    }))
+  }
+  if (usage.budgetFailures > 0) {
+    root.append(el('p', {
+      className: 'reason',
+      text: `预算强制停止 ${usage.budgetFailures} 次（来自检查点：运行器当场停止并落盘的事实）。`,
+    }))
+  }
+
+  const rows = usage.stages.map(stage => el('tr', {}, [
+    el('td', { text: `${STAGE_LABELS[stage.stageId] ?? stage.stageId}（${stage.stageId}）` }),
+    el('td', { className: 'mono', text: String(stage.totals.llmCalls) }),
+    el('td', { className: 'mono', text: `${stage.totals.toolSteps} / ${stage.budget.maxSteps}` }),
+    el('td', { className: 'mono', text: String(stage.totals.reviewCalls) }),
+    el('td', { className: 'mono', text: String(stage.totals.executorCases) }),
+    el('td', {
+      text: stage.exceeded.length === 0 && stage.budgetFailures === 0
+        ? '否'
+        : `是（${stage.exceeded.map(item => `${item.kind} ${item.used}>${item.limit}`).join('；')}`
+          + `${stage.budgetFailures > 0 ? `；强制停止 ${stage.budgetFailures} 次` : ''}）`,
+    }),
+  ]))
+
+  root.append(el('table', { className: 'usage' }, [
+    el('thead', {}, [el('tr', {}, [
+      el('th', { text: '阶段' }),
+      el('th', { text: '模型调用' }),
+      el('th', { text: '工具步数 / 上限' }),
+      el('th', { text: '审核调用' }),
+      el('th', { text: '执行用例' }),
+      el('th', { text: '超限' }),
+    ])]),
+    el('tbody', {}, rows),
+  ]))
+
+  const totals = usage.totals
+  root.append(el('p', {
+    className: 'small muted',
+    text: `合计：模型调用 ${totals.llmCalls} · 工具步数 ${totals.toolSteps} · 执行用例 ${totals.executorCases}`
+      + `（失败 ${totals.executorFailures}）· 墙钟跨度 ${totals.wallClockMs}ms · `
+      + (totals.tokensAvailable
+        ? `tokens ${totals.inputTokens}/${totals.outputTokens}`
+        : 'tokens 不可用（provider 未完整返回用量，不能当成 0）'),
+  }))
+}
+
+function renderEvents() {
+  const list = $('events-list')
+  list.replaceChildren()
+  if (state.events.length === 0) {
+    list.append(el('li', { className: 'muted', text: '尚无事件。' }))
+    return
+  }
+  for (const event of state.events) {
+    list.append(el('li', {}, [
+      el('span', { className: 'mono small', text: timeText(event.at) }),
+      chip(EVENT_LABELS[event.kind] ?? event.kind, 'event'),
+      el('span', {
+        text: (event.stageId === null ? '' : `${STAGE_LABELS[event.stageId] ?? event.stageId} · `) + event.detail,
+      }),
+      event.actorId === null ? null : el('span', { className: 'muted small', text: `by ${event.actorId}` }),
+    ]))
   }
 }
 
-function setPolling(enabled) {
-  if (pollTimer !== null) {
-    clearInterval(pollTimer)
-    pollTimer = null
+function renderAdvanced() {
+  const root = $('advanced-violations')
+  root.replaceChildren()
+  const view = state.view
+  if (view === null) return
+
+  for (const stage of view.stages) {
+    if (stage.machineViolations.length === 0 && stage.reviewFindings.length === 0 && stage.failure === null) continue
+    const body = []
+    if (stage.failure !== null) {
+      body.push(el('p', {
+        className: 'reason',
+        text: `失败：${stage.failure.kind}`
+          + (stage.failure.rule === null ? '' : ` · ${stage.failure.rule}`)
+          + (stage.failure.detail === null ? '' : `：${stage.failure.detail}`)
+          + `（${timeText(stage.failure.at)}）`,
+      }))
+    }
+    if (stage.machineViolations.length > 0) {
+      body.push(el('ul', { className: 'violations' }, stage.machineViolations.map(v =>
+        el('li', { text: `[${v.level}] ${v.rule}：${v.detail}`, attrs: { 'data-level': v.level } }))))
+    }
+    if (stage.reviewFindings.length > 0) {
+      body.push(el('ul', { className: 'findings' }, stage.reviewFindings.map(f => el('li', { text: f }))))
+    }
+    root.append(el('details', { className: 'node' }, [
+      el('summary', { text: `${STAGE_LABELS[stage.stageId] ?? stage.stageId}（${stage.stageId}）` }),
+      ...body,
+    ]))
   }
-  if (enabled) pollTimer = setInterval(() => { void refresh() }, 2000)
+  if (root.childElementCount === 0) {
+    root.append(el('p', { className: 'muted', text: '没有机器违规或审核 findings。' }))
+  }
+
+  // 重入表单：digest 用当前阶段的真实值，避免手抄错。
+  const select = $('f-reenter-stage')
+  if (select.options.length === 0) {
+    for (const stage of view.stages) {
+      select.append(el('option', {
+        text: `${STAGE_LABELS[stage.stageId] ?? stage.stageId}（${stage.stageId}）`,
+        attrs: { value: stage.stageId },
+      }))
+    }
+    select.addEventListener('change', syncReenterDigest)
+  }
+  syncReenterDigest()
+
+  $('raw-view').textContent = JSON.stringify(view, null, 2)
+}
+
+function syncReenterDigest() {
+  const stageId = $('f-reenter-stage').value
+  const stage = state.view?.stages.find(item => item.stageId === stageId)
+  $('f-reenter-digest').value = stage?.digest ?? ''
+}
+
+// ── 刷新 ─────────────────────────────────────────────────────────────────────
+
+/**
+ * 刷新当前流水线的全部事实。
+ *
+ * 关键取舍（要求 7）：门任务面板在用户正在输入时**冻结**，只提示"有新变化"；
+ * 产物查看器保留展开状态。这两处是"用户正在看/改的东西"，被轮询冲掉最恼人。
+ */
+async function refresh() {
+  if (state.busy) return
+  state.busy = true
+  try {
+    if (state.pipelineId === null) {
+      renderWizard()
+      state.list = (await api('GET', '/api/pipelines')).pipelines
+      renderList()
+      state.lastError = null
+      return
+    }
+
+    const id = encodeURIComponent(state.pipelineId)
+    const [view, gates, usage, events] = await Promise.all([
+      api('GET', `/api/pipelines/${id}`),
+      api('GET', `/api/pipelines/${id}/gates`),
+      api('GET', `/api/pipelines/${id}/usage`),
+      api('GET', `/api/pipelines/${id}/events`),
+    ])
+    const previousStage = state.view?.currentStage ?? null
+    state.view = view
+    state.gates = gates.gates
+    state.usage = usage
+    state.events = events.events
+    state.lastError = null
+
+    $('wizard').hidden = true
+    $('workspace').hidden = false
+
+    renderSummary()
+    renderStepper()
+    renderTask()
+    if (gatesFrozen()) {
+      // 不重绘门面板；明确告诉用户"页面上的门任务可能已过期"。
+      showOut('gate-notice', '门任务有新变化，但你正在输入：已暂停更新该面板。清空输入或移开焦点后会自动刷新。', 'warn')
+    } else {
+      clearOut('gate-notice')
+      renderGates()
+    }
+    renderUsage()
+    renderEvents()
+    renderAdvanced()
+
+    // 产物：保持展开状态；阶段推进后重新拉一次（内容可能已变）。
+    if (state.openArtifact !== null) {
+      const stillExists = view.stages.some(stage => stage.stageId === state.openArtifact)
+      if (!stillExists) {
+        state.openArtifact = null
+        state.artifact = null
+      } else if (previousStage !== view.currentStage || state.artifact === null) {
+        await toggleArtifact(state.openArtifact, true)
+      }
+    }
+    renderArtifact()
+  } catch (error) {
+    state.lastError = error
+    // 503 不显示成"没有流水线"：给出明确的基础设施提示 + 重试入口。
+    if (state.pipelineId === null) {
+      $('pipeline-list').replaceChildren()
+      showOut('out-wizard', describeError(error), 'error')
+    } else {
+      $('conn').dataset.state = 'error'
+      $('conn').textContent = '读取失败'
+      $('task-body').replaceChildren(el('p', { className: 'reason', text: describeError(error) }))
+    }
+  } finally {
+    state.busy = false
+    renderPollingState()
+  }
+}
+
+// ── 动作 ─────────────────────────────────────────────────────────────────────
+
+function openPipeline(pipelineId) {
+  state.pipelineId = pipelineId
+  state.view = null
+  state.gates = []
+  state.usage = null
+  state.events = []
+  state.openArtifact = null
+  state.artifact = null
+  state.artifactError = null
+  clearOut('out-wizard')
+  // 导航上下文进 URL（只存 pipelineId，不存任何运行状态）；刷新后能回到同一条流水线。
+  location.hash = `pipeline=${encodeURIComponent(pipelineId)}`
+  void refresh()
+}
+
+function closePipeline() {
+  state.pipelineId = null
+  state.view = null
+  history.replaceState(null, '', location.pathname)
+  void refresh()
+}
+
+async function createPipeline(form) {
+  const data = new FormData(form)
+  const body = { pipelineId: String(data.get('pipelineId') ?? '').trim() }
+  for (const field of ['requirementInput', 'providerName', 'targetBaseUrl', 'rulesetVersion']) {
+    const value = String(data.get(field) ?? '').trim()
+    if (value !== '') body[field] = value
+  }
+  for (const field of ['maxGateRetries', 'gateWaitTimeoutMs', 'gateTaskTtlMs']) {
+    const raw = String(data.get(field) ?? '').trim()
+    if (raw === '') continue
+    const value = Number(raw)
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new ApiError('invalid-request', `${field} 必须是非负整数`, 400, {})
+    }
+    body[field] = value
+  }
+  const diag = String(data.get('diagCredentials') ?? '').split(',').map(item => item.trim()).filter(item => item !== '')
+  if (diag.length > 0) body.diagCredentials = diag
+
+  const projectId = String(data.get('projectId') ?? '').trim()
+  const summary = await api('POST', `/api/projects/${encodeURIComponent(projectId)}/pipelines`, body)
+  showOut('out-wizard', `已创建：${summary.pipelineId}（status=${summary.status}）`, 'ok')
+  // 创建成功自动打开该流水线（要求 4）。
+  openPipeline(summary.pipelineId)
+}
+
+async function triggerRun() {
+  try {
+    const result = await api('POST', `/api/pipelines/${encodeURIComponent(state.pipelineId)}/run`)
+    showOut('out-wizard', result.started
+      ? '已在后台触发运行。人工门等待超时后本次运行以 waiting-human 结束；裁决后再次触发即续跑。'
+      : `未启动新运行：${result.reason}`, result.started ? 'ok' : 'warn')
+    await refresh()
+  } catch (error) {
+    showOut('out-wizard', describeError(error), 'error')
+    if (error instanceof ApiError && error.httpStatus === 409) await refresh()
+  }
+}
+
+async function cancelRun() {
+  try {
+    const result = await api('POST', `/api/pipelines/${encodeURIComponent(state.pipelineId)}/cancel`)
+    showOut('out-wizard', result.cancelled
+      ? '已发送取消信号（后台运行会在下一个安全点退出）。'
+      : '当前没有本进程内的后台运行可取消。', 'warn')
+    await refresh()
+  } catch (error) {
+    showOut('out-wizard', describeError(error), 'error')
+  }
+}
+
+async function recover() {
+  try {
+    const { outcomes } = await api('POST', '/api/admin/recover')
+    showOut('out-wizard', outcomes.length === 0
+      ? '没有需要恢复的流水线。'
+      : outcomes.map(item => `${item.pipelineId} → ${item.action}`
+        + `${item.started ? '（已续跑）' : ''}`
+        + `${item.detail === null ? '' : `：${item.detail}`}`).join('\n'), 'ok')
+    await refresh()
+  } catch (error) {
+    showOut('out-wizard', describeError(error), 'error')
+  }
+}
+
+async function reenter() {
+  const stageId = $('f-reenter-stage').value
+  const reason = $('f-reenter-reason').value.trim()
+  const digest = $('f-reenter-digest').value
+  try {
+    const checkpoint = await api('POST', `/api/pipelines/${encodeURIComponent(state.pipelineId)}/reenter`, {
+      stageId,
+      reason,
+      ...(digest === '' ? {} : { expectedCurrentDigest: digest }),
+    })
+    showOut('out-reenter',
+      `重入已登记：cursor ${checkpoint.cursor}，累计 ${checkpoint.reentries.length} 次。触发运行即级联重跑。`, 'ok')
+    await refresh()
+  } catch (error) {
+    showOut('out-reenter', describeError(error), 'error')
+    if (error instanceof ApiError && error.httpStatus === 409) await refresh()
+  }
+}
+
+async function decideGate(task, action, note, decisionId) {
+  try {
+    await api('POST', `/api/gates/${encodeURIComponent(task.gateTaskId)}/decide`, {
+      pipelineId: state.pipelineId,
+      action,
+      note,
+      expectedUpdatedAt: task.updatedAt,
+      decisionId,
+    })
+    showOut('out-wizard', `已裁决 ${task.stageId} → ${action}；再次触发运行即消费该裁决。`, 'ok')
+    await refresh()
+  } catch (error) {
+    showOut('out-wizard', describeError(error), 'error')
+    if (error instanceof ApiError && error.httpStatus === 409) await refresh()
+  }
+}
+
+async function cancelGate(task, note) {
+  try {
+    const result = await api('POST', `/api/gates/${encodeURIComponent(task.gateTaskId)}/cancel`, {
+      pipelineId: state.pipelineId,
+      note,
+    })
+    showOut('out-wizard', result.cancelled ? `已取消门任务 ${result.task.gateTaskId}。` : '取消未生效。', 'warn')
+    await refresh()
+  } catch (error) {
+    showOut('out-wizard', describeError(error), 'error')
+  }
 }
 
 // ── 事件绑定 ─────────────────────────────────────────────────────────────────
 
-$('btn-create').addEventListener('click', async () => {
-  const projectId = $('projectId').value.trim()
-  const pipelineId = $('pipelineId').value.trim()
+$('create-form').addEventListener('submit', async event => {
+  event.preventDefault()
   try {
-    // 只发可公开字段：没有 apiKey，configRef 由服务端决定。
-    const body = { pipelineId }
-    for (const [field, id] of [['requirementInput', 'requirementInput'], ['providerName', 'providerName'], ['targetBaseUrl', 'targetBaseUrl']]) {
-      const value = $(id).value.trim()
-      if (value !== '') body[field] = value
-    }
-    const summary = await api('POST', `/api/projects/${encodeURIComponent(projectId)}/pipelines`, body)
-    report('out-create', summary)
-    await refresh()
+    await createPipeline(event.target)
   } catch (error) {
-    showError('out-create', error)
+    showOut('out-wizard', describeError(error), 'error')
   }
 })
-
-$('btn-refresh').addEventListener('click', () => { void refresh() })
 
 $('btn-list').addEventListener('click', async () => {
   try {
-    const { pipelines } = await api('GET', '/api/pipelines')
-    const list = $('pipeline-list')
-    list.replaceChildren()
-    for (const item of pipelines) {
-      const node = document.createElement('li')
-      const button = document.createElement('button')
-      button.className = 'link'
-      button.textContent = `${item.pipelineId} · ${item.projectId} · ${STATUS_LABELS[item.status] ?? item.status}`
-      button.addEventListener('click', () => {
-        $('pipelineId').value = item.pipelineId
-        $('projectId').value = item.projectId
-        openArtifact = null
-        void refresh()
-      })
-      node.append(button)
-      list.append(node)
-    }
-    if (pipelines.length === 0) list.innerHTML = '<li class="muted">没有可见的流水线。</li>'
+    state.list = (await api('GET', '/api/pipelines')).pipelines
+    $('list-filters').hidden = false
+    renderList()
   } catch (error) {
-    showError('out-create', error)
+    showOut('out-wizard', describeError(error), 'error')
   }
 })
 
-$('btn-run').addEventListener('click', async () => {
-  const pipelineId = $('pipelineId').value.trim()
-  try {
-    const result = await api('POST', `/api/pipelines/${encodeURIComponent(pipelineId)}/run`)
-    report('out-run', result.started
-      ? '已在后台触发运行（202）。人工门等待超时后本次运行以 waiting-human 结束，裁决后再次触发即续跑。'
-      : `未启动新运行：${result.reason === 'already-running' ? '该流水线已有后台运行在进行' : result.reason}`)
-    // 后台运行不是同步的：稍等再刷新，避免读到触发前的状态。
-    setTimeout(() => { void refresh() }, 500)
-  } catch (error) {
-    showError('out-run', error)
+$('f-filter-project').addEventListener('input', event => {
+  state.filters.projectId = event.target.value
+  renderList()
+})
+$('f-filter-status').addEventListener('change', event => {
+  state.filters.status = event.target.value
+  renderList()
+})
+
+$('btn-primary').addEventListener('click', () => { void runPrimaryAction() })
+$('btn-cancel-run').addEventListener('click', () => { void cancelRun() })
+$('btn-recover').addEventListener('click', () => { void recover() })
+$('btn-close').addEventListener('click', () => { closePipeline() })
+$('btn-reenter').addEventListener('click', () => { void reenter() })
+$('btn-refresh').addEventListener('click', () => { void refresh() })
+
+$('btn-poll').addEventListener('click', () => {
+  state.polling = !state.polling
+  renderPollingState()
+  // 恢复时立刻补一次，避免"刚恢复就看到旧数据"。
+  if (state.polling) void refresh()
+})
+
+window.addEventListener('hashchange', () => {
+  const match = /pipeline=([^&]+)/.exec(location.hash)
+  const id = match === null ? null : decodeURIComponent(match[1])
+  if (id !== state.pipelineId) {
+    if (id === null) closePipeline()
+    else openPipeline(id)
   }
 })
 
-$('btn-cancel-run').addEventListener('click', async () => {
-  const pipelineId = $('pipelineId').value.trim()
-  try {
-    const result = await api('POST', `/api/pipelines/${encodeURIComponent(pipelineId)}/cancel`)
-    report('out-run', result.cancelled ? '已发送取消信号。' : '当前没有本进程内的后台运行可取消。')
-    await refresh()
-  } catch (error) {
-    showError('out-run', error)
-  }
-})
+// ── 启动 ─────────────────────────────────────────────────────────────────────
 
-$('btn-recover').addEventListener('click', async () => {
-  try {
-    const { outcomes } = await api('POST', '/api/admin/recover')
-    report('out-run', outcomes.length === 0
-      ? '没有需要恢复的流水线。'
-      : outcomes.map(item => `${item.pipelineId} → ${item.action}${item.started ? '（已续跑）' : ''}${item.detail ? `：${item.detail}` : ''}`).join('\n'))
-    setTimeout(() => { void refresh() }, 500)
-  } catch (error) {
-    showError('out-run', error)
-  }
-})
-
-$('btn-reenter').addEventListener('click', async () => {
-  const pipelineId = $('pipelineId').value.trim()
-  const stageId = $('reenter-stage').value
-  const reason = $('reenter-reason').value.trim()
-  const expectedCurrentDigest = $('reenter-digest').value
-  try {
-    const result = await api('POST', `/api/pipelines/${encodeURIComponent(pipelineId)}/reenter`, {
-      stageId,
-      reason,
-      ...(expectedCurrentDigest === '' ? {} : { expectedCurrentDigest }),
-    })
-    report('out-reenter', `重入已登记：cursor ${result.cursor}，累计 ${result.reentries.length} 次。触发运行即级联重跑。`)
-    await refresh()
-  } catch (error) {
-    showError('out-reenter', error)
-    if (error.code === 'conflict') await refresh()
-  }
-})
-
-$('auto-poll').addEventListener('change', event => setPolling(event.target.checked))
+setInterval(() => { if (state.polling) void refresh() }, 2000)
 
 void (async () => {
   await refreshHealth()
+  // 要求 11：刷新页面后恢复到同一条流水线（pipelineId 来自 URL，不是本地缓存的状态）。
+  const match = /pipeline=([^&]+)/.exec(location.hash)
+  if (match !== null) state.pipelineId = decodeURIComponent(match[1])
+  else $('list-filters').hidden = false
+  renderPollingState()
   await refresh()
-  setPolling($('auto-poll').checked)
 })()
