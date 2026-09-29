@@ -485,6 +485,43 @@ src/web/pipeline-legacy.ts         # 旧 manifest/checkpoint → 新对象的纯
 
 验收：现有测试全绿 + 新增 legacy 投影测试；磁盘零新文件。
 
+#### L1a 执行记录（证据）
+
+执行时间：2026-09-29。提交：`80c85e5`（代码）、`eebd2fe`（设计定稿）。
+
+```text
+tsc --noEmit                          OK
+node --test test/pipeline-model-l1a.test.ts     17/17 pass
+node --test test/pipeline-l1a-service.test.ts    8/8  pass
+node --test                          953/953 pass、0 fail、0 skipped
+```
+
+L1a 的两条**承诺性**断言（不是"字段对不对"，而是"承诺有没有被破坏"）：
+
+```text
+1. 不写盘：跑完 listRevisions / listRuns 后，数据根里每个文件的
+   sha256 + 大小逐字不变 —— 这是"L1a 回滚成本为零"的实质。
+2. 不泄露部署布局：响应体里不得出现数据根绝对路径。
+   projectLegacy 产出的 legacyLocator 是绝对路径，必须被剥掉；
+   用 PublicPipelineRecord = Omit<PipelineRecord,'legacyLocator'> 在**类型层面**
+   让它无法出现在响应里，而不是靠"记得别返回它"。
+```
+
+**L1a 期间发现并修掉的两个真实缺陷**（都记入 `eebd2fe` / `80c85e5`）：
+
+| 缺陷 | 后果 | 修法 |
+|---|---|---|
+| `PipelineRecord` 若写在 `pipelines/<id>.json` | `isIndexEntry` 忽略多余字段 → 新形状被当合法 manifest → **运行参数静默丢失** | 改到 `pipelines/<pipelineId>/pipeline.json`；特征测试钉住（见 §3.3） |
+| `revisionFingerprint` 把 `undefined` 与 `''` 归一成同一值 | 两份**行为不同**的配置算出同一指纹，破坏 R4 | `normalizeField` 加类型标签（`u:`/`n:`/`a:`/`v:`） |
+
+**§9 验收门槛的 L1a 部分**：
+
+- [x] 三对象类型冻结，且不变量有断言函数（`assertRunInvariants` 等，不是只写在文档里）
+- [x] 旧数据可读（953 项现有测试全绿）
+- [ ] locator 是唯一路径来源 —— **未达**：`pipeline-run-service.ts` 仍有一处
+      `join(dataRoot, 'pipelines')`。按 §3.2 的设计，服务层委托到 locator 属 **L1b**，
+      此处如实记为未勾选，不得提前勾。
+
 ### L1b：双写 + 惰性迁移
 
 交付：
