@@ -715,6 +715,62 @@ type RunResult =
 
 ---
 
+## 8.7 L1 事实模型：只读端点 + 双写 + 惰性迁移（L1a / L1b）
+
+> 设计依据：`docs/19-l1-pipeline-revision-run-design.md`。**L1b 期间读侧不变**——
+> 下面所有"新增"都是**增量**：既有端点的请求与响应**逐字不变**（967 项测试兜底）。
+
+| 接口 | 语义 | 权限 | 阶段 |
+|---|---|---|---|
+| `GET /api/pipelines/:id/revisions` | 列出该流水线的 **Revision**（配置快照） | `operator` | L1a |
+| `GET /api/pipelines/:id/runs` | 列出该流水线的 **Run**（一次执行） | `operator` | L1a |
+
+**响应形状（冻结）**：
+
+```ts
+// GET /api/pipelines/:id/revisions
+{ pipelineId, pipeline: PublicPipelineRecord, revisions: PipelineRevision[] }
+// GET /api/pipelines/:id/runs
+{ pipelineId, pipeline: PublicPipelineRecord, runs: PipelineRun[] }
+```
+
+**两条硬约束（都有用例钉住）**：
+
+1. **不泄露部署布局**：`PublicPipelineRecord = Omit<PipelineRecord, 'legacyLocator'>`。
+   `legacyLocator` 的三个字段是**服务器绝对路径**，在**类型层面**让它无法出现在响应里，
+   而不是靠"记得别返回它"。`PipelineRun.checkpointLocator` 一律是**相对 dataRoot** 的路径。
+2. **`migration` 段不污染 `backend.ok`**：`PipelineDiagnostics` 新增 `migration`：
+
+```ts
+interface PipelineMigrationReport {
+  state: 'migrated' | 'needed' | 'incomplete' | 'conflict'
+  record: 'missing' | 'ok' | 'corrupt'
+  revisions: number
+  runs: number
+  diagnostics: StorageDiagnostic[]     // ref 是**相对**路径，不含数据根
+}
+```
+
+`backend.ok` 的语义仍是"**存储 schema 健康**"。把"还没迁移"算进它会
+让每一份老数据根一开机就报不健康——报警一旦是常态就没人看了。
+`attentionNeeded` 只在 `state` 为 `incomplete` / `conflict` 时置真。
+
+**新增落盘/契约**：
+
+- `AuditEventKind` 新增 `migration-intent` / `migration-completed`（成对出现，
+  **必须同时加进 `AUDIT_EVENT_KINDS`**——同一类坑第三次出现，用例已钉住读得出来）；
+- `StorageDiagnosticCode` 新增 `migration-incomplete` / `migration-conflict`；
+- 新格式落盘坐标：`pipelines/<id>/pipeline.json`、`pipelines/<id>/revisions/<rid>.json`、
+  `pipelines/<id>/runs/<runId>.json`。**注意不是** `pipelines/<id>.json`（那是旧扁平索引，
+  写错会被 `isIndexEntry` 静默接受、运行参数静默丢失，见 `docs/19` §3.3）；
+- 落盘一律走**可注入的** `HostRecordStore`（`(collection, id)` 坐标），
+  文件路径由坐标推导——直接写文件会让"换后端只改装配"静默失效。
+
+**L1b 的读侧承诺**：`create` / `PATCH` / `run` 双写；`get` 在新格式**不齐全**时惰性迁移；
+其余读端点（`list` / 产物 / 事件 / 用量 / 门任务 / 体检）**纯读旧格式，一个字节都不写**。
+
+---
+
 ## 9. 本轮计划新增/变更的契约
 
 > 以下为 `docs/14` W1~W3 的计划内容，**冻结稿确认它们尚未存在**。实现时必须

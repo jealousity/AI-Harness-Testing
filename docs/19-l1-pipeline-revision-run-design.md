@@ -128,13 +128,19 @@ interface PipelineRevision {
 
 | # | 不变量 |
 |---|---|
-| R1 | Revision 创建后**不可变**（任何字段都不再改） |
+| R1 | Revision 创建后**配置字段**不可变。**例外**：`status` 是唯一的生命周期字段，且只能 `active → superseded` **单向**迁移（写 L1b 时发现的矛盾：若 `status` 也冻结，则新建 revision-2 时 revision-1 无法退出 active，R3 永远无法成立） |
 | R2 | `revisionNumber` 在同一 pipeline 内单调递增、不跳号 |
 | R3 | 同一 pipeline 内最多一个 `status: 'active'` |
 | R4 | `fingerprint` 覆盖所有行为字段（含 `rulesetVersion`） |
 | R5 | 凭据**值**绝不进入 revision；`diagCredentials` 只存环境变量名 |
 | R6 | `targetBaseUrl` 在创建 revision 时做 SSRF 校验 |
 | R7 | 创建新 revision 时，若 fingerprint 与当前 active 相同 → **不新建**，直接返回当前 active（避免"改了个空格产生一版"） |
+
+**R4/R7 的落地要点（写 L1b 时踩出来的）**：指纹必须由**唯一一处**函数计算
+（`pipeline-model.ts` 的 `revisionConfigOf`）。迁移路径与新建路径若各算一次，
+同一份配置会得到**两个**指纹——迁移侧曾把缺省字段写成 `?? null`，新建侧留 `undefined`，
+而规范化把 `null` 记成 `n:`、`undefined` 记成 `u:`，两者不相等。后果是
+"PATCH 一份与当前完全相同的参数"被误判成变化，白建一个 revision（直接破坏 R7）。
 
 ### 2.3 PipelineRun（一次执行）
 
@@ -201,8 +207,8 @@ PipelineRunView     ← 上述三者的派生视图（新增 runId / revisionId 
     pipeline.json                              # PipelineRecord（新）★ 独立路径，见 §3.3
     revisions/<revisionId>.json                # PipelineRevision（新）
     runs/<runId>.json                          # PipelineRun（新）
-    runs/<runId>/checkpoint.json               # L1b 起
-    runs/<runId>/artifacts/<stageId>.json      # L1b 起
+    runs/<runId>/checkpoint.json               # **L1c 起**（见下）
+    runs/<runId>/artifacts/<stageId>.json      # **L1c 起**
   # ── 以下为旧结构，L1 期间保持可读，不删 ──
   tenants/<tenant>/projects/<project>/
     checkpoints/<pipelineId>/checkpoint.json
@@ -213,23 +219,62 @@ PipelineRunView     ← 上述三者的派生视图（新增 runId / revisionId 
     audit/audit.jsonl
 ```
 
+**这份布局只是"文件后端下的样子"，不是"直接写文件"的许可**。上面每一行都通过
+`HostRecordStore` 的 `(collection, id)` 坐标落盘（见 §3.2），默认工厂是文件实现，
+因此布局与这份图逐字一致；换内存/对象存储/PostgreSQL 之后**同一段业务代码不再落本地盘**。
+早期实现曾直接 `writeFile` 到这些路径，被 `test/storage-backend-wiring.test.ts` 的
+"注入之后本地不得再出现 `pipelines/` 目录"抓出来——那条断言就是这件事的守门人。
+
+**`runs/<runId>/checkpoint.json` 与 `runs/<runId>/artifacts/` 标的是 L1c 而不是 L1b**：
+把检查点搬进 run 目录等于**换读取的事实来源**，而 L1b 的定位是"写两侧、读旧侧"（§4.1）。
+两件事必须一起做，否则 L1b 期间会出现"新格式里有检查点、但读的还是旧检查点"的双事实。
+本文件早期版本把它们标成"L1b 起"，与 §4.1/§8 的分工矛盾，已在写 L1b 时改回 L1c。
+
 ### 3.2 locator 函数（**唯一路径来源**）
 
 新增 `src/web/pipeline-locator.ts`，所有入口必须调用它，禁止自行拼路径：
 
 ```ts
-function pipelineRecordPath(dataRoot: string, pipelineId: string): string
-function pipelineDir(dataRoot: string, pipelineId: string): string
+// ① 存储坐标（真正做 I/O 时用；走可注入的 HostRecordStore）
+const L1_INDEX_COLLECTION = 'pipelines'
+function pipelineCollectionOf(pipelineId: string): string      // pipelines/<pipelineId>
+function pipelineRecordKey(pipelineId: string): L1RecordKey    // → …/pipeline
+function revisionKey(pipelineId: string, revisionId: string): L1RecordKey
+function runKey(pipelineId: string, runId: string): L1RecordKey
+function revisionCollection(pipelineId: string): string        // …/revisions
+function runCollection(pipelineId: string): string             // …/runs
+
+// ② 文件路径（**由坐标推导**，供排障/测试核对；不直接用于业务 I/O）
+function pipelineIndexDir(dataRoot: string): string
+function pipelineIndexEntryPath(dataRoot: string, pipelineId: string): string   // 旧扁平索引
+function pipelineRecordPath(dataRoot: string, pipelineId: string): string       // 新记录
 function revisionPath(dataRoot: string, pipelineId: string, revisionId: string): string
 function runRecordPath(dataRoot: string, pipelineId: string, runId: string): string
 function runCheckpointPath(dataRoot: string, pipelineId: string, runId: string): string
 function runArtifactPath(dataRoot: string, pipelineId: string, runId: string, stageId: StageId): string
-function legacyCheckpointRoot(roots: PlatformStorageRoots): string
+
+// ③ 旧结构定位（L1 期间只读）
+function legacyCheckpointPath(roots: PlatformStorageRoots, pipelineId: string): string
+function legacyCheckpointLocator(dataRoot, roots, pipelineId): string   // 相对 dataRoot，出 API 用
+function legacyManifestPath(dataRoot: string, pipelineId: string): string
 function legacyArtifactRoot(roots: PlatformStorageRoots): string
 ```
 
 **为什么必须收口**：`docs/18` §8.6 禁止"各入口各写一套事实"。历史上锁路径就是这样出过问题
 （CLI/Web/Harness 拼出三条不同路径 = 等于没锁）。路径推导必须先收成一个模块。
+
+**为什么坐标与路径要两套、而不是只留一套**（写 L1b 时定下的）：
+
+| 需求 | 只有路径 | 只有坐标 | 两套（本设计） |
+|---|---|---|---|
+| 换后端后不落本地盘 | ✗ 直接写文件就漏了 | ✓ | ✓ |
+| 排障时能直接看到文件在哪 | ✓ | ✗ | ✓ |
+| 两者不会分叉 | — | — | ✓（路径由坐标推导） |
+
+`pipeline-run-service.ts` 的 `pipelineIndexDir` / `PIPELINE_INDEX_COLLECTION`
+**委托**到本模块（保留导出只为不改变公开 API），因此 §9 的
+"grep 全仓无第二处拼 `pipelines/`"由 `test/pipeline-l1b-migration.test.ts` 的
+「门槛」用例守住。
 
 ### 3.3 ⚠️ 为什么 `PipelineRecord` **不能**写在 `pipelines/<pipelineId>.json`
 
@@ -304,12 +349,17 @@ L1c 切换为单一事实源（新格式）
   → 构造 PipelineRecord（activeRevisionId = revision-1）
   → 构造 PipelineRevision-1（从旧 manifest 的运行参数字段）
   → 构造 PipelineRun-1（status/cursor 从 checkpoint 推导）
-  → 写 pipelines/<id>.json
-  → 写 revisions/revision-1.json
-  → 写 runs/run-1.json
-  → 追加审计 pipeline-migrated
+  → 写审计 migration-intent        （先写，见 M2）
+  → 写 pipelines/<id>/pipeline.json          （新形状；**不是** pipelines/<id>.json，见 §3.3）
+  → 写 pipelines/<id>/revisions/revision-1.json
+  → 写 pipelines/<id>/runs/run-1.json
+  → 写审计 migration-completed
   → 返回新视图
 ```
+
+**写入顺序**：`migration-intent` → `PipelineRecord` → `revision` → `run` → `migration-completed`。
+先写 record 意味着"中断后 record 已存在、revision/run 缺失"是最可能的中断形态，
+§4.3 的恢复判据正是围绕这个形态设计的。
 
 **硬约束**
 
@@ -322,24 +372,58 @@ L1c 切换为单一事实源（新格式）
 | M5 | 迁移失败不得让 `get` 失败——降级为"只读旧格式"并返回明确诊断 |
 | M6 | 迁移不得触发任何阶段执行 |
 
+**M1 与 M2 的分工（写 L1b 时澄清的）**：M1 保护的是**事实文件**
+（旧 manifest / 检查点 / 产物）——迁移一个字节都不该动它们。审计日志是**只追加**的
+观测通道，M2 恰恰要求往它追加事件。因此校验必须分开做：
+事实文件比 **sha256 逐字不变**，审计日志比 **只追加**（已有前缀的 sha256 不变、长度不减）。
+把日志算进"不得变化"会让 M1 与 M2 互相打架。
+
+**M3 的判据是"齐全"，不是"record 存在"**（写 L1b 时踩出来的真 bug）：
+`get` 的早退条件一度写成"新 record 存在就返回"。但 §4.3 的主形态恰恰是
+"record 在、revisions/runs 缺"——按"record 存在"早退，中断的迁移就**永远补不回来**，
+而体检会一直报 `migration-incomplete` 却没有任何路径能修好它。
+正确判据是 **record 在 + 至少一条 revision + 至少一条 run**。
+`test/pipeline-l1b-migration.test.ts` 的「中断后重跑幂等补齐」就是这条的守门人。
+
 ### 4.3 迁移中断的恢复
 
 ```text
-检测：pipelines/<id>.json 存在但 revisions/ 或 runs/ 缺失
+检测：pipelines/<id>/pipeline.json 存在但 revisions/ 或 runs/ 缺失
   → 视为"迁移未完成"
   → 重新执行迁移（幂等）
   → 若新格式已存在且合法 → 跳过写入，只补审计
 ```
 
+注意判据用的是**新 record 文件**（`pipelines/<id>/pipeline.json`），不是旧索引
+`pipelines/<id>.json`——旧索引在 L1 期间始终存在，拿它当判据会把"从未迁移过"误判成"迁移中断"。
+
+**"只补审计"的适用范围**（写 L1b 时澄清的）：这一句说的是**中断恢复这条路径**内部的取舍
+（新格式里已经存在且合法的那部分不重写，只把审计补齐），**不是**说"每次 `get` 都补一条审计"。
+已经**齐全**的流水线再被 `get` 时是**纯读**，一个字节都不写——否则 `get` 会变成写路径，
+审计日志随访问次数无界增长。M3 的"幂等"正是这个意思。
+
 新增诊断码（`StorageDiagnosticCode`）：
 
 ```text
-'migration-needed'      已有（旧格式待迁移）
-'migration-incomplete'  新增（新格式存在但不完整）
+'migration-needed'      已有（旧格式待迁移，新格式尚不存在）
+'migration-incomplete'  新增（新格式存在但不完整：record 在、revision/run 缺）
 'migration-conflict'    新增（新旧格式都存在但事实不一致）
 ```
 
 `diagnose()` 必须报告这三类，**不静默**。
+
+**`migration-needed` 不算 `attentionNeeded`**（写 L1b 时定下的）：L1b 期间"还没迁移"
+是完全正常的状态，把它算进"需要处置"会让每一份老数据根一开机就报不健康——
+报警一旦是常态就没人看了。只有 `incomplete` / `conflict` 计入。
+
+**冲突比较只比"旧侧权威、新侧应当镜像"的字段**，且**不比时间戳**：
+`createdAt`/`updatedAt` 在两侧语义不同（旧侧是"清单被写的时间"，新侧是"首次投影的时刻"），
+把它们算成冲突只会制造噪音，让人学会忽略这个诊断。检查点读不出来时**只报记录层面的结论**，
+不硬比运行状态——读不到事实就没法判"一致不一致"，硬比会报出假冲突。
+
+**M5 的降级用哪个码**：迁移抛错时不新增第四种码——此刻新格式仍未落盘，
+如实报 `migration-needed` 并附上失败原因即为"明确诊断"。
+凭空加一个 `migration-failed` 会让"新格式到底存不存在"这件事有两个码在说，反而含糊。
 
 ### 4.4 回滚（L1c → L1b）
 
@@ -406,11 +490,19 @@ L1c：锁路径改为 (pipelineId, runId) 两级：
 ### 6.2 必须新增的并发测试
 
 ```text
-1. 两个进程同时 PATCH → 只有一个 revision 成功，另一个得到 conflict
-2. 两个进程同时创建 run → 只有一个 active Run
-3. 旧代码（按 pipelineId 锁）+ 新代码（L1b）同时推进 → 仍互斥
-4. L1c 之后：两个 run 可并行（不同 runId），但同一 run 仍互斥
+1. 两个进程同时 PATCH → 只有一个 revision 成功，另一个得到 conflict      ← L1c
+2. 两个进程同时创建 run → 只有一个 active Run                            ← L1c
+3. 旧代码（按 pipelineId 锁）+ 新代码（L1b）同时推进 → 仍互斥              ← 由"锁路径不变"保证
+4. L1c 之后：两个 run 可并行（不同 runId），但同一 run 仍互斥              ← L1c
 ```
+
+**L1b 实际覆盖到的并发性质**：迁移的**内容确定性**——`revision-1` / `run-1` 由
+`pipelineId` 推出、内容来自同一份旧事实，加上记录存储的写是原子的，因此多个进程
+同时迁移只会写出同一份结果，不会各造一个 `revision-N`。
+`test/pipeline-l1b-migration.test.ts` 的「并发：两个 get 同时触发迁移」守住这条。
+
+用例 1/2/4 需要 **pipeline 级锁**，而 §6.1 明确规定锁拆分在 L1c；用例 3 不需要新测试
+——L1b **没有改动锁路径**，互斥性是"由构造保证"而不是"由新代码保证"的。
 
 ---
 
@@ -452,16 +544,21 @@ L1c：锁路径改为 (pipelineId, runId) 两级：
 - 迁移写审计事件
 
 【兼容】
-- 旧 GET /api/pipelines/:id 与 GET /api/runs/:activeRunId 返回同一事实
-- 旧 POST /api/pipelines/:id/run 与 POST /api/pipelines/:id/runs 语义一致
-- 旧 PATCH 语义变为"创建 revision"后，旧客户端仍拿到 200 + 可用视图
-- 旧 DELETE 语义为软删除后，旧客户端仍拿到 200
+- 旧 GET /api/pipelines/:id 与 GET /api/runs/:activeRunId 返回同一事实      ← L1c（L1b 读侧未切）
+- 旧 POST /api/pipelines/:id/run 与 POST /api/pipelines/:id/runs 语义一致  ← L1c
+- 旧 PATCH 语义变为"创建 revision"后，旧客户端仍拿到 200 + 可用视图          ← L1b 已满足
+- 旧 DELETE 语义为软删除后，旧客户端仍拿到 200                              ← L1b 已满足
 
 【并发】
-- 并发 PATCH → 一个成功一个 conflict
-- 并发创建 run → 只有一个 active
-- 新旧代码同时推进同一条流水线 → 互斥
+- 并发 PATCH → 一个成功一个 conflict                    ← L1c（需 pipeline 级锁）
+- 并发创建 run → 只有一个 active                        ← L1c
+- 新旧代码同时推进同一条流水线 → 互斥                    ← L1b 由"锁路径不变"保证
+- 并发触发迁移 → 结果确定、不产生垃圾 revision           ← L1b 已覆盖
 ```
+
+**L1b 实际落地的测试文件**：`test/pipeline-l1b-migration.test.ts`（13 项），
+覆盖【迁移】全组 + 迁移诊断四态 + 迁移只读性 + 注入存储 + 并发迁移 + §3.2 的门槛扫描。
+其余各项按上表标注的阶段推进，**未做的如实留空**，不用"看起来像做了"的占位测试充数。
 
 ---
 
@@ -518,9 +615,7 @@ L1a 的两条**承诺性**断言（不是"字段对不对"，而是"承诺有没
 
 - [x] 三对象类型冻结，且不变量有断言函数（`assertRunInvariants` 等，不是只写在文档里）
 - [x] 旧数据可读（953 项现有测试全绿）
-- [ ] locator 是唯一路径来源 —— **未达**：`pipeline-run-service.ts` 仍有一处
-      `join(dataRoot, 'pipelines')`。按 §3.2 的设计，服务层委托到 locator 属 **L1b**，
-      此处如实记为未勾选，不得提前勾。
+- [x] locator 是唯一路径来源 —— **L1b 已达成**（服务层委托 + 源码扫描用例守住，见 §3.2）
 
 ### L1b：双写 + 惰性迁移
 
@@ -532,11 +627,82 @@ L1a 的两条**承诺性**断言（不是"字段对不对"，而是"承诺有没
 
 验收：迁移测试 + 并发测试 + 迁移不修改旧文件（sha256）。
 
+**本阶段的定位（写之前先钉死，避免实现时含糊）**：**写两侧、读旧侧**。
+
+```text
+写入（create / PATCH / run）→ 同时镜像到新格式
+读取（get / list / 产物 / 事件 / 用量 …）→ 仍然走旧格式，行为逐字不变
+旧数据被 get 访问 → 惰性迁移补齐新格式（幂等、不碰旧文件）
+```
+
+**为什么读侧不切**：切读侧等于**换事实来源**，必须与锁路径拆分一起做（§6.1）——
+先切读再拆锁，会让新旧进程同时推进同一条流水线。因此 L1b 期间新格式是**副本**：
+丢了可以从旧格式重建，回滚成本 = 删掉 `pipelines/<id>/`。
+
+**L1b 明确不做（留给 L1c）**，逐条写出来，避免被当成"漏做"：
+
+| 不做的事 | 为什么是 L1c |
+|---|---|
+| 多 run（每次"重新运行"新 `runId`，Q1/Q4/Q5） | 需要 run 级检查点与产物目录，那是换事实来源 |
+| `run.revisionId` 成为**不可变**的绑定 | 旧事实里没有"某次运行绑了哪份配置"，L1b 的 run 只能跟当前 active revision |
+| 检查点搬进 `runs/<runId>/checkpoint.json` | 同上；搬了就有两份检查点 |
+| 锁拆成 pipeline 级 + run 级（§6.2 用例 1/4） | §6.1 明确规定 L1c 才拆，否则新旧进程不再互斥 |
+| run 的 `startedAt` / `finishedAt` 严格时序 | 旧 `Checkpoint` 类型里**没有**这两个字段，L1b 编不出来 |
+
+#### L1b 执行记录（证据）
+
+执行时间：2026-09-29。
+
+```text
+tsc --noEmit                          OK
+tsc -p tsconfig.build.json            OK
+node --test test/pipeline-l1b-migration.test.ts   13/13 pass
+node --test                          967/967 pass、0 fail、0 skipped
+```
+
+L1b 的三条**承诺性**断言：
+
+```text
+1. 迁移不改旧文件：迁移前后旧格式每个**事实文件**的 sha256 逐字不变（M1）；
+   审计日志单独判"只追加"（M2 要求写它）——两者混在一起判会互相打架。
+2. 迁移幂等：已齐全时 get 是纯读，第二次跑一个字节都不写（M3）。
+3. 迁移不执行阶段：迁移只是搬数据，不得顺带推进流水线（M6）。
+```
+
+**L1b 期间发现并修掉的三个真实缺陷**：
+
+| 缺陷 | 后果 | 修法 |
+|---|---|---|
+| L1 新格式直接 `writeFile` 到 `dataRoot` | 换后端后新格式仍落本地盘，"换后端只改装配"失效；单机测试看不见 | 改走可注入的 `HostRecordStore`（`(collection,id)` 坐标）；`test/storage-backend-wiring.test.ts` 的"注入后本地不得出现 `pipelines/`"抓出来 |
+| `get` 的迁移早退判据写成"record 存在" | **中断的迁移永远补不回来**，体检一直报 `migration-incomplete` 却无人能修 | 判据改为"record 在 + revision 在 + run 在"（§4.2 M3） |
+| 迁移与新建各算一次 revision 指纹 | 同一份配置两个指纹 → "PATCH 成完全相同的参数"白建一个 revision（破坏 R7） | 收口到 `revisionConfigOf`，缺省字段不做 `?? null` 归一（§2.2 R4/R7） |
+
+**顺带修掉的一个既有脆弱测试**：`checkpoint-lock.test.ts` 的"自动续租"用例依赖固定
+`sleep`（120ms → 300ms 两次放宽过），全量并行时事件循环被拖住会假失败（实测在全量
+967 项里偶发 1 项）。改成**轮询到机制成立**：机制判据（严格大于）不变，但不再依赖机器忙不忙。
+
+**§9 验收门槛的 L1b 部分**：
+
+- [x] locator 是唯一路径来源（服务层委托 + 源码扫描用例）
+- [x] 旧数据可读（967 项全绿）
+- [x] `PATCH` 创建新 revision（旧 manifest 仍同步更新——L1b 是双写，不是只写新格式）
+- [x] 每次 Run 绑定 revisionId（L1b 绑当前 active；不可变绑定属 L1c）
+- [x] 旧 API 与新 API 读同一事实（读侧都走旧格式，因此天然同源）
+- [x] `diagnose()` 报告迁移诊断码（四态 + 明细 + 不污染 `backend.ok`）
+- [x] 迁移可中断、可恢复，且**不修改旧文件**
+- [ ] 并发测试（PATCH / 新旧代码混跑）—— **未达**：§6.2 用例 1/3/4 需要 pipeline 级锁，
+      而 §6.1 明确 L1c 才拆锁。此处如实记为未勾选。
+- [ ] 旧 artifact 不被新 run 覆盖 —— **未达**：L1b 只有一条 run，产物目录还没按 run 分，
+      属 L1c。
+- [ ] 可回滚（§4.4 的演练）—— L1b 的回滚成本为零（删 `pipelines/<id>/`），
+      但**演练记录**按 §4.4 的要求写在 L1c 上线前，因此未勾选。
+
 ### L1c：切换单一事实源 + 锁拆分
 
 交付：
 
 - 新写入只写新格式；
+- 检查点与产物搬进 `runs/<runId>/`（多 run 由此成立）；
 - 锁拆成 pipeline 级 + run 级；
 - 旧文件只读保留。
 
@@ -546,21 +712,21 @@ L1a 的两条**承诺性**断言（不是"字段对不对"，而是"承诺有没
 
 ## 9. 验收门槛（L1 完成判定）
 
-- [ ] 三对象类型冻结，且不变量有断言函数（不是只写在文档里）
-- [ ] locator 是唯一路径来源（grep 全仓无第二处拼 `pipelines/`、`runs/`）
-- [ ] 旧数据可读（928 项现有测试全绿）
-- [ ] 迁移可中断、可恢复、可回滚，且**不修改旧文件**
-- [ ] `PATCH` 创建新 revision（不再覆盖 manifest）
-- [ ] 每次 Run 绑定 revisionId
-- [ ] 旧 artifact 不被新 run 覆盖
-- [ ] 旧 API 与新 API 读同一事实
-- [ ] 并发测试（PATCH / run / 新旧代码混跑）全绿
-- [ ] `diagnose()` 报告迁移诊断码
-- [ ] 回滚演练记录写进验收文档
+- [x] 三对象类型冻结，且不变量有断言函数（不是只写在文档里）
+- [x] locator 是唯一路径来源（grep 全仓无第二处拼 `pipelines/`、`runs/`）
+- [x] 旧数据可读（967 项现有测试全绿）
+- [x] 迁移可中断、可恢复，且**不修改旧文件**（可回滚的演练记录仍待 L1c，见 §4.4）
+- [x] `PATCH` 创建新 revision（L1b 仍同步旧 manifest；L1c 起不再写旧侧）
+- [x] 每次 Run 绑定 revisionId（L1b 绑当前 active revision）
+- [ ] 旧 artifact 不被新 run 覆盖 —— 属 L1c（产物目录按 run 分）
+- [x] 旧 API 与新 API 读同一事实
+- [ ] 并发测试（PATCH / run / 新旧代码混跑）全绿 —— 属 L1c（需 pipeline 级锁）
+- [x] `diagnose()` 报告迁移诊断码
+- [ ] 回滚演练记录写进验收文档 —— 按 §4.4，在 L1c 上线前完成
 
 ---
 
-## 10. 决策记录（L1a 开工前已定稿）
+## 10. 决策记录（L1a 开工前已定稿，L1b 续补 Q7~Q9）
 
 | # | 问题 | 决定 | 理由 |
 |---|---|---|---|
@@ -570,14 +736,27 @@ L1a 的两条**承诺性**断言（不是"字段对不对"，而是"承诺有没
 | Q4 | 旧 `POST /api/pipelines/:id/run` 在无 active Run 时是否自动创建 run？ | **自动创建**，并在响应里回传 `runId` | 保持旧客户端可用；同时让新客户端能拿到 runId |
 | Q5 | L1c 之后是否允许同一 pipeline 两个 run 并行？ | **允许**（不同 runId），但**同一 run 严格互斥** | 并行运行是 L2 比较能力的前提；同一 run 双写会破坏事实 |
 | Q6 | run 级产物目录会显著放大磁盘吗？ | **会**，L1 只记录风险 | 保留策略（保留最近 N 次 run）放 L2，不塞进 L1 |
+| **Q7** | L1b 期间"读侧"切不切新格式？ | **不切**：写两侧、读旧侧 | 切读侧等于换事实来源，必须与锁拆分一起做（§6.1）。不切则 L1b 是纯增量：回滚 = 删 `pipelines/<id>/`，且"旧 API 与新 API 读同一事实"天然成立 |
+| **Q8** | L1b 的一条 pipeline 有几条 run？`run.revisionId` 钉在哪一版？ | **一条 run**（`run-1`），`revisionId` 跟**当前 active revision** | 旧模型里一条流水线只有一份检查点，因此旧事实**不存在**"某次运行绑了哪份配置"这个信息；钉一个旧 revision 反而是编造绑定。多 run 与不可变绑定需要 run 级检查点，属 L1c |
+| **Q9** | L1b 的 `PATCH` 还要不要更新旧 manifest？ | **要**（双写） | L1b 是"双写"而不是"只写新的"。旧 manifest 仍是被读的那一份，不更新就会立刻出现"新格式说 revision-2、旧格式还是 revision-1"的假冲突 |
+| **Q10** | 新格式的落盘走文件还是走可注入的记录存储？ | **走 `HostRecordStore` 的 `(collection, id)` 坐标**，文件路径由坐标推导 | 直接写文件会让"换后端只改装配"失效（新格式仍落本地盘），而单机测试看不见；同时保留路径推导供排障。见 §3.1/§3.2 |
 
-**Q1 的落地形态**（写清楚，避免实现时含糊）：
+**Q1 的落地形态**（写清楚，避免实现时含糊；**L1c 才生效**）：
 
 ```text
 POST /api/pipelines/:id/run      → 触发 **active Run**
 POST /api/pipelines/:id/runs     → 显式创建**新 Run**（绑定 active revision），再触发
 "重新运行"按钮                    → 调 /runs（新 runId），不是把旧 run 重跑
 同一次运行内的阶段重试             → 同一 runId，attempt + 1（driver 内部行为，不变）
+```
+
+**Q7 的落地形态**：
+
+```text
+L1b：create / PATCH / run  → 双写（旧侧照旧，新侧镜像）
+     get                  → 惰性迁移（只在"新格式不齐全"时写盘）
+     其它读端点            → 纯读旧格式，一个字节都不写
+L1c：新写入只写新格式；读侧切到新格式；锁按 (pipelineId, runId) 两级拆
 ```
 
 **Q2 的落地形态**：
@@ -594,15 +773,22 @@ create 时若发现 deletedAt 存在 → 409 conflict，错误详情里说明"�
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| 改动面大（web 层 2075 行核心 service） | 回归风险高 | 分 L1a/L1b/L1c；L1a 不写盘，回滚成本为 0 |
-| 旧 API 语义漂移 | 现有客户端/测试失效 | 兼容矩阵（§5.1）+ 928 项测试兜底 |
+| 改动面大（web 层 2000+ 行核心 service） | 回归风险高 | 分 L1a/L1b/L1c；L1a 不写盘、L1b 只加副本，回滚成本为 0 |
+| 旧 API 语义漂移 | 现有客户端/测试失效 | 兼容矩阵（§5.1）+ 967 项测试兜底 |
 | 迁移中断留下半成品 | 数据不可读 | 幂等迁移 + `migration-incomplete` 诊断 + 降级为只读旧格式 |
 | 锁路径提前拆分 | 新旧进程不再互斥 | 锁路径 L1c 才拆（§6.1） |
+| **L1b 顺手把读侧也切了** | 出现两份事实（新格式说 A、读的还是 B），且新旧进程可能同时推进 | §4.1/§8 明写"写两侧、读旧侧"；L1b 明确不做清单（§8）逐条列出 |
+| **新格式绕过存储抽象直接写文件** | 换后端后仍落本地盘，"换后端只改装配"静默失效 | 走 `HostRecordStore` 坐标（Q10）；`storage-backend-wiring` 的"注入后本地不得出现 `pipelines/`"守门 |
+| **迁移的早退判据写成"record 存在"** | 中断的迁移永远补不回来，且体检一直报警却无人能修 | 判据是"齐全"（§4.2 M3）；专门的用例守住 |
 | 磁盘放大（每 run 一套产物） | 长期运维成本 | L1 只记录风险；保留策略放 L2 |
 
 ---
 
 ## 12. 一句话
 
-> **L1a 只加类型、locator 与只读兼容，不写任何新格式文件——这样即使设计错了，回滚成本是零。**
-> 双写（L1b）与切源（L1c）必须在 L1a 稳定运行之后再做。
+> **L1a 只加类型、locator 与只读兼容，不写任何新格式文件——即使设计错了，回滚成本是零。**
+> **L1b 双写 + 惰性迁移，但读侧仍走旧格式——新格式只是副本，回滚成本 = 删 `pipelines/<id>/`。**
+> **L1c 才切事实来源、搬 run 检查点、拆锁。**
+>
+> 三段的边界是"**读哪一份**"：L1a/L1b 读旧、L1c 读新。跨过这条线就是另一阶段的事，
+> 不能"顺手做了"——顺手切读会让新旧进程同时推进同一条流水线（§6.1）。
