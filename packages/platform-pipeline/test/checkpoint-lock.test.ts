@@ -445,13 +445,17 @@ test('自动续租：短间隔下 heartbeatAt 会自行前进（无需调用方�
     // ① "续租真的在跑" → `heartbeatAt` **严格前进**（这是机制证据）；
     // ② "续租把它保持在自身的 stale 窗口内" → 与 `staleMs` 比较。
     //
-    // 原来这里写的是"等待 120ms 后 `Date.now() - heartbeatAt < 300`"。全量测试并行跑时
-    // 事件循环会被拖住，20ms 的定时器完全可能被拖后几百毫秒，于是这条断言**假失败**
-    // （实测出现过）。把等待放到 300ms、把窗口放宽到 3s，机制判据反而更强（严格大于）。
+    // 等待方式用**轮询到机制成立**，不是固定 `sleep`：固定等待（原先的 120ms、后来的 300ms）
+    // 在全量测试并行跑时会被事件循环拖住，20ms 的定时器可能迟迟不触发，于是断言**假失败**
+    // （实测又出现过一次，全量 967 项里偶发 1 项）。轮询把"等多久"变成"等到为止"，
+    // 机制判据不变，但不再依赖机器忙不忙。
     const staleMs = 3_000
     const lock = await acquirePipelineLock(root, PIPELINE, { staleMs, heartbeatMs: 20 })
     const first = lock.owner.heartbeatAt
-    await new Promise(resolve => setTimeout(resolve, 300))
+    const deadline = Date.now() + 5_000
+    while (lock.owner.heartbeatAt <= first && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
     assert.ok(lock.owner.heartbeatAt > first, '续租必须真的推进 heartbeatAt（自动续租在工作）')
     assert.ok(Date.now() - lock.owner.heartbeatAt < staleMs, '自动续租后不应表现为 stale')
     assert.equal(await lock.release(), true)
