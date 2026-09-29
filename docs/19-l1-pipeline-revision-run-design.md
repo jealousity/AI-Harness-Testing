@@ -196,8 +196,9 @@ PipelineRunView     ← 上述三者的派生视图（新增 runId / revisionId 
 
 ```text
 <dataRoot>/
-  pipelines/<pipelineId>.json                  # PipelineRecord（新）
+  pipelines/<pipelineId>.json                  # **旧 manifest / 现有索引**（L1 期间不动）
   pipelines/<pipelineId>/
+    pipeline.json                              # PipelineRecord（新）★ 独立路径，见 §3.3
     revisions/<revisionId>.json                # PipelineRevision（新）
     runs/<runId>.json                          # PipelineRun（新）
     runs/<runId>/checkpoint.json               # L1b 起
@@ -230,16 +231,43 @@ function legacyArtifactRoot(roots: PlatformStorageRoots): string
 **为什么必须收口**：`docs/18` §8.6 禁止"各入口各写一套事实"。历史上锁路径就是这样出过问题
 （CLI/Web/Harness 拼出三条不同路径 = 等于没锁）。路径推导必须先收成一个模块。
 
-### 3.3 读路径解析顺序（L1a 兼容策略）
+### 3.3 ⚠️ 为什么 `PipelineRecord` **不能**写在 `pipelines/<pipelineId>.json`
+
+本文件早期版本把 `PipelineRecord` 放在 `pipelines/<pipelineId>.json`——**那正是旧 manifest 的路径**。
+实测确认这是一个**会静默损坏行为**的陷阱：
+
+```text
+现有索引读取器 `isIndexEntry` 只校验 pipelineId / projectId / configRef 非空，
+**忽略多余字段**；而 `PipelineRecord` 恰好都有这三个字段 → 被当成合法 manifest 接受。
+后果：targetBaseUrl / providerName / 运行预算这些**只存在于旧 manifest** 的字段全部丢失，
+      而 create / run 继续"成功"——行为已经变了却没有任何报错。
+```
+
+证据：`test/pipeline-l1a-service.test.ts` 的
+「L1a⚠️：把 PipelineRecord 形状写进 pipelines/<id>.json 会被**静默误读**」——
+它把索引文件原地换成新形状，断言 `get()` **不报错**且 `params` 变成 `{}`。
+这条测试是**特征测试**（characterization test），故意钉住这个危险事实：
+将来若有人"顺手修好" `isIndexEntry`，它会失败并强制其更新本设计。
+
+**因此**：新形状写在 `pipelines/<pipelineId>/pipeline.json`（独立路径），
+旧索引在 L1 期间**原样保留**，直到 L1c 才切换。这也让"新旧并存"成为物理上可能，
+而不是靠"读取时按形状猜"。
+
+### 3.4 读路径解析顺序（L1a 兼容策略）
 
 ```text
 读一条 pipeline：
-  1. 读 pipelines/<id>.json（新格式）
-  2. 若不存在 → 读旧 manifest（<dataRoot>/pipelines/<id>.json 的旧形状）
-  3. 若旧形状可识别 → 构造内存态 PipelineRecord + 隐式 revision-1 + 隐式 run-1
-     （**不落盘**，纯读兼容）
-  4. 都不存在 → not-found
+  1. 读 pipelines/<id>/pipeline.json（新形状）
+  2. 若不存在 → 读 pipelines/<id>.json 并**按形状判别**：
+     - looksLikeLegacyManifest → 投影成内存态三对象（**不落盘**，L1a 纯读兼容）
+     - looksLikePipelineRecord → 兼容早期误写到该路径的情况（不推荐，见 §3.3）
+  3. 两者都不认 → 报 `schema-invalid` 诊断（**不猜**）
+  4. 文件不存在 → not-found
 ```
+
+**为什么还要按形状判别**：历史数据里没有版本号可用；而且磁盘上确实可能同时存在
+"早期版本误写的新形状"与"正常的旧形状"。判别顺序固定为"先新路径、再旧路径 + 形状判别"，
+结果只取决于内容，不取决于时间。
 
 **L1a 只读兼容、不写新格式**——这样即使 L1a 上线后发现问题，回滚只是"关掉新读路径"，
 磁盘上没有任何新格式数据。
@@ -495,18 +523,33 @@ src/web/pipeline-legacy.ts         # 旧 manifest/checkpoint → 新对象的纯
 
 ---
 
-## 10. 未决问题（必须在 L1a 开工前定）
+## 10. 决策记录（L1a 开工前已定稿）
 
-| # | 问题 | 备选 | 倾向 |
+| # | 问题 | 决定 | 理由 |
 |---|---|---|---|
-| Q1 | 用户点"重新运行"是新建 run 还是同一 run 的 attempt+1？ | 新建 run / attempt+1 | **新建 run**（attempt 只用于同一次运行的阶段重试），语义更清楚 |
-| Q2 | 软删除后 `pipelineId` 能否被新 pipeline 复用？ | 可复用 / 永久占用 | **永久占用**——复用会让审计与历史产生歧义 |
-| Q3 | `PATCH` 无字段变化时是否创建 revision？ | 创建 / 不创建 | **不创建**（R7），避免噪音版本 |
-| Q4 | 旧 `POST /api/pipelines/:id/run` 在无 active Run 时是否自动创建 run？ | 自动 / 要求显式创建 | **自动**（保持旧客户端可用），但响应里回传 `runId` |
-| Q5 | L1c 之后是否允许同一 pipeline 两个 run 并行？ | 允许 / 禁止 | **允许**（不同 runId），但同一 run 严格互斥 |
-| Q6 | run 级产物目录是否会显著放大磁盘？ | — | 会。L2 需要配套保留策略（保留 N 次 run），**L1 先记录该风险** |
+| **Q1** | 用户点"重新运行"是新建 run 还是同一 run 的 `attempt+1`？ | **新建 run** | `attempt` 只用于**同一次运行内**的阶段重试；用户主动再跑一次是**新的一次运行**，必须有自己的产物与证据，否则"运行历史"与"结果比较"（L2）不成立 |
+| **Q2** | 软删除后 `pipelineId` 能否被新 pipeline 复用？ | **永久占用** | 复用会让审计与历史产生歧义（同一个 ID 指过两条不同的流水线）。要换项目/换身份请换 ID |
+| Q3 | `PATCH` 无字段变化时是否创建 revision？ | **不创建** | 避免噪音版本；见 R7 |
+| Q4 | 旧 `POST /api/pipelines/:id/run` 在无 active Run 时是否自动创建 run？ | **自动创建**，并在响应里回传 `runId` | 保持旧客户端可用；同时让新客户端能拿到 runId |
+| Q5 | L1c 之后是否允许同一 pipeline 两个 run 并行？ | **允许**（不同 runId），但**同一 run 严格互斥** | 并行运行是 L2 比较能力的前提；同一 run 双写会破坏事实 |
+| Q6 | run 级产物目录会显著放大磁盘吗？ | **会**，L1 只记录风险 | 保留策略（保留最近 N 次 run）放 L2，不塞进 L1 |
 
-**Q1/Q2 会直接影响 API 形状，必须在 L1a 开工前由用户确认。**
+**Q1 的落地形态**（写清楚，避免实现时含糊）：
+
+```text
+POST /api/pipelines/:id/run      → 触发 **active Run**
+POST /api/pipelines/:id/runs     → 显式创建**新 Run**（绑定 active revision），再触发
+"重新运行"按钮                    → 调 /runs（新 runId），不是把旧 run 重跑
+同一次运行内的阶段重试             → 同一 runId，attempt + 1（driver 内部行为，不变）
+```
+
+**Q2 的落地形态**：
+
+```text
+PipelineRecord.deletedAt 存在 → pipelineId 永久占用
+create 时若发现 deletedAt 存在 → 409 conflict，错误详情里说明"该 ID 已被已移除的流水线占用；
+要恢复请用 restore，要新建请换 ID"
+```
 
 ---
 
