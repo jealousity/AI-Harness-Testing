@@ -87,6 +87,11 @@ import { type HumanGateTask, type HumanGateTaskStore } from '../runtime/persiste
 import { HumanGateWaitAbortedError } from '../runtime/persistent-human-gate.ts'
 import { inspectPipelineLock } from '../checkpoint-lock.ts'
 import {
+  projectLegacy,
+  type LegacyProjection,
+} from './pipeline-legacy.ts'
+import type { PipelineRecord, PipelineRevision, PipelineRun } from './pipeline-model.ts'
+import {
   PipelineRunError,
   assertAdminRole,
   assertGateRole,
@@ -105,6 +110,9 @@ import {
   type GateTaskView,
   type PipelineDiagnostics,
   type PipelineRemovalView,
+  type PipelineRevisionsView,
+  type PipelineRunsView,
+  type PublicPipelineRecord,
   type PipelineRunParams,
   type PipelineUpdateView,
   type UpdatePipelineRunInput,
@@ -235,6 +243,15 @@ export interface PipelineRunService {
   update(input: UpdatePipelineRunInput, actor: ActorContext): Promise<PipelineUpdateView>
   /** 移除流水线（当前只摘索引，数据保留；要求 admin）。 */
   remove(pipelineId: string, actor: ActorContext): Promise<PipelineRemovalView>
+  /**
+   * L1a 只读兼容：列出该流水线的 **Revision**（`docs/19` §8）。
+   *
+   * L1a 阶段**不写任何新格式文件**：数据是把现有 manifest + checkpoint 在内存里
+   * 投影成 L1 对象得到的，因此当前恒为一条 `revision-1`。
+   */
+  listRevisions(pipelineId: string, actor: ActorContext): Promise<PipelineRevisionsView>
+  /** L1a 只读兼容：列出该流水线的 **Run**。当前恒为一条 `run-1`。 */
+  listRuns(pipelineId: string, actor: ActorContext): Promise<PipelineRunsView>
   /**
    * 回读某阶段的产物文件（`GET /api/pipelines/:pipelineId/stages/:stageId/artifact`）。
    *
@@ -480,6 +497,18 @@ function runParamsOf(manifest: PipelineRunManifest): PipelineRunParams {
     ...(manifest.diagCredentials === undefined ? {} : { diagCredentials: manifest.diagCredentials }),
     ...(manifest.updatedAt === undefined ? {} : { updatedAt: manifest.updatedAt }),
   }
+}
+
+/**
+ * 对外视图：剥掉 `legacyLocator`。
+ *
+ * 它的三个字段都是**服务器绝对路径**（`join(dataRoot, ...)` / `join(roots.checkpointRoot, ...)`），
+ * 直接返回给浏览器就是泄露部署布局——`docs/15` 明确要求"不返回服务器绝对路径"。
+ * 保留在内部（迁移与排障要用），但**不出 API**。
+ */
+function publicPipelineOf(record: PipelineRecord): PublicPipelineRecord {
+  const { legacyLocator: _internal, ...rest } = record
+  return rest
 }
 
 const EDITABLE_MANIFEST_FIELDS = [
@@ -984,6 +1013,46 @@ export class FilePipelineRunService implements PipelineRunService {
       })
     } catch {
       // 审计写失败不能把业务动作判成失败——那会让"动作成功了但报错"更糟。
+    }
+  }
+
+  /**
+   * L1a：把该流水线的**现有**事实投影成 L1 三对象（只读，不落盘）。
+   *
+   * 复用已有的 `locate` / `requireCheckpoint` / 门任务列表，因此作用域校验、存储体检
+   * 与错误分类全都与其它端点一致——不会因为"多了一个新读路径"而绕过任何一道防线。
+   */
+  private async projectPipeline(pipelineId: string, actor: ActorContext): Promise<LegacyProjection> {
+    const { manifest, config, backend, checkpointRoot } = await this.locate(pipelineId, actor)
+    const checkpoint = await this.requireCheckpoint(backend, pipelineId, checkpointRoot)
+    const tasks = await backend.ports.gateTasks.list({ pipelineId })
+    return projectLegacy({
+      manifest, checkpoint, tasks,
+      dataRoot: this.options.dataRoot,
+      roots: resolvePlatformRoots(this.options.dataRoot, config),
+      now: Date.now(),
+    })
+  }
+
+  async listRevisions(pipelineId: string, actor: ActorContext): Promise<PipelineRevisionsView> {
+    assertActor(actor)
+    assertSafeIdentifier(pipelineId, 'pipelineId')
+    const projection = await this.projectPipeline(pipelineId, actor)
+    return {
+      pipelineId,
+      pipeline: publicPipelineOf(projection.pipeline),
+      revisions: [projection.revision],
+    }
+  }
+
+  async listRuns(pipelineId: string, actor: ActorContext): Promise<PipelineRunsView> {
+    assertActor(actor)
+    assertSafeIdentifier(pipelineId, 'pipelineId')
+    const projection = await this.projectPipeline(pipelineId, actor)
+    return {
+      pipelineId,
+      pipeline: publicPipelineOf(projection.pipeline),
+      runs: [projection.run],
     }
   }
 

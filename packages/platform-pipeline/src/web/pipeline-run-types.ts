@@ -19,6 +19,7 @@ import type { HumanGateTask, HumanGateTaskStatus } from '../runtime/persistence.
 import { GateTaskBusyError } from '../runtime/persistence.ts'
 import { isStorageInfrastructureError, type StorageDiagnostic, type StorageUnavailableError } from '../storage/ports.ts'
 import type { CheckpointStatus, InputLocks, ReentryRecord, StageId } from '../types.ts'
+import type { PipelineRecord, PipelineRevision, PipelineRun } from './pipeline-model.ts'
 
 // ── 作用域与身份（docs/10 §10 P0-A「明确 actor/tenant/project/pipeline scope 类型」）──
 
@@ -419,6 +420,28 @@ export interface PipelineRemovalView {
   readonly removed: boolean
   readonly dataRetained: boolean
   readonly dataRetainedReason: string
+}
+
+/**
+ * 对外可见的 Pipeline 记录：**剥掉 `legacyLocator`**。
+ *
+ * 那三个字段是服务器绝对路径，返回给浏览器即泄露部署布局（`docs/15` 的硬要求）。
+ * 用 `Omit` 而不是"记得别返回它"——类型层面就让它无法出现在响应里。
+ */
+export type PublicPipelineRecord = Omit<PipelineRecord, 'legacyLocator'>
+
+/** `GET /api/pipelines/:id/revisions`（`docs/19` §8 的 L1a 只读端点）。 */
+export interface PipelineRevisionsView {
+  readonly pipelineId: string
+  readonly pipeline: PublicPipelineRecord
+  readonly revisions: readonly PipelineRevision[]
+}
+
+/** `GET /api/pipelines/:id/runs`。 */
+export interface PipelineRunsView {
+  readonly pipelineId: string
+  readonly pipeline: PublicPipelineRecord
+  readonly runs: readonly PipelineRun[]
 }
 
 /**

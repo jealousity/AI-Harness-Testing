@@ -372,6 +372,16 @@ const ROUTES = [
     json(res, 200, artifact)
   }],
 
+  // L1a 只读端点（docs/19 §8）：把现有事实投影成 Revision / Run。
+  // **不写任何新格式文件**，也不改变任何现有端点行为。
+  ['GET', /^\/api\/pipelines\/([^/]+)\/revisions$/, async (req, res, pipelineId) => {
+    json(res, 200, await service.listRevisions(pipelineId, actorOf(req)))
+  }],
+
+  ['GET', /^\/api\/pipelines\/([^/]+)\/runs$/, async (req, res, pipelineId) => {
+    json(res, 200, await service.listRuns(pipelineId, actorOf(req)))
+  }],
+
   ['GET', /^\/api\/pipelines\/([^/]+)\/diagnostics$/, async (req, res, pipelineId) => {
     // 数据根体检（docs/14 W5 第 9 条）：只读，不取锁、不改记录。
     // 排障入口，因此要求 operator 角色（service 层再校验一次）。
