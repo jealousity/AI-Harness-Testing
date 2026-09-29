@@ -40,6 +40,63 @@ export {
 } from './server-config.ts'
 
 export {
+  ACTIVE_RUN_STATUSES,
+  PipelineModelError,
+  REVISION_BEHAVIOR_FIELDS,
+  TERMINAL_RUN_STATUSES,
+  assertIdentityImmutable,
+  assertPipelineInvariants,
+  assertRevisionInvariants,
+  assertRevisionNumbering,
+  assertRunInvariants,
+  assertSingleActiveRevision,
+  assertSingleActiveRun,
+  isActiveRunStatus,
+  isTerminalRunStatus,
+  revisionFingerprint,
+  type LegacyLocator,
+  type PipelineRecord,
+  type PipelineRevision,
+  type PipelineRun,
+  type RevisionBehaviorField,
+  type RunFailure,
+} from './pipeline-model.ts'
+
+export {
+  UnsafePathSegmentError,
+  assertSafeSegment,
+  legacyArtifactDir,
+  legacyArtifactRoot,
+  legacyCheckpointDir,
+  legacyCheckpointPath,
+  legacyManifestPath,
+  pipelineDir,
+  // 注意：`pipelineIndexDir` 目前由 `pipeline-run-service.ts` 导出（历史位置），
+  // locator 里也有一份同路径的实现。L1a 刻意**不重复导出**（避免同名冲突），
+  // L1b 会让服务层委托到 locator，届时再统一。
+  pipelineRecordPath,
+  revisionDir,
+  revisionIdOf,
+  revisionPath,
+  runArtifactPath,
+  runCheckpointLocator,
+  runCheckpointPath,
+  runDir,
+  runIdOf,
+  runRecordPath,
+  runsDir,
+} from './pipeline-locator.ts'
+
+export {
+  MIGRATION_ACTOR,
+  looksLikeLegacyManifest,
+  looksLikePipelineRecord,
+  projectLegacy,
+  type LegacyProjection,
+  type LegacyProjectionInput,
+} from './pipeline-legacy.ts'
+
+export {
   assertTargetBaseUrlAllowed,
   assertTargetResolvedAllowed,
   isPrivateAddress,

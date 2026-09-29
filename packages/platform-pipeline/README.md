@@ -41,6 +41,9 @@
 | `storage/compose.ts` | `composeStorageBackends()`：把 records（PostgreSQL）与 objects（对象存储）拼成一个完整后端。做四件必须有唯一落点的事：版本一致性校验、端口冲突显式化（不替宿主猜优先级）、能力声明合并、装配即校验必需端口；`portOrigins` 用于排障（"这个端口是谁提供的"） | 10 §8.3 M4-B / ADR-0002 |
 | `storage/postgres/` | PostgreSQL **接口层**（不引 SDK、不建连）：`PostgresClient` 接缝（`query`/`transaction`，SDK 无关）、`postgresSchemaDdl()` 表结构（8 张表，含 CAS 用的 `revision` 与 `generation`）、`POSTGRES_PORT_TABLES` 端口↔表映射、`POSTGRES_TRANSACTION_BOUNDARIES` 事务边界（含"产物先写、检查点后写"的跨存储顺序论证）、`classifyPostgresError()` 按 SQLSTATE 分类。未配置时 `requirePostgresClient()` **明确抛 `StorageUnavailableError`，绝不降级到文件后端** | 10 §8.3 M4-B / ADR-0002 |
 | `storage/object-store/` | 对象存储 **接口层**（不引 SDK、不建连）：`ObjectStoreClient` 接缝、**对象键约定**（`artifacts/`·`evidence/`·`knowledge/`·`cases/`，构造函数而非文档散文）、键安全校验（`..`/绝对路径/空段/未知根前缀/跨项目一律拒绝——对象存储没有目录树，只能自己拦）、`classifyObjectStoreError()`。**不承担**需要 CAS 的端口（检查点/任务/门任务/用量/审计/锁），那些必须在 PostgreSQL 里 | 10 §8.3 M4-B / ADR-0002 |
+| `web/pipeline-model.ts` | **L1 事实模型的类型与不变量**（`docs/19`）：`PipelineRecord`（身份）/ `PipelineRevision`（配置快照）/ `PipelineRun`（一次执行）+ 逐条不变量断言（P1~P6、R1~R7、N1~N5）+ 行为指纹 `revisionFingerprint`（按固定字段顺序、带类型标签，区分「没设」与「显式清空」）。**纯类型与纯函数，不碰 I/O** | 19 §2 |
+| `web/pipeline-locator.ts` | **L1 存储布局的唯一路径来源**（`docs/19` §3.2）：索引/Revision/Run/检查点/产物的路径函数 + 确定性 id（`revision-N`/`run-N`，迁移幂等的前提）+ 路径段安全校验（拒绝 `..`、`/`、绝对路径）。历史上锁路径就是因为三个入口各拼一套而等于没锁 | 19 §3 |
+| `web/pipeline-legacy.ts` | **旧数据 → L1 对象的纯函数投影**（`docs/19` §3.3/§4.2）：旧扁平 manifest + checkpoint → 三对象；**不编时序**（老数据没有 run 起止时间就留空）、**不猜历史**（只产出 revision-1/run-1）、状态复用 `deriveRunStatus` 不另写一套；`looksLikeLegacyManifest`/`looksLikePipelineRecord` 按**结构**判别新旧形状 | 19 §4 |
 | `web/` | 无 HTTP 框架依赖的 `PipelineRunService`：作用域/身份校验、配置装载与缓存、宿主装配、检查点与人工门驱动的 create/get/list/run/reenter/gate-*/artifact/events/usage；Web 状态与阶段视图（12 字段）全部由持久化事实重建。另有 `pipeline-run-registry.ts`（进程内运行句柄，**刻意不导出状态查询**，只存句柄与取消信号）、`async-runner.ts`（触发/取消/进程重启后的恢复扫描，`decideRecovery` 为纯函数）与 **`server-config.ts`**（Web 外壳的启动配置解析与部署前置校验：严格十进制整数解析（`NaN`/小数/科学计数法/十六进制/越界**启动即失败**）、危险部署组合失败关闭（信任请求头 + 非回环 + 未声明 `PLATFORM_TRUSTED_PROXY` 即拒绝启动）、`assertStartupConfigUsable` 启动期完整校验（ACL/审批覆盖/规则引用/provider 引用）、启动日志脱敏） | 10 §4/§5 · 14 W1 |
 
 ## 使用
@@ -106,7 +109,7 @@ await ctx.plugin(platformPipelineHost, {
 ## 状态
 
 - 设计文档：9 份定稿（docs/01~09）+ 24 条决策（docs/07）+ 下一阶段实施规划（docs/10）+ 2 份 ADR（docs/adr/0001 文档解析库选型、docs/adr/0002 存储后端选型与事务边界）
-- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **928 项测试全绿**
+- 确定性代码层：已覆盖核心编排、执行可信、知识库治理和通用平台基础，当前 **953 项测试全绿**
   - 注：在受限沙箱里跑全量 `node --test` 时，`test/fs-tools.test.ts` 的清理步骤可能被宿主 `safe-delete` 批量删除守卫拦下（按「每轮删除次数 > 阈值」判定，与代码无关）。单独运行该文件即通过。
 - 宿主接线：完成（minimal-host）；真实 LLM 六阶段端到端通过，含重入级联 + 故障注入（里程碑 7）
 - Web 运行服务（M0 契约层）：`platform-pipeline/web` 提供无 HTTP 框架依赖的 `PipelineRunService`，覆盖 create/get/list/run/reenter 与人工门 list/claim/decide/cancel，以及 `getStageArtifact`/`listEvents`/`scanPipelineIndex`；Web 状态与阶段视图全部由检查点、产物与人工门任务重建，服务层不复制阶段逻辑。
