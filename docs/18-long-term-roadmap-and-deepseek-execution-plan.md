@@ -162,16 +162,53 @@ git rev-parse origin/main
    - 有运行锁时 edit/remove 返回 `conflict`；
    - 编辑与移除都写审计事件。
 
-### 2.3 L0 验收
+### 2.3 L0 验收（**已全部完成**）
 
-- [ ] `tsc --noEmit` 通过；
-- [ ] `tsc -p tsconfig.build.json` 通过；
-- [ ] 全量测试通过；
-- [ ] `test/web-ui-contract.test.ts` 通过；
-- [ ] 真实 Web 服务返回的 HTML 中：sidebar 没有流水线条目、右侧有列表表格；
-- [ ] UI 相关修改先给用户预览，用户确认后才能 commit/push；
-- [ ] `HEAD == origin/main`；
-- [ ] 工作区干净。
+- [x] `tsc --noEmit` 通过；
+- [x] `tsc -p tsconfig.build.json` 通过；
+- [x] 全量测试通过（**928/928 pass、0 fail、0 skipped**）；
+- [x] `test/web-ui-contract.test.ts` 通过（14/14）；
+- [x] 真实 Web 服务返回的 HTML 中：sidebar 没有流水线条目、右侧有列表表格；
+- [x] UI 相关修改先给用户预览，用户确认后才能 commit/push；
+- [x] `HEAD == origin/main`；
+- [x] 工作区干净。
+
+### 2.4 L0 执行记录（证据）
+
+执行时间：2026-09-29。收口提交：`5f84871`、`233832d`、`4bfd663`（均已推送）。
+
+```text
+tsc --noEmit                      OK
+tsc -p tsconfig.build.json        OK
+test/web-ui-contract.test.ts      14/14 pass
+test/web-pipeline-edit.test.ts     9/9  pass
+node --test                       928/928 pass、0 fail、0 skipped
+```
+
+真实服务 HTML 结构核验（**17/17 PASS**）：
+
+```text
+sidebar 无输入框 / 不含流水线条目 / 有「通用配置」「流水线列表」两个菜单项
+右侧：通用配置面板（恰好 6 个输入，不含流水线 ID）/ 流水线列表表格 / 详情工作区
+右上角：['暂停自动刷新', '立即刷新', '＋ 新建流水线']（无重复的「流水线列表」入口）
+详情页：有「编辑参数 / 移除」
+标签配平：section 8/8、aside 1/1、nav 2/2、table 1/1、ul 1/1、details 1/1、dialog 2/2、form 2/2
+```
+
+**核验中修掉一个真实缺口**（记入 `4bfd663`）：
+
+`PATCH /api/pipelines/:id` 此前会**静默忽略**不可编辑字段 ——
+`{"projectId":"other"}` 返回 `200 {"changedFields":[]}`。事实确实没被改（符合"作用域不可编辑"），
+但调用方会**以为改成功了**，这违反 §0.3 第 9 条"不静默降级"，也让 §2.2 第 5 条的"语义必须明确"不成立。
+
+修法：`web-app/server.mjs` 增加 `EDITABLE_PATCH_FIELDS` 白名单，白名单外的字段一律
+`400 invalid-request`（`details` 带 `unknown` / `editable` / `hint`）。
+新增 e2e 用例「验收11」钉住；真实服务复验：可编辑字段 200、`projectId` 400、
+未知字段 400、拒绝后 `projectId` 事实未变。
+
+**L0 遗留（转 L1）**：`EDITABLE_PATCH_FIELDS` 与 `pipeline-run-service.ts` 的
+`EDITABLE_MANIFEST_FIELDS` 是两处定义，目前没有自动校验二者同步的机制
+（与 `AuditEventKind` vs `AUDIT_EVENT_KINDS` 是同类陷阱）。
 
 **L0 不做：** Revision/Run 重构、PostgreSQL、worker、多用户、计费。
 
