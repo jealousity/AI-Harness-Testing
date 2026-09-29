@@ -900,3 +900,28 @@ test('验收10e：非回环绑定 + 信任请求头 + 未声明可信代理 → 
     await rm(app.dir, { recursive: true, force: true })
   }
 })
+
+// ── 验收 11：编辑接口的字段白名单（docs/18 §2.2 第 5 条）────────────────────────
+
+test('验收11：PATCH 只接受可编辑字段，不可编辑字段必须显式拒绝（不能静默忽略）', async () => {
+  await withApp(async app => {
+    await createPipeline(app)
+
+    const ok = await app.request('PATCH', `/api/pipelines/${PIPELINE_ID}`, { maxGateRetries: 5 })
+    assert.equal(ok.status, 200, `可编辑字段应当被接受：${JSON.stringify(ok.body)}`)
+    assert.deepEqual(ok.body.changedFields, ['maxGateRetries'])
+
+    // `projectId` 决定索引键与作用域：**不可编辑**。静默忽略会让调用方拿到 200
+    // 却什么都没改——比报错危险得多，所以必须 400。
+    const rejected = await app.request('PATCH', `/api/pipelines/${PIPELINE_ID}`, { projectId: 'other' })
+    assert.equal(rejected.status, 400, `不可编辑字段必须拒绝：${JSON.stringify(rejected.body)}`)
+    assert.equal(rejected.body.error.code, 'invalid-request')
+    assert.deepEqual(rejected.body.error.details.unknown, ['projectId'])
+    assert.match(String(rejected.body.error.details.hint), /不可编辑/,
+      '错误详情要说明为什么不能改、该怎么办')
+
+    // 拒绝之后事实不变：projectId 仍是原来的。
+    const view = await app.request('GET', `/api/pipelines/${PIPELINE_ID}`)
+    assert.equal(view.body.projectId, PROJECT_ID)
+  })
+})

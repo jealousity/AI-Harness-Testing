@@ -279,6 +279,17 @@ function actorOf(req) {
  * 处理器只做参数解析与响应映射；一切业务判定都在 service 内，因此
  * 「HTTP 又写了一套流水线」在结构上不可能发生（docs/10 §5.2）。
  */
+/**
+ * `PATCH /api/pipelines/:id` 允许的字段（**唯一白名单**）。
+ *
+ * 不在这里的字段一律拒绝：静默忽略会让调用方误以为改成功（docs/18 §2.2 第 5 条）。
+ * 与 `pipeline-run-service.ts` 的 `EDITABLE_MANIFEST_FIELDS` 必须保持一致。
+ */
+const EDITABLE_PATCH_FIELDS = new Set([
+  'requirementInput', 'providerName', 'targetBaseUrl', 'rulesetVersion',
+  'maxGateRetries', 'gateWaitTimeoutMs', 'gateTaskTtlMs', 'diagCredentials',
+])
+
 const ROUTES = [
   ['GET', /^\/api\/pipelines$/, async (req, res) => {
     json(res, 200, { pipelines: await service.list(actorOf(req)) })
@@ -371,6 +382,18 @@ const ROUTES = [
     // 编辑**运行参数**（docs/14 W5 后续）。作用域字段（projectId/tenantId/configRef）
     // 刻意不可编辑——它们决定索引键，改了就不是同一条流水线。
     const body = await readJsonBody(req)
+    // **不可编辑的字段必须显式拒绝，不能静默忽略**（docs/18 §2.2 第 5 条）。
+    // 静默忽略的后果是：调用方 PATCH `projectId` 拿到 200，以为改成功了，
+    // 实际什么都没发生——这比直接报错危险得多。作用域字段（projectId/tenantId/configRef）
+    // 决定索引键与作用域，改了就不是同一条流水线；要换项目请新建。
+    const unknown = Object.keys(body).filter(field => !EDITABLE_PATCH_FIELDS.has(field))
+    if (unknown.length > 0) {
+      throw new PipelineRunError('invalid-request', `PATCH 不接受这些字段：${unknown.join('、')}`, {
+        unknown,
+        editable: [...EDITABLE_PATCH_FIELDS],
+        hint: 'projectId / tenantId / configRef 决定流水线身份，不可编辑；要换项目请新建一条。',
+      })
+    }
     json(res, 200, await service.update({
       pipelineId,
       ...optionalFields(body, ['requirementInput', 'providerName', 'targetBaseUrl', 'rulesetVersion']),
