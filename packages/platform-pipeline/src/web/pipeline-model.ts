@@ -244,6 +244,170 @@ function normalizeField(value: unknown): string {
 }
 
 /**
+ * 构造 revision 所需的行为参数来源。
+ *
+ * 三个来源共用它：① 旧 manifest 迁移；② `create` 的输入；③ `PATCH` 之后的 next manifest。
+ * 之所以要统一类型，是因为**指纹口径必须只有一处**（见 `revisionConfigOf`）。
+ */
+export interface RevisionParamsSource {
+  readonly requirementInput?: string
+  readonly providerName?: string
+  readonly targetBaseUrl?: string
+  readonly rulesetVersion: string
+  readonly maxGateRetries?: number
+  readonly gateWaitTimeoutMs?: number
+  readonly gateTaskTtlMs?: number
+  readonly diagCredentials?: readonly string[]
+}
+
+/** `revisionConfigOf` 的产出：revision 的配置部分 + 指纹。 */
+export interface RevisionConfig {
+  readonly requirementInput?: string
+  readonly providerName?: string
+  readonly targetBaseUrl?: string
+  readonly rulesetVersion: string
+  readonly maxGateRetries?: number
+  readonly gateWaitTimeoutMs?: number
+  readonly gateTaskTtlMs?: number
+  readonly diagCredentials?: readonly string[]
+  readonly fingerprint: string
+}
+
+/**
+ * 从行为参数派生 revision 的配置部分（含指纹）。**唯一实现。**
+ *
+ * 为什么必须唯一：迁移路径与新建路径若各算一次指纹，**同一份配置会得到两个指纹**，
+ * 于是"PATCH 一份与当前完全相同的参数"会被误判成变化、白建一个 revision（破坏 R7）。
+ * 迁移路径曾经把缺省字段写成 `?? null`，而新建路径留 `undefined`——
+ * 在 `normalizeField` 里 `null` 是 `n:`、`undefined` 是 `u:`，两者**不相等**。
+ * 这个 bug 在统一到本函数时才被消除。
+ */
+export function revisionConfigOf(source: RevisionParamsSource): RevisionConfig {
+  return {
+    rulesetVersion: source.rulesetVersion,
+    ...(source.requirementInput === undefined ? {} : { requirementInput: source.requirementInput }),
+    ...(source.providerName === undefined ? {} : { providerName: source.providerName }),
+    ...(source.targetBaseUrl === undefined ? {} : { targetBaseUrl: source.targetBaseUrl }),
+    ...(source.maxGateRetries === undefined ? {} : { maxGateRetries: source.maxGateRetries }),
+    ...(source.gateWaitTimeoutMs === undefined ? {} : { gateWaitTimeoutMs: source.gateWaitTimeoutMs }),
+    ...(source.gateTaskTtlMs === undefined ? {} : { gateTaskTtlMs: source.gateTaskTtlMs }),
+    ...(source.diagCredentials === undefined ? {} : { diagCredentials: source.diagCredentials }),
+    // 注意传的是**原始值**（可能 undefined），不做 `?? null` 归一——
+    // 归一交给 `normalizeField`，它已经带了类型标签。
+    fingerprint: revisionFingerprint({
+      requirementInput: source.requirementInput,
+      providerName: source.providerName,
+      targetBaseUrl: source.targetBaseUrl,
+      rulesetVersion: source.rulesetVersion,
+      maxGateRetries: source.maxGateRetries,
+      gateWaitTimeoutMs: source.gateWaitTimeoutMs,
+      gateTaskTtlMs: source.gateTaskTtlMs,
+      diagCredentials: source.diagCredentials,
+    }),
+  }
+}
+
+// ── 构造器（唯一一份；迁移与新建都走这里）────────────────────────────────────
+
+export interface RevisionDraft {
+  readonly revisionId: string
+  readonly pipelineId: string
+  readonly revisionNumber: number
+  readonly createdAt: number
+  readonly createdBy: string
+  readonly status: 'active' | 'superseded'
+  readonly params: RevisionParamsSource
+  /** 只有**老数据迁移**产生的 revision 才带这个标记；新建的**不带**。 */
+  readonly migratedFrom?: string
+}
+
+/** 构造并自检一个 revision（不变量违例会**立刻**抛出，而不是等落盘之后才发现）。 */
+export function makeRevision(draft: RevisionDraft): PipelineRevision {
+  const revision: PipelineRevision = {
+    revisionId: draft.revisionId,
+    pipelineId: draft.pipelineId,
+    revisionNumber: draft.revisionNumber,
+    createdAt: draft.createdAt,
+    createdBy: draft.createdBy,
+    status: draft.status,
+    ...revisionConfigOf(draft.params),
+    ...(draft.migratedFrom === undefined ? {} : { migratedFrom: draft.migratedFrom }),
+  }
+  assertRevisionInvariants(revision)
+  return revision
+}
+
+export interface PipelineRecordDraft {
+  readonly pipelineId: string
+  readonly tenantId: string | null
+  readonly projectId: string
+  readonly configRef: string
+  readonly createdAt: number
+  readonly updatedAt?: number
+  readonly deletedAt?: number
+  readonly deletedBy?: string
+  readonly activeRevisionId: string
+  readonly legacyLocator?: LegacyLocator
+}
+
+export function makePipelineRecord(draft: PipelineRecordDraft): PipelineRecord {
+  const record: PipelineRecord = {
+    pipelineId: draft.pipelineId,
+    tenantId: draft.tenantId,
+    projectId: draft.projectId,
+    configRef: draft.configRef,
+    createdAt: draft.createdAt,
+    ...(draft.updatedAt === undefined ? {} : { updatedAt: draft.updatedAt }),
+    ...(draft.deletedAt === undefined ? {} : { deletedAt: draft.deletedAt }),
+    ...(draft.deletedBy === undefined ? {} : { deletedBy: draft.deletedBy }),
+    activeRevisionId: draft.activeRevisionId,
+    ...(draft.legacyLocator === undefined ? {} : { legacyLocator: draft.legacyLocator }),
+  }
+  assertPipelineInvariants(record)
+  return record
+}
+
+export interface RunDraft {
+  readonly runId: string
+  readonly pipelineId: string
+  readonly revisionId: string
+  readonly attempt: number
+  readonly status: PipelineRunStatus
+  readonly cursor: number
+  readonly createdAt: number
+  readonly startedAt?: number
+  readonly finishedAt?: number
+  readonly createdBy: string
+  readonly failure?: RunFailure
+  readonly checkpointLocator: string
+}
+
+/**
+ * 构造并自检一个 run。
+ *
+ * `allowUnknownTiming` 由调用方显式选择：**只有**"从旧检查点投影"那条路可以放宽
+ * （老数据没记起止时间），新写入一律严格。
+ */
+export function makeRun(draft: RunDraft, options: { readonly allowUnknownTiming?: boolean } = {}): PipelineRun {
+  const run: PipelineRun = {
+    runId: draft.runId,
+    pipelineId: draft.pipelineId,
+    revisionId: draft.revisionId,
+    attempt: draft.attempt,
+    status: draft.status,
+    cursor: draft.cursor,
+    createdAt: draft.createdAt,
+    ...(draft.startedAt === undefined ? {} : { startedAt: draft.startedAt }),
+    ...(draft.finishedAt === undefined ? {} : { finishedAt: draft.finishedAt }),
+    createdBy: draft.createdBy,
+    ...(draft.failure === undefined ? {} : { failure: draft.failure }),
+    checkpointLocator: draft.checkpointLocator,
+  }
+  assertRunInvariants(run, options)
+  return run
+}
+
+/**
  * Run 不变量（`docs/19` §2.3 N2~N5）。N1/N6 需要跨 run 才能判，见 `assertSingleActiveRun`。
  *
  * `allowUnknownTiming` 只给**旧数据投影**用：老检查点里**没有记录** run 的开始/结束时间，

@@ -76,6 +76,23 @@ export type StorageDiagnosticCode =
   | 'unsupported-version'
   /** 旧版本，可被 `migrate` 升级。 */
   | 'migration-needed'
+  /**
+   * L1 事实模型迁移未完成（`docs/19` §4.3）：新格式**部分**存在
+   * （`pipeline.json` 在，但 `revisions/` 或 `runs/` 缺）。
+   *
+   * 与 `migration-needed` 的区别是"新格式有没有开始写"：
+   * `migration-needed` = 一个字都没写，`migration-incomplete` = 写了一半。
+   * 两者的处置相同（重跑迁移，幂等），但**排障时要能分辨**——
+   * 前者是"还没迁过"，后者是"迁过但中断了"。
+   */
+  | 'migration-incomplete'
+  /**
+   * 新旧格式都在，但**事实不一致**（`docs/19` §4.3）。
+   *
+   * 这是最需要人工介入的一类：说明双写漏了一处，或者有人手工改过其中一侧。
+   * 判据必须给出**具体是哪个字段**不一致，不能只说"不一致"——否则运维无从下手。
+   */
+  | 'migration-conflict'
   /** 路径越界 / 软链接逃逸 / 权限不足 / IO 错误。 */
   | 'unreadable'
 
@@ -257,6 +274,19 @@ export type AuditEventKind =
   | 'case-archived'
   | 'lock-event'
   | 'storage-migrated'
+  /**
+   * L1 惰性迁移（`docs/19` §4.2 M2）。**成对出现**：
+   * `migration-intent` 写在写盘之前，`migration-completed` 写在全部新格式落盘之后。
+   *
+   * 为什么不像 `storage-migrated` 那样只记一条：迁移**可能中断**（M3/§4.3），
+   * 只有"意图"没有"完成"才说明那一次是中断的。单条事件无法表达这个区别，
+   * 而"这次迁移到底完成了没有"正是排障时要回答的第一个问题。
+   *
+   * 与 `storage-migrated` 的分工：那个是**存储 schemaVersion** 的升级，
+   * 这个是**事实模型**（旧 manifest/checkpoint → PipelineRecord/Revision/Run）的搬迁。
+   */
+  | 'migration-intent'
+  | 'migration-completed'
 
 /**
  * 审计事件。

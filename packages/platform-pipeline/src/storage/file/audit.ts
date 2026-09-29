@@ -168,6 +168,8 @@ export const AUDIT_EVENT_KINDS: readonly AuditEventKind[] = [
   // 写侧照写、读侧静默丢弃——事件在盘上却永远查不出来（本文件上面那段注释警告的正是这件事，
   // 实测踩到过一次：`update`/`remove` 的审计事件一条都读不出来）。
   'pipeline-updated', 'pipeline-removed',
+  // L1 惰性迁移（docs/19 §4.2 M2）。同上：类型加了就必须加这里。
+  'migration-intent', 'migration-completed',
 ]
 
 function errorMessageOf(error: unknown): string {

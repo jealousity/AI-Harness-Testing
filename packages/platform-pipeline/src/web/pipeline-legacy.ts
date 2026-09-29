@@ -1,10 +1,12 @@
 /**
  * 旧数据 → L1 对象的**纯函数投影**（`docs/19-l1-pipeline-revision-run-design.md` §3.3 / §4.2）。
  *
- * L1a 的定位是**只读兼容**：把现有的
- * `pipelines/<id>.json`（旧扁平 manifest）+ `checkpoints/<id>/checkpoint.json`
- * 在**内存里**投影成 `PipelineRecord + PipelineRevision + PipelineRun`，
- * **不写任何新格式文件**。这样即使模型设计错了，回滚成本为零。
+ * 把现有的 `pipelines/<id>.json`（旧扁平 manifest）+ `checkpoints/<id>/checkpoint.json`
+ * 在**内存里**投影成 `PipelineRecord + PipelineRevision + PipelineRun`。
+ *
+ * 两个调用场景，靠 `provenance` 区分（**必填**，见下）：
+ * - **L1a 只读兼容**：端点拿到结果直接用于视图，磁盘零新文件；
+ * - **L1b 双写 / 惰性迁移**：结果被 `pipeline-l1-store.ts` 落盘。
  *
  * 三条纪律：
  * 1. **不编事实**：老数据里没有的信息（run 的开始/结束时间）**保持 undefined**，
@@ -23,22 +25,74 @@ import {
   revisionIdOf,
   runIdOf,
   legacyCheckpointPath,
+  legacyCheckpointLocator,
   legacyArtifactRoot,
   legacyManifestPath,
-  runCheckpointLocator,
 } from './pipeline-locator.ts'
 import {
-  assertPipelineInvariants,
-  assertRevisionInvariants,
-  assertRunInvariants,
-  revisionFingerprint,
+  makePipelineRecord,
+  makeRevision,
+  makeRun,
+  type LegacyLocator,
   type PipelineRecord,
   type PipelineRevision,
   type PipelineRun,
+  type RevisionParamsSource,
 } from './pipeline-model.ts'
 
 /** 迁移产生的对象在审计里用这个 actor，避免看起来像某个真人建的。 */
 export const MIGRATION_ACTOR = 'system:migration'
+
+/** 迁移产生的第一个 revision 的来源标记。 */
+export const LEGACY_MIGRATION_SOURCE = 'legacy-manifest'
+
+/**
+ * 从旧 manifest + checkpoint 取出一组**行为参数**。
+ *
+ * 唯一实现：迁移路径（`projectLegacy`）与新建路径（service 的双写）都必须走它，
+ * 否则两条路会各自解释"缺省字段是什么"，指纹随之分叉（见 `revisionConfigOf`）。
+ *
+ * 取法上的两个讲究：
+ * - `rulesetVersion` 在旧 manifest 里可能缺省（历史索引没有该字段），
+ *   回退到 checkpoint 里那个——那是**真正生效过的**版本；
+ * - 其余字段**缺省就是缺省**，不写成 `null`/`''`。`undefined` 与 `''` 行为不同
+ *   （前者走默认 provider，后者是一个空 provider 名），归一交给 `normalizeField`。
+ */
+export function revisionParamsOf(
+  manifest: PipelineRunManifest,
+  checkpoint: Checkpoint,
+): RevisionParamsSource {
+  return {
+    ...(manifest.requirementInput === undefined ? {} : { requirementInput: manifest.requirementInput }),
+    ...(manifest.providerName === undefined ? {} : { providerName: manifest.providerName }),
+    ...(manifest.targetBaseUrl === undefined ? {} : { targetBaseUrl: manifest.targetBaseUrl }),
+    rulesetVersion: manifest.rulesetVersion ?? checkpoint.rulesetVersion,
+    ...(manifest.maxGateRetries === undefined ? {} : { maxGateRetries: manifest.maxGateRetries }),
+    ...(manifest.gateWaitTimeoutMs === undefined ? {} : { gateWaitTimeoutMs: manifest.gateWaitTimeoutMs }),
+    ...(manifest.gateTaskTtlMs === undefined ? {} : { gateTaskTtlMs: manifest.gateTaskTtlMs }),
+    ...(manifest.diagCredentials === undefined ? {} : { diagCredentials: manifest.diagCredentials }),
+  }
+}
+
+/**
+ * 旧结构的定位信息（**相对路径**，绝不出绝对路径）。
+ *
+ * `migratedAt` 的语义是"这条新记录**首次**从旧格式投影出来的时刻"——
+ * 双写新建时也用它（那时旧格式就是 create 刚写下的 manifest），因此不是"仅迁移"。
+ */
+export function legacyLocatorOf(
+  dataRoot: string,
+  roots: PlatformStorageRoots,
+  pipelineId: string,
+  now: number,
+): LegacyLocator {
+  return {
+    manifestPath: legacyManifestPath(dataRoot, pipelineId),
+    checkpointPath: legacyCheckpointPath(roots, pipelineId),
+    artifactsRoot: legacyArtifactRoot(roots),
+    migratedAt: now,
+  }
+}
 
 export interface LegacyProjectionInput {
   readonly manifest: PipelineRunManifest
@@ -49,6 +103,21 @@ export interface LegacyProjectionInput {
   readonly roots: PlatformStorageRoots
   /** 注入的时钟（纯函数不自己取时间）。 */
   readonly now: number
+  /**
+   * 这批对象算谁产生的。
+   *
+   * **必填、没有缺省**：这是刻意的。缺省值无论取哪一边都会出错——
+   * 默认 `system:migration` 会把"张三刚建的流水线"记成迁移产物；
+   * 默认"调用者"又会让真正的迁移看起来像某个真人做的。
+   * 让两个调用点各自把意图写出来，是唯一不会错的方案。
+   */
+  readonly provenance: ProjectionProvenance
+}
+
+export interface ProjectionProvenance {
+  readonly createdBy: string
+  /** 只有**老数据迁移**产生的 revision 才带这个标记；双写新建的**不带**。 */
+  readonly migratedFrom?: string
 }
 
 export interface LegacyProjection {
@@ -63,60 +132,39 @@ export interface LegacyProjection {
  * **不落盘**。调用方（L1a 的只读端点）拿到结果后直接用于视图，磁盘上零新文件。
  */
 export function projectLegacy(input: LegacyProjectionInput): LegacyProjection {
-  const { manifest, checkpoint, tasks, dataRoot, roots, now } = input
+  const { manifest, checkpoint, tasks, dataRoot, roots, now, provenance } = input
   const revisionId = revisionIdOf(manifest.pipelineId, 1)
   const runId = runIdOf(manifest.pipelineId, 1)
+  const createdAt = manifest.createdAt ?? now
 
-  // 时序：**老数据没有 run 的起止时间**。`createdAt` 是"这条流水线被创建的时间"，
-  // 不是"这次运行开始的时间"；拿它冒充会让"运行耗时"从一开始就是错的。
-  // 因此这里**留空**，并在 §不变量里显式放行（allowUnknownTiming）。
-  const revision: PipelineRevision = {
+  // 构造走 `pipeline-model.ts` 的**共用构造器**，不在这里再写一遍字段映射：
+  // 迁移路径与新建路径的指纹口径必须一致（见 `revisionConfigOf` 的说明）。
+  const revision = makeRevision({
     revisionId,
     pipelineId: manifest.pipelineId,
     revisionNumber: 1,
-    createdAt: manifest.createdAt ?? now,
-    createdBy: MIGRATION_ACTOR,
+    createdAt,
+    createdBy: provenance.createdBy,
     status: 'active',
-    ...(manifest.requirementInput === undefined ? {} : { requirementInput: manifest.requirementInput }),
-    ...(manifest.providerName === undefined ? {} : { providerName: manifest.providerName }),
-    ...(manifest.targetBaseUrl === undefined ? {} : { targetBaseUrl: manifest.targetBaseUrl }),
-    // `rulesetVersion` 在旧 manifest 里可能缺省（历史索引没有该字段），
-    // 用 checkpoint 的作为回退——checkpoint 里那个是**真正生效过的**版本。
-    rulesetVersion: manifest.rulesetVersion ?? checkpoint.rulesetVersion,
-    ...(manifest.maxGateRetries === undefined ? {} : { maxGateRetries: manifest.maxGateRetries }),
-    ...(manifest.gateWaitTimeoutMs === undefined ? {} : { gateWaitTimeoutMs: manifest.gateWaitTimeoutMs }),
-    ...(manifest.gateTaskTtlMs === undefined ? {} : { gateTaskTtlMs: manifest.gateTaskTtlMs }),
-    ...(manifest.diagCredentials === undefined ? {} : { diagCredentials: manifest.diagCredentials }),
-    fingerprint: revisionFingerprint({
-      requirementInput: manifest.requirementInput ?? null,
-      providerName: manifest.providerName ?? null,
-      targetBaseUrl: manifest.targetBaseUrl ?? null,
-      rulesetVersion: manifest.rulesetVersion ?? checkpoint.rulesetVersion,
-      maxGateRetries: manifest.maxGateRetries ?? null,
-      gateWaitTimeoutMs: manifest.gateWaitTimeoutMs ?? null,
-      gateTaskTtlMs: manifest.gateTaskTtlMs ?? null,
-      diagCredentials: manifest.diagCredentials ?? null,
-    }),
-    migratedFrom: 'legacy-manifest',
-  }
+    params: revisionParamsOf(manifest, checkpoint),
+    ...(provenance.migratedFrom === undefined ? {} : { migratedFrom: provenance.migratedFrom }),
+  })
 
-  const pipeline: PipelineRecord = {
+  const pipeline = makePipelineRecord({
     pipelineId: manifest.pipelineId,
     tenantId: manifest.tenantId,
     projectId: manifest.projectId,
     configRef: manifest.configRef,
-    createdAt: manifest.createdAt ?? revision.createdAt,
+    createdAt,
     ...(manifest.updatedAt === undefined ? {} : { updatedAt: manifest.updatedAt }),
     activeRevisionId: revisionId,
-    legacyLocator: {
-      manifestPath: legacyManifestPath(dataRoot, manifest.pipelineId),
-      checkpointPath: legacyCheckpointPath(roots, manifest.pipelineId),
-      artifactsRoot: legacyArtifactRoot(roots),
-      migratedAt: now,
-    },
-  }
+    legacyLocator: legacyLocatorOf(dataRoot, roots, manifest.pipelineId, now),
+  })
 
-  const run: PipelineRun = {
+  // 时序：**老数据没有 run 的起止时间**。`createdAt` 是"这条流水线被创建的时间"，
+  // 不是"这次运行开始的时间"；拿它冒充会让"运行耗时"从一开始就是错的。
+  // 因此这里留空，并显式放行（allowUnknownTiming）——放宽是**有名字的**。
+  const run = makeRun({
     runId,
     pipelineId: manifest.pipelineId,
     revisionId,
@@ -125,16 +173,16 @@ export function projectLegacy(input: LegacyProjectionInput): LegacyProjection {
     // 而"页面显示什么状态"必须只有一处定义。
     status: deriveRunStatus(checkpoint, tasks),
     cursor: checkpoint.cursor,
-    createdAt: revision.createdAt,
-    createdBy: MIGRATION_ACTOR,
-    // **相对定位**，不是绝对路径——这个字段会出现在响应里（见 `runCheckpointLocator` 的说明）。
-    // L1a 仍指向旧检查点（还没迁到 run 目录）；L1b 迁移后内容不变（run 目录结构就是它）。
-    checkpointLocator: runCheckpointLocator(manifest.pipelineId, runId),
-  }
+    createdAt,
+    createdBy: provenance.createdBy,
+    // **相对定位**，不是绝对路径——这个字段会出现在响应里（见 `legacyCheckpointLocator` 的说明）。
+    //
+    // 指向**旧**检查点（`docs/19` §2.3）：L1a/L1b 期间 `runs/<runId>/checkpoint.json`
+    // 根本还没被写，指过去就是撒谎；L1c 把检查点搬进 run 目录时才改指新位置。
+    // 这里曾经写成 `runCheckpointLocator(...)`（新路径），与文档相反——是写 L1b 时核出来的。
+    checkpointLocator: legacyCheckpointLocator(dataRoot, roots, manifest.pipelineId),
+  }, { allowUnknownTiming: true })
 
-  assertPipelineInvariants(pipeline)
-  assertRevisionInvariants(revision)
-  assertRunInvariants(run, { allowUnknownTiming: true })
   return { pipeline, revision, run }
 }
 

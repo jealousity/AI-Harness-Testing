@@ -63,6 +63,7 @@ import {
   type HostRecordStore,
   type StorageBackend,
   type StorageBackendFactory,
+  type StorageDiagnostic,
 } from '../storage/ports.ts'
 import { FsArtifactStore } from '../stores/fs.ts'
 import {
@@ -87,10 +88,39 @@ import { type HumanGateTask, type HumanGateTaskStore } from '../runtime/persiste
 import { HumanGateWaitAbortedError } from '../runtime/persistent-human-gate.ts'
 import { inspectPipelineLock } from '../checkpoint-lock.ts'
 import {
+  LEGACY_MIGRATION_SOURCE,
+  MIGRATION_ACTOR,
   projectLegacy,
+  revisionParamsOf,
   type LegacyProjection,
+  type ProjectionProvenance,
 } from './pipeline-legacy.ts'
-import type { PipelineRecord, PipelineRevision, PipelineRun } from './pipeline-model.ts'
+import {
+  makePipelineRecord,
+  makeRevision,
+  makeRun,
+  revisionConfigOf,
+  type PipelineRecord,
+  type PipelineRevision,
+  type PipelineRun,
+} from './pipeline-model.ts'
+import {
+  readL1Snapshot,
+  writePipelineRecord,
+  writeRevision,
+  writeRun,
+  type L1Snapshot,
+} from './pipeline-l1-store.ts'
+import {
+  L1_INDEX_COLLECTION,
+  legacyCheckpointLocator,
+  pipelineCollectionOf,
+  pipelineIndexDir as locatorIndexDir,
+  pipelineRecordKey,
+  recordRefOf,
+  revisionIdOf,
+  runIdOf,
+} from './pipeline-locator.ts'
 import {
   PipelineRunError,
   assertAdminRole,
@@ -109,6 +139,7 @@ import {
   type GateTaskKind,
   type GateTaskView,
   type PipelineDiagnostics,
+  type PipelineMigrationReport,
   type PipelineRemovalView,
   type PipelineRevisionsView,
   type PipelineRunsView,
@@ -352,18 +383,19 @@ export interface PipelineRunManifest {
 export type PipelineIndexEntry = PipelineRunManifest
 
 /**
- * 流水线索引目录：`<dataRoot>/pipelines`。集中在此处生成，调用点不得自行拼路径。
+ * 流水线索引目录：`<dataRoot>/pipelines`。
  *
- * 这是**默认（文件）实现**的落盘位置；索引本身走 {@link HostRecordStore}，
- * `collection = 'pipelines'`。因此换一个 store 就能把索引搬到别的后端，
- * 而默认行为与落盘布局逐字不变。
+ * **委托给 `pipeline-locator.ts`**（`docs/19` §3.2 的"唯一路径来源"）：这里曾经自己
+ * `join(dataRoot, 'pipelines')`，与 locator 是第二处实现——两处迟早会分叉，
+ * 而历史上锁路径就是因为三个入口各拼一套而**等于没锁**（`docs/18` §8.6）。
+ * 保留这个导出只是为了不改变公开 API（`src/web/index.ts` 与测试都在用）。
  */
 export function pipelineIndexDir(dataRoot: string): string {
-  return join(dataRoot, 'pipelines')
+  return locatorIndexDir(dataRoot)
 }
 
-/** 索引所在的集合名（`HostRecordStore` 的 `collection`）。 */
-export const PIPELINE_INDEX_COLLECTION = 'pipelines'
+/** 索引所在的集合名（`HostRecordStore` 的 `collection`）。同样以 locator 为准。 */
+export const PIPELINE_INDEX_COLLECTION = L1_INDEX_COLLECTION
 
 /**
  * 索引扫描结果。
@@ -583,7 +615,7 @@ export class FilePipelineRunService implements PipelineRunService {
       // 同一个 pipelineId 换了被测基址/provider/重试预算/诊断探针就是另一次创建，
       // 必须 409 拒绝而不是静默重放首次结果（docs/10 §5.3「绝不静默复用」）。
       idempotencyFingerprint(namespace, createFingerprintFields(input, config.projectId, rulesetVersion)),
-      () => this.createOnce(input, config, roots, rulesetVersion),
+      () => this.createOnce(input, config, roots, rulesetVersion, actor.actorId),
     )
   }
 
@@ -607,6 +639,7 @@ export class FilePipelineRunService implements PipelineRunService {
     config: PipelineConfig,
     roots: PlatformStorageRoots,
     rulesetVersion: string,
+    actorId: string,
   ): Promise<PipelineRunSummary> {
     const checkpointRoot = join(roots.checkpointRoot, input.pipelineId)
     const checkpoint = this.backendOf(config).ports.checkpoints
@@ -630,14 +663,20 @@ export class FilePipelineRunService implements PipelineRunService {
     // 是"一条可见的中间态记录"，恢复扫描能报 `creation-incomplete`，也能被重新 create 接管。
     const manifest = manifestOf(input, config, rulesetVersion)
     await this.writeIndex({ ...manifest, creationState: 'creating' })
+    const initial = initialCheckpoint(input.pipelineId, config.templateVersion, rulesetVersion)
     try {
-      await checkpoint.save(checkpointRoot, initialCheckpoint(input.pipelineId, config.templateVersion, rulesetVersion))
+      await checkpoint.save(checkpointRoot, initial)
     } catch (error) {
       // 检查点写失败：索引停在 `creating`（**故意不清理**）。删掉它反而会回到
       // "两处都看不见"的状态；留着它，恢复扫描与 `get` 都能如实报告这次失败。
       throw error
     }
     await this.writeIndex({ ...manifest, creationState: 'ready' })
+
+    // L1b 双写（docs/19 §8）：新格式与旧格式**同时**写。这是"新建"，不是迁移，
+    // 因此 `createdBy` 是真实调用者、**不带** `migratedFrom`——
+    // 记成 `system:migration` 会把"张三刚建的流水线"说成迁移产物。
+    await this.mirrorL1(this.backendOf(config), config, manifest, initial, { createdBy: actorId })
 
     return {
       pipelineId: input.pipelineId,
@@ -652,7 +691,10 @@ export class FilePipelineRunService implements PipelineRunService {
   async get(pipelineId: string, actor: ActorContext): Promise<PipelineRunView> {
     assertActor(actor)
     assertSafeIdentifier(pipelineId, 'pipelineId')
-    const { manifest, config, checkpoint } = await this.loadRun(pipelineId, actor)
+    const { manifest, config, backend, checkpoint } = await this.loadRun(pipelineId, actor)
+    // L1b 惰性迁移（docs/19 §4.2）：这里是**唯一**的迁移触发点。已迁移过则是纯读，
+    // 不写盘（M3 幂等）；失败降级为只读旧格式，不抛（M5）。
+    await this.migrateIfNeeded(backend, config, manifest, checkpoint)
     // `params` 只在 `get()` 上挂：列表与运行结果不需要它，而穿透 7 处 `buildView`
     // 调用点去加一个必填字段，风险远大于收益。
     return { ...(await this.buildView(config, checkpoint)), params: runParamsOf(manifest) }
@@ -755,37 +797,13 @@ export class FilePipelineRunService implements PipelineRunService {
     // 推进 → checkpoint save。**不含**人工门"阻塞等待"之后的续写——见下面的说明。
     const lock = await this.acquireRunLock(backend, pipelineId)
     try {
-      const host = this.createHost(this.hostOptions(config, manifest, pipelineId, options.signal))
-
-      try {
-        const outcome = await host.driver.run()
-        const view = await this.buildView(config, await this.requireCheckpoint(backend, pipelineId, checkpointRoot))
-        if (outcome.outcome === 'completed') return { outcome: 'completed', view }
-        return { outcome: outcome.outcome, stageId: outcome.stageId, view }
-      } catch (error) {
-        const view = await this.buildView(config, await this.requireCheckpoint(backend, pipelineId, checkpointRoot))
-        // 人工门等待被中止：超时 = 让出控制权等真人裁决（docs/10 §4.2、§5.4 第 4 步）；
-        // 信号中止 / 任务被外部取消 = 本次运行取消。两条路径都绝不自动批准。
-        if (error instanceof HumanGateWaitAbortedError) {
-          if (error.reason === 'timeout') {
-            return { outcome: 'waiting-human', stageId: error.stageId, gateTaskId: error.gateTaskId, view }
-          }
-          return { outcome: 'cancelled', view }
-        }
-        // 运行期异常**落盘**（docs/14 W5 遗留项）。
-        //
-        // 此前它只随 RunResult 返回给后台任务，于是后台运行时在 UI 上**完全不可见**：
-        // 检查点没写、事件流里没有、页面只说"尚未开始"，用户只会反复点"触发运行"。
-        // 这与"前置校验失败"不同——那个已经在启动后台任务之前同步返回了（见 `preflight`）。
-        //
-        // 顺序要紧：**先落盘、再建视图**，否则这一次返回的视图里看不到刚记下的失败。
-        const failure = toPipelineRunError(error)
-        await this.recordRunFailure(backend, pipelineId, checkpointRoot, failure)
-        const failedView = await this.buildView(
-          config, await this.requireCheckpoint(backend, pipelineId, checkpointRoot),
-        )
-        return { outcome: 'failed', error: failure.toView(), view: failedView }
-      }
+      const result = await this.runOnce(backend, config, manifest, pipelineId, checkpointRoot, options)
+      // L1b 双写（docs/19 §8）：run 之后刷新镜像。**在锁内**做，与事实同一次临界区——
+      // 锁外同步会读到"别人刚改过的"检查点，把镜像写成两次观察的拼接。
+      await this.mirrorL1(backend, config, manifest,
+        await this.requireCheckpoint(backend, pipelineId, checkpointRoot),
+        { createdBy: actor.actorId })
+      return result
     } finally {
       // §6.3 M2-2「人工门等待期间可以释放运行锁，但必须保留 awaiting-gate checkpoint 和
       // pending task。裁决后的下一次运行重新 acquire」：让出控制权（waiting-human /
@@ -797,6 +815,53 @@ export class FilePipelineRunService implements PipelineRunService {
       // 同时写同一份检查点——比"多占一会儿锁"危险得多。长时间阻塞靠自动续租（心跳）
       // 保证不被误判 stale。
       await lock.release()
+    }
+  }
+
+  /**
+   * 跑一次驱动并映射结果。**必须在运行锁内调用**（`run()` 负责）。
+   *
+   * 抽出来只为让 `run()` 能"跑完 → 双写 → 返回"一条直线走完，而不是在每个 return 点
+   * 都记得同步一次镜像——那种"每个出口都要记得做同一件事"的写法迟早会漏掉一个出口。
+   */
+  private async runOnce(
+    backend: StorageBackend,
+    config: PipelineConfig,
+    manifest: PipelineRunManifest,
+    pipelineId: string,
+    checkpointRoot: string,
+    options: RunCallOptions,
+  ): Promise<RunResult> {
+    const host = this.createHost(this.hostOptions(config, manifest, pipelineId, options.signal))
+
+    try {
+      const outcome = await host.driver.run()
+      const view = await this.buildView(config, await this.requireCheckpoint(backend, pipelineId, checkpointRoot))
+      if (outcome.outcome === 'completed') return { outcome: 'completed', view }
+      return { outcome: outcome.outcome, stageId: outcome.stageId, view }
+    } catch (error) {
+      const view = await this.buildView(config, await this.requireCheckpoint(backend, pipelineId, checkpointRoot))
+      // 人工门等待被中止：超时 = 让出控制权等真人裁决（docs/10 §4.2、§5.4 第 4 步）；
+      // 信号中止 / 任务被外部取消 = 本次运行取消。两条路径都绝不自动批准。
+      if (error instanceof HumanGateWaitAbortedError) {
+        if (error.reason === 'timeout') {
+          return { outcome: 'waiting-human', stageId: error.stageId, gateTaskId: error.gateTaskId, view }
+        }
+        return { outcome: 'cancelled', view }
+      }
+      // 运行期异常**落盘**（docs/14 W5 遗留项）。
+      //
+      // 此前它只随 RunResult 返回给后台任务，于是后台运行时在 UI 上**完全不可见**：
+      // 检查点没写、事件流里没有、页面只说"尚未开始"，用户只会反复点"触发运行"。
+      // 这与"前置校验失败"不同——那个已经在启动后台任务之前同步返回了（见 `preflight`）。
+      //
+      // 顺序要紧：**先落盘、再建视图**，否则这一次返回的视图里看不到刚记下的失败。
+      const failure = toPipelineRunError(error)
+      await this.recordRunFailure(backend, pipelineId, checkpointRoot, failure)
+      const failedView = await this.buildView(
+        config, await this.requireCheckpoint(backend, pipelineId, checkpointRoot),
+      )
+      return { outcome: 'failed', error: failure.toView(), view: failedView }
     }
   }
 
@@ -926,6 +991,14 @@ export class FilePipelineRunService implements PipelineRunService {
       `编辑流水线运行参数：${changedFields.length === 0 ? '（无字段变化）' : changedFields.join('、')}`)
 
     const checkpoint = await this.requireCheckpoint(backend, input.pipelineId, checkpointRoot)
+
+    // L1b 双写（docs/19 §8 / §5.1）：PATCH 在旧侧更新 manifest，在新侧**创建新 revision**。
+    // R7 保证"没有行为变化就不新建版本"——判据是 `revisionConfigOf` 的指纹，
+    // 与迁移路径同口径。注意这里用 `changedFields`（可编辑字段）之外还会看指纹：
+    // 即便 `changedFields` 为空，只要指纹与 active 不同（例如历史数据没有 active），
+    // 也必须补一条，否则新格式就与旧格式不一致了。
+    await this.mirrorL1(backend, config, next, checkpoint, { createdBy: actor.actorId })
+
     const produced = STAGE_ORDER.some(id => checkpoint.stageStates[id]!.status !== 'idle')
     return {
       pipelineId: input.pipelineId,
@@ -999,7 +1072,7 @@ export class FilePipelineRunService implements PipelineRunService {
     manifest: PipelineRunManifest,
     config: PipelineConfig,
     actor: ActorContext,
-    kind: 'pipeline-updated' | 'pipeline-removed',
+    kind: 'pipeline-updated' | 'pipeline-removed' | 'migration-intent' | 'migration-completed',
     detail: string,
   ): Promise<void> {
     try {
@@ -1016,44 +1089,274 @@ export class FilePipelineRunService implements PipelineRunService {
     }
   }
 
+  // ── L1 新格式：双写 + 惰性迁移（docs/19 §8 L1b）──────────────────────────────
+  //
+  // L1b 的定位（docs/19 §4.1）是 **写两侧、读旧侧**：
+  // - 写入（create / PATCH / run）把事实同时镜像到新格式，为新模型积累**真实**数据；
+  // - 读取仍然走旧格式（manifest + checkpoint），因此**旧端点行为逐字不变**；
+  // - 旧数据被访问时惰性迁移，把新格式补齐（幂等、不碰旧文件）。
+  //
+  // 为什么不顺手把读侧也切了：切读侧等于**换事实来源**，那是 L1c 的事，
+  // 而且必须与锁路径一起改（§6.1）——先切读再拆锁，会让新旧进程同时推进同一条流水线。
+  //
+  // 因此本阶段新格式是**副本**：丢了可以从旧格式重建，回滚成本 = 删掉 `pipelines/<id>/`。
+
   /**
-   * L1a：把该流水线的**现有**事实投影成 L1 三对象（只读，不落盘）。
+   * 把当前事实镜像到 L1 新格式。**尽力而为，失败不上抛。**
    *
-   * 复用已有的 `locate` / `requireCheckpoint` / 门任务列表，因此作用域校验、存储体检
-   * 与错误分类全都与其它端点一致——不会因为"多了一个新读路径"而绕过任何一道防线。
+   * 为什么可以吞掉失败：新格式在 L1b 是副本而非事实来源，读写都仍以旧格式为准。
+   * 上抛会让"其实已经建好的流水线"报创建失败——那比"副本暂时缺失"糟得多。
+   * 副本缺失是**可观测且可自愈**的：下一次访问走惰性迁移补齐，其间体检报 `migration-needed`。
    */
-  private async projectPipeline(pipelineId: string, actor: ActorContext): Promise<LegacyProjection> {
+  private async mirrorL1(
+    backend: StorageBackend,
+    config: PipelineConfig,
+    manifest: PipelineRunManifest,
+    checkpoint: Checkpoint,
+    provenance: ProjectionProvenance,
+    mode: 'refresh' | 'migrate' = 'refresh',
+  ): Promise<void> {
+    try {
+      await this.syncL1(backend, config, manifest, checkpoint, provenance, mode)
+    } catch {
+      // 见方法说明：副本写失败不改变事实，也不该让调用方看到失败。
+    }
+  }
+
+  /**
+   * 把当前事实写成/刷新 L1 三对象。
+   *
+   * 分支只有两条，且**没有第三处**决定"新格式写什么"：
+   * 1. 记录不存在 → 整份写出来（首次双写 or 惰性迁移，靠 `provenance` 区分出处）；
+   * 2. 记录已存在 → 按 R7/R2/R3 维护 revision，并刷新 run 的状态与游标。
+   *
+   * `mode: 'migrate'`（读端点的惰性迁移）只在**新格式已齐全**时提前返回——
+   * 这是 §4.2 说的"触发点：任何一次 `get` 命中旧格式且**未迁移过**"，读端点不该每次访问都写盘。
+   *
+   * **注意早退的判据是"齐全"，不是"record 存在"**：§4.3 的主形态恰恰是
+   * "record 在、revisions/runs 缺"（迁移中断）。若按"record 存在"早退，
+   * 中断的迁移就**永远补不回来**，而且体检会一直报 `migration-incomplete`
+   * 却没有任何一条路径能修好它。实测抓出来过一次（`test/pipeline-l1b-migration.test.ts`
+   * 的「中断后重跑幂等补齐」）。
+   */
+  private async syncL1(
+    backend: StorageBackend,
+    config: PipelineConfig,
+    manifest: PipelineRunManifest,
+    checkpoint: Checkpoint,
+    provenance: ProjectionProvenance,
+    mode: 'refresh' | 'migrate' = 'refresh',
+  ): Promise<void> {
+    const dataRoot = this.options.dataRoot
+    const pipelineId = manifest.pipelineId
+    const now = Date.now()
+    const roots = resolvePlatformRoots(dataRoot, config)
+    const snapshot = await this.l1Snapshot(pipelineId)
+    const isMigration = provenance.migratedFrom !== undefined
+
+    // 迁移侧：新格式已**齐全**（record + 至少一条 revision + 至少一条 run）才算迁过。
+    const complete = snapshot.record.state === 'ok'
+      && snapshot.revisions.ok.length > 0
+      && snapshot.runs.ok.length > 0
+    if (mode === 'migrate' && complete) return
+
+    // 走到这里一定会写盘（或尝试写）。M2：**写之前**先落"意图"。
+    // 只有"意图"没有"完成"才说明那一次是中断的（§4.3）——单条事件表达不了这个区别。
+    if (isMigration) {
+      await this.appendAudit(backend, manifest, config, { actorId: provenance.createdBy }, 'migration-intent',
+        `开始把旧格式事实迁移到 L1 新格式：${recordRefOf(pipelineRecordKey(pipelineId))}`)
+    }
+    // 写失败时**不**落 completed（异常直接抛出，由 `mirrorL1` 兜住）：
+    // 留下"有意图、无完成"正是中断的痕迹，体检据此报 `migration-incomplete`（§4.3）。
+    await this.writeL1(backend, config, manifest, checkpoint, provenance, snapshot, roots, now)
+    if (isMigration) {
+      await this.appendAudit(backend, manifest, config, { actorId: provenance.createdBy }, 'migration-completed',
+        `L1 新格式迁移完成：${pipelineCollectionOf(pipelineId)}`)
+    }
+  }
+
+  private async writeL1(
+    backend: StorageBackend,
+    config: PipelineConfig,
+    manifest: PipelineRunManifest,
+    checkpoint: Checkpoint,
+    provenance: ProjectionProvenance,
+    snapshot: L1Snapshot,
+    roots: PlatformStorageRoots,
+    now: number,
+  ): Promise<void> {
+    const dataRoot = this.options.dataRoot
+    const pipelineId = manifest.pipelineId
+
+    // ── ① 记录不存在：整份写出来 ──
+    if (snapshot.record.state !== 'ok') {
+      const tasks = await backend.ports.gateTasks.list({ pipelineId })
+      const projection = projectLegacy({ manifest, checkpoint, tasks, dataRoot, roots, now, provenance })
+      await writePipelineRecord(this.indexStore, projection.pipeline)
+      await writeRevision(this.indexStore, projection.revision)
+      await writeRun(this.indexStore, projection.run)
+      return
+    }
+
+    const record = snapshot.record.value
+    let nextRecord = record
+
+    // ── ② revision：R7 去重、R2 递增、R3 单一 active ──
+    //
+    // 指纹走 `revisionConfigOf`（唯一实现），与迁移路径同口径——否则"PATCH 一份与当前
+    // 完全相同的参数"会被误判成变化，白建一个 revision。
+    const params = revisionParamsOf(manifest, checkpoint)
+    const fingerprint = revisionConfigOf(params).fingerprint
+    const active = snapshot.revisions.ok.find(item => item.revisionId === record.activeRevisionId)
+    if (active === undefined || active.fingerprint !== fingerprint) {
+      const number = snapshot.revisions.ok.reduce((max, item) => Math.max(max, item.revisionNumber), 0) + 1
+      const revisionId = revisionIdOf(pipelineId, number)
+      // R1 约束的是**配置字段**；`status` 是唯一允许的生命周期字段，且只能
+      // active → superseded 单向迁移（否则 R3"最多一个 active"无法成立）。
+      if (active !== undefined) {
+        await writeRevision(this.indexStore, { ...active, status: 'superseded' })
+      }
+      await writeRevision(this.indexStore, makeRevision({
+        revisionId,
+        pipelineId,
+        revisionNumber: number,
+        createdAt: manifest.updatedAt ?? now,
+        createdBy: provenance.createdBy,
+        status: 'active',
+        params,
+      }))
+      nextRecord = makePipelineRecord({
+        ...nextRecord,
+        activeRevisionId: revisionId,
+        ...(manifest.updatedAt === undefined ? {} : { updatedAt: manifest.updatedAt }),
+      })
+    } else if (manifest.updatedAt !== undefined && manifest.updatedAt !== record.updatedAt) {
+      nextRecord = makePipelineRecord({ ...record, updatedAt: manifest.updatedAt })
+    }
+
+    // ── ③ run：状态与游标**每次都要从检查点重推** ──
+    //
+    // L1b 只有一条 run（旧模型里一条流水线只有一份检查点）。它的 `revisionId` 跟
+    // **当前 active revision** 走，而不是钉在创建时那一条：
+    // 旧事实里根本没有"某次运行绑了哪份配置"这个信息，钉一个旧 revision 反而是编造绑定。
+    // 每次运行绑定自己的 revision 是 L1c 的事（那时 run 才有自己的检查点与产物目录）。
+    const tasks = await backend.ports.gateTasks.list({ pipelineId })
+    const status = deriveRunStatus(checkpoint, tasks)
+    const runId = runIdOf(pipelineId, 1)
+    const existing = snapshot.runs.ok.find(item => item.runId === runId)
+    if (existing === undefined
+      || existing.status !== status
+      || existing.cursor !== checkpoint.cursor
+      || existing.revisionId !== nextRecord.activeRevisionId) {
+      await writeRun(this.indexStore, makeRun({
+        runId,
+        pipelineId,
+        revisionId: nextRecord.activeRevisionId,
+        attempt: existing?.attempt ?? 1,
+        status,
+        cursor: checkpoint.cursor,
+        createdAt: existing?.createdAt ?? (manifest.createdAt ?? now),
+        createdBy: existing?.createdBy ?? provenance.createdBy,
+        // 指向**旧**检查点：L1b 的 run 目录里还没有检查点（L1c 才搬）。
+        checkpointLocator: existing?.checkpointLocator ?? legacyCheckpointLocator(dataRoot, roots, pipelineId),
+      // 旧检查点里**没有** run 的起止时间（`Checkpoint` 类型里就没有这两个字段），
+      // 因此放宽是唯一诚实的选项——编一个 `finishedAt` 会让"运行耗时"从一开始就是错的。
+      // 严格时序从 L1c 开始：那时 run 目录拥有自己的检查点，起止时间才是真实存在的。
+      }, { allowUnknownTiming: true }))
+    }
+
+    if (nextRecord !== record) await writePipelineRecord(this.indexStore, nextRecord)
+  }
+
+  /**
+   * 惰性迁移（`docs/19` §4.2）：旧格式在、新格式缺时补齐。
+   *
+   * **幂等**（M3）：新格式已存在时是纯读操作，不重复写。
+   * **不碰旧文件**（M1）：只读旧、只写新。
+   * **失败不上抛**（M5）：降级为"只读旧格式"，由体检报 `migration-needed`。
+   */
+  private async migrateIfNeeded(
+    backend: StorageBackend,
+    config: PipelineConfig,
+    manifest: PipelineRunManifest,
+    checkpoint: Checkpoint,
+  ): Promise<void> {
+    await this.mirrorL1(backend, config, manifest, checkpoint, {
+      createdBy: MIGRATION_ACTOR,
+      migratedFrom: LEGACY_MIGRATION_SOURCE,
+    }, 'migrate')
+  }
+
+  /** 该流水线的新格式现状。体检与迁移共用同一次观察（避免读到两次之间的写入）。 */
+  private l1Snapshot(pipelineId: string): Promise<L1Snapshot> {
+    return readL1Snapshot(this.indexStore, pipelineId)
+  }
+
+  /**
+   * 读出该流水线的 L1 三对象（`GET /api/pipelines/:id/revisions`、`/runs` 共用）。
+   *
+   * **优先读落盘的新格式**：L1b 双写之后，磁盘上那份才是"这批对象究竟是什么"的权威
+   * 记录——它带真实的 `createdBy`（人建的 vs 迁移来的）。不齐全时才回落到内存投影
+   * （老数据还没迁移时的唯一来源）。
+   *
+   * 为什么必须优先读落盘的（实测抓到的真 bug）：这两个端点原先一律用
+   * `projectLegacy` 投影，于是**刚被张三创建**的流水线在 API 里显示
+   * `createdBy: "system:migration"`、`migratedFrom: "legacy-manifest"`，
+   * 而同一时刻磁盘上的记录写的是 `createdBy: "alice"` —— 同一件事两个说法。
+   * 审计的用处就是回答"谁做的"，这里说错等于把审计作废。
+   *
+   * 作用域校验 / 未登记 / 存储体检仍然走 `locate` + `requireCheckpoint`，
+   * 不因为"改成读新格式"而绕过任何一道防线。
+   */
+  private async l1ViewOf(pipelineId: string, actor: ActorContext): Promise<{
+    readonly pipeline: PublicPipelineRecord
+    readonly revisions: readonly PipelineRevision[]
+    readonly runs: readonly PipelineRun[]
+  }> {
     const { manifest, config, backend, checkpointRoot } = await this.locate(pipelineId, actor)
     const checkpoint = await this.requireCheckpoint(backend, pipelineId, checkpointRoot)
+
+    const snapshot = await this.l1Snapshot(pipelineId)
+    // 判据是"**齐全**"而不是"record 存在"：只写了一半的新格式不能当权威，
+    // 否则会拿一份缺 revision 的记录去回答 `/revisions`（返回空列表却不说明原因）。
+    if (snapshot.record.state === 'ok'
+      && snapshot.revisions.ok.length > 0
+      && snapshot.runs.ok.length > 0) {
+      return {
+        pipeline: publicPipelineOf(snapshot.record.value),
+        revisions: snapshot.revisions.ok,
+        runs: snapshot.runs.ok,
+      }
+    }
+
     const tasks = await backend.ports.gateTasks.list({ pipelineId })
-    return projectLegacy({
+    const projection = projectLegacy({
       manifest, checkpoint, tasks,
       dataRoot: this.options.dataRoot,
       roots: resolvePlatformRoots(this.options.dataRoot, config),
       now: Date.now(),
+      // 这条路读的是**旧格式事实**，产出的对象天然带"从旧格式投影而来"的出处。
+      provenance: { createdBy: MIGRATION_ACTOR, migratedFrom: LEGACY_MIGRATION_SOURCE },
     })
+    return {
+      pipeline: publicPipelineOf(projection.pipeline),
+      revisions: [projection.revision],
+      runs: [projection.run],
+    }
   }
 
   async listRevisions(pipelineId: string, actor: ActorContext): Promise<PipelineRevisionsView> {
     assertActor(actor)
     assertSafeIdentifier(pipelineId, 'pipelineId')
-    const projection = await this.projectPipeline(pipelineId, actor)
-    return {
-      pipelineId,
-      pipeline: publicPipelineOf(projection.pipeline),
-      revisions: [projection.revision],
-    }
+    const view = await this.l1ViewOf(pipelineId, actor)
+    return { pipelineId, pipeline: view.pipeline, revisions: view.revisions }
   }
 
   async listRuns(pipelineId: string, actor: ActorContext): Promise<PipelineRunsView> {
     assertActor(actor)
     assertSafeIdentifier(pipelineId, 'pipelineId')
-    const projection = await this.projectPipeline(pipelineId, actor)
-    return {
-      pipelineId,
-      pipeline: publicPipelineOf(projection.pipeline),
-      runs: [projection.run],
-    }
+    const view = await this.l1ViewOf(pipelineId, actor)
+    return { pipelineId, pipeline: view.pipeline, runs: view.runs }
   }
 
   /**
@@ -1083,6 +1386,10 @@ export class FilePipelineRunService implements PipelineRunService {
     const usageRead = await backend.ports.usage.read(pipelineId)
     const lock = await inspectPipelineLock(checkpointBase, pipelineId)
 
+    // L1 迁移现状（docs/19 §4.3）。**只读**：体检绝不触发迁移——排障路径上做写操作
+    // 会让"看一眼"改变被观察对象。检查点读不出来时不报迁移结论（读不到事实就无法比较）。
+    const migration = await this.migrationReportOf(pipelineId, manifest, config, backend)
+
     const creationState: 'creating' | 'ready' = manifest.creationState === 'creating' ? 'creating' : 'ready'
     const now = Date.now()
     const heartbeatAt = lock.owner?.heartbeatAt ?? null
@@ -1094,6 +1401,7 @@ export class FilePipelineRunService implements PipelineRunService {
       storage: health.diagnostics,
       index: { entries: scan.entries.length, unreadable: scan.unreadable },
       usageSkippedLines: usageRead.skipped.length,
+      migration,
       creationState,
       lock: {
         present: lock.present,
@@ -1104,8 +1412,148 @@ export class FilePipelineRunService implements PipelineRunService {
       attentionNeeded: !health.ok
         || scan.unreadable.length > 0
         || usageRead.skipped.length > 0
-        || creationState === 'creating',
+        || creationState === 'creating'
+        // `needed` **刻意不算**：L1b 期间"还没迁移"是完全正常的状态，
+        // 把它算进来会让每一份老数据根一开机就报不健康——报警一旦是常态就没人看了。
+        // `incomplete` / `conflict` 才是真的需要处置。
+        || migration.state === 'incomplete'
+        || migration.state === 'conflict',
     }
+  }
+
+  /**
+   * 组装 L1 迁移报告（`docs/19` §4.3）。**只读**，不触发迁移。
+   *
+   * 判据顺序固定为"文件在不在 → 齐不齐 → 一致不一致"：
+   * 先回答"新格式有没有开始写"，再回答"写完了没有"，最后才比较内容。
+   * 顺序反过来会在"新格式只写了一半"时拿半份数据去比，报出一堆假的冲突。
+   */
+  private async migrationReportOf(
+    pipelineId: string,
+    manifest: PipelineRunManifest,
+    config: PipelineConfig,
+    backend: StorageBackend,
+  ): Promise<PipelineMigrationReport> {
+    const snapshot = await this.l1Snapshot(pipelineId)
+    const diagnostics: StorageDiagnostic[] = []
+    // L1 对象统一用 `record` 这个 kind：它表示"宿主级键值记录"，与 `HostRecordStore` 一致。
+    // 不为它们新开 kind 是因为 `StorageRecordKind` 被多个后端共享，加值会波及它们的穷尽分支。
+    const diag = (
+      code: StorageDiagnostic['code'],
+      ref: string,
+      detail: string,
+      recoverable: boolean,
+    ): StorageDiagnostic => ({ code, kind: 'record', ref, detail, recoverable })
+
+    for (const broken of [...snapshot.revisions.corrupt, ...snapshot.runs.corrupt]) {
+      diagnostics.push(diag('migration-incomplete', broken.ref, `新格式文件不可读：${broken.detail}`, false))
+    }
+    const counts = {
+      revisions: snapshot.revisions.ok.length,
+      runs: snapshot.runs.ok.length,
+    }
+
+    // ① 新格式一个字都没有 → 待迁移（正常状态，访问时自动补）
+    if (snapshot.record.state === 'missing') {
+      return {
+        state: 'needed', record: 'missing', ...counts,
+        diagnostics: [diag('migration-needed', recordRefOf(pipelineRecordKey(pipelineId)),
+          '旧格式（pipelines/<id>.json + checkpoints）在，L1 新格式尚未落盘；下一次访问会自动迁移', true)],
+      }
+    }
+
+    // ② 记录文件坏了 → 迁移不完整（不能报 needed：它不是"还没迁"，是"迁坏了"）
+    if (snapshot.record.state === 'corrupt') {
+      return {
+        state: 'incomplete', record: 'corrupt', ...counts,
+        diagnostics: [diag('migration-incomplete', recordRefOf(pipelineRecordKey(pipelineId)),
+          `新格式记录不可读：${snapshot.record.detail}`, false), ...diagnostics],
+      }
+    }
+
+    // ③ 记录在但缺件 → 迁移中断（§4.3 的主形态）
+    if (counts.revisions === 0 || counts.runs === 0) {
+      return {
+        state: 'incomplete', record: 'ok', ...counts,
+        diagnostics: [diag('migration-incomplete', pipelineCollectionOf(pipelineId),
+          `新格式不完整：revisions=${counts.revisions} runs=${counts.runs}；重跑迁移即可补齐（幂等）`, true),
+          ...diagnostics],
+      }
+    }
+
+    // ④ 都在 → 比较事实
+    const conflicts = await this.migrationConflicts(manifest, config, backend, snapshot)
+    if (conflicts.length > 0) {
+      return {
+        state: 'conflict', record: 'ok', ...counts,
+        diagnostics: [
+          ...conflicts.map(item => diag('migration-conflict', pipelineCollectionOf(pipelineId), item, false)),
+          ...diagnostics,
+        ],
+      }
+    }
+    return { state: 'migrated', record: 'ok', ...counts, diagnostics }
+  }
+
+  /**
+   * 比较新旧两侧的**同一批事实**，返回不一致的项（人读字符串，含字段名与两侧取值）。
+   *
+   * 只比"旧侧权威、新侧应当镜像"的字段。**不比时间戳**：`createdAt`/`updatedAt`
+   * 在两侧的语义不同（旧侧是"清单被写的时间"，新侧是"首次投影的时刻"），
+   * 把它们算成冲突只会制造噪音，让人学会忽略这个诊断。
+   */
+  private async migrationConflicts(
+    manifest: PipelineRunManifest,
+    config: PipelineConfig,
+    backend: StorageBackend,
+    snapshot: L1Snapshot,
+  ): Promise<readonly string[]> {
+    if (snapshot.record.state !== 'ok') return []
+    const record = snapshot.record.value
+    const conflicts: string[] = []
+    const compare = (field: string, legacy: unknown, mirrored: unknown): void => {
+      if (JSON.stringify(legacy) !== JSON.stringify(mirrored)) {
+        conflicts.push(`${field} 不一致：旧格式=${JSON.stringify(legacy)} 新格式=${JSON.stringify(mirrored)}`)
+      }
+    }
+
+    compare('projectId', manifest.projectId, record.projectId)
+    compare('configRef', manifest.configRef, record.configRef)
+    compare('tenantId', manifest.tenantId, record.tenantId)
+
+    // 检查点读不出来时**只报记录层面的结论**，不比较运行状态：读不到事实就没法判
+    // "一致不一致"，硬比会报出假冲突。这一条比"体检一定要有结论"重要。
+    let checkpoint: Checkpoint
+    let tasks: readonly HumanGateTask[]
+    try {
+      const roots = resolvePlatformRoots(this.options.dataRoot, config)
+      checkpoint = await this.requireCheckpoint(
+        backend, manifest.pipelineId, join(roots.checkpointRoot, manifest.pipelineId),
+      )
+      tasks = await backend.ports.gateTasks.list({ pipelineId: manifest.pipelineId })
+    } catch {
+      return conflicts
+    }
+
+    const active = snapshot.revisions.ok.find(item => item.revisionId === record.activeRevisionId)
+    if (active === undefined) {
+      // P5：activeRevisionId 必须指向存在的 revision。指向空是硬错误，不是"待迁移"。
+      conflicts.push(`activeRevisionId=${record.activeRevisionId} 指向的 revision 不存在（违反 P5）`)
+    } else {
+      compare('activeRevision.fingerprint',
+        revisionConfigOf(revisionParamsOf(manifest, checkpoint)).fingerprint, active.fingerprint)
+    }
+
+    const runId = runIdOf(manifest.pipelineId, 1)
+    const run = snapshot.runs.ok.find(item => item.runId === runId)
+    if (run === undefined) {
+      conflicts.push(`run ${runId} 不存在`)
+    } else {
+      compare('run.status', deriveRunStatus(checkpoint, tasks), run.status)
+      compare('run.cursor', checkpoint.cursor, run.cursor)
+      compare('run.revisionId', record.activeRevisionId, run.revisionId)
+    }
+    return conflicts
   }
 
   async reenter(input: ReenterInput, actor: ActorContext): Promise<Checkpoint> {
@@ -1401,9 +1849,15 @@ export class FilePipelineRunService implements PipelineRunService {
     readonly config: PipelineConfig
     readonly checkpoint: Checkpoint
     readonly manifest: PipelineRunManifest
+    readonly backend: StorageBackend
   }> {
     const { manifest, config, backend, checkpointRoot } = await this.locate(pipelineId, actor)
-    return { manifest, config, checkpoint: await this.requireCheckpoint(backend, pipelineId, checkpointRoot) }
+    return {
+      manifest,
+      config,
+      backend,
+      checkpoint: await this.requireCheckpoint(backend, pipelineId, checkpointRoot),
+    }
   }
 
   /**

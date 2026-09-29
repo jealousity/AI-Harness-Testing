@@ -430,6 +430,36 @@ export interface PipelineRemovalView {
  */
 export type PublicPipelineRecord = Omit<PipelineRecord, 'legacyLocator'>
 
+/**
+ * L1 迁移状态（`docs/19` §4.3）。
+ *
+ * ```text
+ * migrated    新格式齐全且与旧格式一致（正常）
+ * needed      旧格式在、新格式一个字都没有（还没迁过；访问时会自动补）
+ * incomplete  新格式写了一半（record 在、revision 或 run 缺）——迁移中断
+ * conflict    新旧都在但事实不一致（双写漏了一处 / 有人手工改过其中一侧）
+ * ```
+ */
+export type PipelineMigrationState = 'migrated' | 'needed' | 'incomplete' | 'conflict'
+
+/**
+ * L1 迁移现状（`GET /api/pipelines/:id/diagnostics` 的一部分）。
+ *
+ * 为什么单独一段而不是塞进 `backend.storage`：那段是**存储 schema 健康**的判据，
+ * 它非空就意味着 `backend.ok === false`、`attentionNeeded === true`。
+ * 而 L1b 期间"还没迁移"是**完全正常**的状态，把它算进 `ok` 会让每一份老数据根
+ * 一开机就报不健康——报警一旦是常态，就没人看了。
+ */
+export interface PipelineMigrationReport {
+  readonly state: PipelineMigrationState
+  /** 新格式文件本身的状态（`corrupt` 表示文件在但读不出来）。 */
+  readonly record: 'missing' | 'ok' | 'corrupt'
+  readonly revisions: number
+  readonly runs: number
+  /** 需要人工/自动处置的明细。`ref` 是**相对**路径，不含数据根。 */
+  readonly diagnostics: readonly StorageDiagnostic[]
+}
+
 /** `GET /api/pipelines/:id/revisions`（`docs/19` §8 的 L1a 只读端点）。 */
 export interface PipelineRevisionsView {
   readonly pipelineId: string
@@ -490,6 +520,11 @@ export interface PipelineDiagnostics {
   }
   /** 汇总：有任何需要处置的项时为 true。**不代替**逐项判断，只是给页面一个入口信号。 */
   readonly attentionNeeded: boolean
+  /**
+   * L1 事实模型的迁移现状（`docs/19` §4.3）。**只读报告，体检不触发迁移**
+   * ——排障路径上做写操作是最糟的设计。
+   */
+  readonly migration: PipelineMigrationReport
 }
 
 /**
