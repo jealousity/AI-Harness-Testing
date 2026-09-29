@@ -58,7 +58,7 @@ async function snapshot(): Promise<Readonly<Record<string, string>>> {
 
 // ── 正向 ─────────────────────────────────────────────────────────────────────
 
-test('L1a：listRevisions 把现有 manifest 投影成 revision-1（含参数与指纹）', async () => {
+test('L1a：listRevisions 返回 revision-1（含参数与指纹）', async () => {
   const service = serviceOf(new ScriptedHost())
   await service.create({ ...CREATE, targetBaseUrl: 'https://staging.example.com', maxGateRetries: 2 }, REVIEWER)
 
@@ -74,12 +74,15 @@ test('L1a：listRevisions 把现有 manifest 投影成 revision-1（含参数与
   assert.equal(revision.status, 'active')
   assert.equal(revision.targetBaseUrl, 'https://staging.example.com')
   assert.equal(revision.maxGateRetries, 2)
-  assert.equal(revision.createdBy, 'system:migration', '迁移产生的对象不能看起来像某个真人建的')
-  assert.equal(revision.migratedFrom, 'legacy-manifest')
   assert.ok(revision.fingerprint.length > 0, '必须有行为指纹（R4）')
+  // **L1b 起这条断言的期望变了**：端点优先读**落盘的新格式**，因此 `createdBy` 是真实
+  // 创建者而不是 `system:migration`。原先一律用内存投影时，一条刚被 alice 建的流水线
+  // 会显示成"迁移产物"——磁盘上写 alice、API 说 migration，同一件事两个说法。
+  assert.equal(revision.createdBy, 'alice', 'L1b 之后读的是落盘记录，创建者必须是真人')
+  assert.equal(revision.migratedFrom, undefined, '新建的不是迁移产物，不该带迁移标记')
 })
 
-test('L1a：listRuns 把 checkpoint 投影成 run-1，状态复用 deriveRunStatus', async () => {
+test('L1a：listRuns 返回 run-1，状态与游标跟当前检查点走', async () => {
   const service = serviceOf(new ScriptedHost())
   await service.create(CREATE, REVIEWER)
 
@@ -88,12 +91,12 @@ test('L1a：listRuns 把 checkpoint 投影成 run-1，状态复用 deriveRunStat
   assert.equal(fresh.runs[0]!.runId, 'run-1')
   assert.equal(fresh.runs[0]!.revisionId, 'revision-1')
   assert.equal(fresh.runs[0]!.attempt, 1)
-  assert.equal(fresh.runs[0]!.status, 'queued', '全新流水线应投影成 queued')
-  // **不编时序**：老数据没有 run 的起止时间。
+  assert.equal(fresh.runs[0]!.status, 'queued', '全新流水线应是 queued')
+  // **不编时序**：老数据没有 run 的起止时间，L1b 也不编（旧 `Checkpoint` 里就没这两个字段）。
   assert.equal(fresh.runs[0]!.startedAt, undefined)
   assert.equal(fresh.runs[0]!.finishedAt, undefined)
 
-  // 跑到人工门后，投影状态必须跟着变（说明它读的是**当前**事实，不是快照）。
+  // 跑到人工门后，状态必须跟着变（说明它读的是**当前**事实，不是创建时的快照）。
   await service.run('pipe-1', REVIEWER)
   const parked = await service.listRuns('pipe-1', OPERATOR)
   assert.equal(parked.runs[0]!.status, 'waiting-human')

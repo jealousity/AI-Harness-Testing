@@ -32,8 +32,11 @@ import {
 import {
   UnsafePathSegmentError,
   assertSafeSegment,
+  legacyCheckpointLocator,
   legacyCheckpointPath,
+  legacyManifestPath,
   pipelineIndexDir,
+  pipelineIndexEntryPath,
   pipelineRecordPath,
   revisionIdOf,
   revisionPath,
@@ -43,6 +46,7 @@ import {
   runRecordPath,
 } from '../src/web/pipeline-locator.ts'
 import {
+  LEGACY_MIGRATION_SOURCE,
   MIGRATION_ACTOR,
   looksLikeLegacyManifest,
   looksLikePipelineRecord,
@@ -109,7 +113,18 @@ test('L1a：locator 产出的路径与现有索引路径一致（不是另立一
   // 索引目录必须与 `pipeline-run-service.ts` 的 `pipelineIndexDir` 完全相同，
   // 否则新旧代码会读写两个不同位置。
   assert.equal(pipelineIndexDir(DATA_ROOT), join(DATA_ROOT, 'pipelines'))
-  assert.equal(pipelineRecordPath(DATA_ROOT, 'pipe-1'), join(DATA_ROOT, 'pipelines', 'pipe-1.json'))
+  // **旧**扁平索引：与现有索引存储同路径（`collection='pipelines'`, `id=pipelineId`）。
+  assert.equal(pipelineIndexEntryPath(DATA_ROOT, 'pipe-1'), join(DATA_ROOT, 'pipelines', 'pipe-1.json'))
+  // **新** PipelineRecord：独立路径，**不是** pipelines/<id>.json（docs/19 §3.3）。
+  // 写错到旧路径会被 `isIndexEntry` 静默接受、运行参数静默丢失。
+  assert.equal(pipelineRecordPath(DATA_ROOT, 'pipe-1'), join(DATA_ROOT, 'pipelines', 'pipe-1', 'pipeline.json'))
+  assert.notEqual(
+    pipelineRecordPath(DATA_ROOT, 'pipe-1'),
+    pipelineIndexEntryPath(DATA_ROOT, 'pipe-1'),
+    '新旧两条路径必须不同——这正是 §3.3 那个会静默损坏行为的陷阱',
+  )
+  // 旧 manifest 与旧索引**是同一个文件**（两种形状），迁移读的就是它。
+  assert.equal(legacyManifestPath(DATA_ROOT, 'pipe-1'), pipelineIndexEntryPath(DATA_ROOT, 'pipe-1'))
   assert.equal(
     revisionPath(DATA_ROOT, 'pipe-1', 'revision-1'),
     join(DATA_ROOT, 'pipelines', 'pipe-1', 'revisions', 'revision-1.json'),
@@ -129,6 +144,18 @@ test('L1a：locator 产出的路径与现有索引路径一致（不是另立一
   // 旧检查点路径：`<checkpointsRoot>/<pipelineId>/checkpoint.json`
   const roots = resolvePlatformRoots(DATA_ROOT, baseConfig())
   assert.equal(legacyCheckpointPath(roots, 'pipe-1'), join(roots.checkpointRoot, 'pipe-1', 'checkpoint.json'))
+})
+
+test('L1a：旧检查点的**相对定位**在数据根之内且不含绝对路径', () => {
+  // `PipelineRun.checkpointLocator` 会出现在响应里，因此必须是相对路径（docs/15）。
+  const roots = resolvePlatformRoots(DATA_ROOT, baseConfig())
+  const locator = legacyCheckpointLocator(DATA_ROOT, roots, 'pipe-1')
+  assert.equal(isAbsolute(locator), false, `不得是绝对路径：${locator}`)
+  assert.equal(locator.startsWith('..'), false, `不得逃出数据根：${locator}`)
+  assert.equal(locator.includes(DATA_ROOT), false, `不得包含数据根：${locator}`)
+  assert.ok(locator.endsWith('/checkpoints/pipe-1/checkpoint.json'), `指向旧检查点：${locator}`)
+  // 分隔符统一成 `/`，让同一份数据在不同平台比较相等。
+  assert.equal(locator.includes('\\'), false)
 })
 
 test('L1a：locator 拒绝路径穿越（pipelineId 来自请求，不能拼出数据根之外的路径）', () => {
@@ -283,6 +310,8 @@ const LEGACY_MANIFEST = {
   diagCredentials: ['ACME_API_TOKEN'],
 }
 
+const MIGRATION_PROVENANCE = { createdBy: MIGRATION_ACTOR, migratedFrom: LEGACY_MIGRATION_SOURCE }
+
 test('L1a：旧 manifest + checkpoint 投影成三对象，且**不编时序**', () => {
   const config = baseConfig()
   const roots = resolvePlatformRoots(DATA_ROOT, config)
@@ -293,6 +322,7 @@ test('L1a：旧 manifest + checkpoint 投影成三对象，且**不编时序**',
     dataRoot: DATA_ROOT,
     roots,
     now: 9_000,
+    provenance: MIGRATION_PROVENANCE,
   })
 
   assert.equal(projection.pipeline.pipelineId, 'pipe-1')
@@ -330,6 +360,7 @@ test('L1a：投影复用 deriveRunStatus——不另写一套状态推导', () =
   const projection = projectLegacy({
     manifest: LEGACY_MANIFEST, checkpoint: parked, tasks: [],
     dataRoot: DATA_ROOT, roots, now: 9_000,
+    provenance: MIGRATION_PROVENANCE,
   })
   // 没有门任务时 awaiting-gate 会推导成 waiting-human（由 deriveRunStatus 决定）。
   assert.equal(projection.run.status, 'waiting-human')
@@ -345,6 +376,7 @@ test('L1a：rulesetVersion 缺省时回退到 checkpoint 里那个（真正生�
     dataRoot: DATA_ROOT,
     roots,
     now: 9_000,
+    provenance: MIGRATION_PROVENANCE,
   })
   assert.equal(projection.revision.rulesetVersion, 'from-checkpoint-r9')
 })
@@ -358,6 +390,7 @@ test('L1a：投影是纯函数——同样的输入两次得到同样结果（�
     dataRoot: DATA_ROOT,
     roots,
     now: 9_000,
+    provenance: MIGRATION_PROVENANCE,
   }
   assert.deepEqual(projectLegacy(input), projectLegacy(input))
 })
