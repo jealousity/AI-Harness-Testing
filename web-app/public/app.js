@@ -919,6 +919,13 @@ function renderDiagnostics(report) {
       el('span', { className: 'mono small', text: String(report.usageSkippedLines) })]),
     el('li', {}, [el('span', { className: 'muted small', text: '创建状态' }),
       el('span', { className: 'mono small', text: report.creationState })]),
+    // L1 事实模型迁移现状（docs/19 §4.3）。**必须显示**：只报在响应里而页面看不见，
+    // 就等于"记了但没人看得到"——那正是审计白名单那类坑的另一种形态。
+    el('li', {}, [el('span', { className: 'muted small', text: 'L1 迁移' }),
+      el('span', {
+        className: 'mono small',
+        text: `${report.migration.state}（revisions ${report.migration.revisions} · runs ${report.migration.runs}）`,
+      })]),
     el('li', {}, [el('span', { className: 'muted small', text: '运行锁' }),
       el('span', {
         className: 'mono small',
@@ -947,6 +954,16 @@ function renderDiagnostics(report) {
   if (report.index.unreadable.length > 0) {
     root.append(el('ul', { className: 'violations' }, report.index.unreadable.map(item =>
       el('li', { text: `索引不可读 ${item.file}：${item.reason}`, attrs: { 'data-level': 'BLOCKING' } }))))
+  }
+
+  // L1 迁移诊断（docs/19 §4.3）。`migration-needed` 是可自愈的（下次访问自动补），
+  // 因此按 `recoverable` 分成 WARNING / BLOCKING，不一律报红。
+  if (report.migration.diagnostics.length > 0) {
+    root.append(el('ul', { className: 'violations' }, report.migration.diagnostics.map(item =>
+      el('li', {
+        text: `[${item.code}] ${item.ref}：${item.detail}`,
+        attrs: { 'data-level': item.recoverable ? 'WARNING' : 'BLOCKING' },
+      }))))
   }
 }
 
